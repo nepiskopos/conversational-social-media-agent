@@ -1,0 +1,14 @@
+services:
+  mackie:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Persist org profiles, post ledgers, and learned preferences across restarts
+      - ./data:/app/data
+      # Skills are mounted so a non-engineer can add a new platform YAML
+      # without rebuilding the image
+      - ./skills:/app/skills
+    restart: unless-stopped

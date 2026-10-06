@@ -1,0 +1,51 @@
+# Unlike .gitignore, a pattern here matches only at the top of the build
+# context unless it starts with **/ — so anything that can appear in a
+# subfolder (secrets, bytecode caches) uses **/.
+
+# Secrets and runtime data: provided at run time (env_file, ./data volume)
+**/.env
+**/.env.*
+data/
+
+# Not needed in the image (the web UI shows chainlit.md, not the README)
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+.github/
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+README.md
+design_doc.md
+tests/
+pytest.ini
+ruff.toml
+requirements-dev.txt
+
+# Python, virtualenvs and caches
+**/__pycache__/
+**/*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.files/
+
+# Editors and operating systems
+.vscode/
+.idea/
+**/*.swp
+**/*~
+**/.DS_Store
+**/Thumbs.db
+**/Zone.Identifier

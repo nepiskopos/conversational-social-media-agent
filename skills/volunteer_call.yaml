@@ -1,0 +1,18 @@
+# Content-type skill: Volunteer Call.
+# See donation_appeal.yaml for what a content type is and what each field means.
+# Safe to edit: all fields below. Run `python scripts/validate.py` after editing.
+
+kind: content_type
+id: volunteer_call
+name: Volunteer Call
+purpose: Recruit volunteers for a specific role, shift, or event
+structure: |
+  1. What volunteers will actually do, in plain words
+  2. When, where, and how much time it takes
+  3. Who it's a good fit for (no experience needed? skills wanted?)
+  4. How to sign up
+must_include:
+  - The time commitment
+  - A sign-up link or contact
+avoid:
+  - Vague asks like "we always need help"

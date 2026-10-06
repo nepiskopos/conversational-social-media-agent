@@ -1,0 +1,11 @@
+python-dotenv>=1.0.0
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+tavily-python>=0.3.0
+pyyaml>=6.0.0
+rich>=13.0.0
+chainlit>=2.11.1
+litellm>=1.40.0
+langgraph>=1.0.0
+langchain-core>=1.0.0
+langgraph-checkpoint-sqlite>=2.0.0

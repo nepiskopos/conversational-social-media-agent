@@ -1,0 +1,29 @@
+# Platform skill file for LinkedIn.
+# Mackie loads this file on every conversation turn — changes take effect immediately
+# without any restart or code change.
+#
+# Safe to edit: all fields below.
+# To add a new platform, copy this file to skills/{platform}.yaml with a unique id field.
+#
+# Fields:
+#   kind:          Optional — "platform" (the default) or "content_type"
+#   name:          Display name referenced in responses (e.g. "LinkedIn") (required)
+#   id:            Machine-readable identifier — must be unique, lowercase, no spaces (required)
+#   tone:          Writing style guide injected into the system prompt each turn
+#   max_length:    Character limit for posts; longer posts are not saved (required)
+#   hashtag_count: Number of hashtags a post must have, or a range like "3-5"
+#   hashtag_style: Guidance on hashtag selection — what kinds work on this platform
+#   format_hints:  Multi-line block of platform-specific formatting tips
+
+name: LinkedIn
+id: linkedin
+tone: professional yet warm — avoid jargon, lead with impact, show human faces behind the org
+max_length: 3000
+hashtag_count: "3-5"
+hashtag_style: professional, industry-specific terms (e.g. #nonprofit #communityimpact)
+format_hints: |
+  - Open with a compelling hook or insight (first 2 lines visible before "see more")
+  - Use short paragraphs and line breaks for readability
+  - Include a clear call-to-action (donate, volunteer, share, attend)
+  - End with a question or reflection to drive comments
+  - Emojis used sparingly for emphasis only

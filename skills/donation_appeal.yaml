@@ -1,0 +1,34 @@
+# Content-type skill: Donation Appeal.
+# A content type describes WHAT a post is for (fundraising, recruiting, an event…),
+# independent of the platform it goes on. Mackie combines it with a platform file:
+# "a donation appeal for Instagram" follows both this file and instagram.yaml.
+# Mackie reloads this file on every turn — changes apply without a restart.
+#
+# Safe to edit: all fields below. To add a content type, copy this file to
+# skills/{something}.yaml and give it a new, unique id. Run
+# `python scripts/validate.py` afterwards to check the file.
+#
+# Fields:
+#   kind:         Must be "content_type" (this is what makes it a content type)
+#   id:           Machine-readable identifier — unique, lowercase, no spaces   (required)
+#   name:         Display name                                                  (required)
+#   purpose:      One line: what this kind of post should achieve               (required)
+#   structure:    The order of the post's parts, one per line                   (required)
+#   must_include: Things every post of this type needs                          (optional)
+#   avoid:        Things posts of this type should never do                     (optional)
+
+kind: content_type
+id: donation_appeal
+name: Donation Appeal
+purpose: Move followers to give, by showing the concrete difference a gift makes
+structure: |
+  1. One real person or moment the org made a difference for
+  2. The need that still exists, in one or two sentences
+  3. What a specific amount does (e.g. "$25 covers one care package")
+  4. One clear call to action with the donation link
+must_include:
+  - A specific, concrete use of donated money
+  - Exactly one call to action
+avoid:
+  - Guilt or shame language
+  - Statistics without a human story

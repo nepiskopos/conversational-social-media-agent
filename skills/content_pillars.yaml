@@ -1,0 +1,42 @@
+# Content pillars define the framework for organizing post suggestions.
+# Each suggestion is labeled with a pillar so the ledger can group by theme.
+#
+# Safe to edit: add, rename, or remove pillars here without any code changes.
+# To override these for a specific org, add a "content_pillars" key to
+# data/{org-id}/profile.json with the same list structure (name + description).
+# When a per-org override is present it replaces this file entirely.
+
+pillars:
+  - name: Community Impact
+    description: Stories and data showing real-world effect on the people you serve
+    examples:
+      - "X families supported this month"
+      - "Volunteer spotlight"
+      - "Impact report highlight"
+
+  - name: Programs & Services
+    description: What the org offers and how to access it
+    examples:
+      - "Program launch or update"
+      - "How to apply / enroll / get involved"
+
+  - name: Awareness & Education
+    description: Educating the audience on the cause
+    examples:
+      - "Did you know…"
+      - "Statistics that matter"
+      - "Common misconception debunked"
+
+  - name: Events & Campaigns
+    description: Time-sensitive calls to action — fundraisers, drives, galas
+    examples:
+      - "Event announcement"
+      - "Giving Tuesday appeal"
+      - "Sign-up or donate CTA"
+
+  - name: Behind the Scenes
+    description: Humanizing the org — staff, volunteers, partners
+    examples:
+      - "Team spotlight"
+      - "A day in the life"
+      - "Partner or donor thank-you"

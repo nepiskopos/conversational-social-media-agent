@@ -1,0 +1,12 @@
+line-length = 100
+target-version = "py312"
+
+[lint]
+# pycodestyle, pyflakes, import order, bugbear, pyupgrade. Long lines are the formatter's job.
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+# Entry points import agent/ only after load_dotenv() or a sys.path change, which it depends on.
+"{app,main}.py" = ["E402"]
+"scripts/*.py" = ["E402"]

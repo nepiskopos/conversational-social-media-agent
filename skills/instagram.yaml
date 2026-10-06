@@ -1,0 +1,30 @@
+# Platform skill file for Instagram.
+# Mackie loads this file on every conversation turn — changes take effect immediately
+# without any restart or code change.
+#
+# Safe to edit: all fields below.
+# To add a new platform, copy this file to skills/{platform}.yaml with a unique id field.
+#
+# Fields:
+#   kind:          Optional — "platform" (the default) or "content_type"
+#   name:          Display name referenced in responses (e.g. "Instagram") (required)
+#   id:            Machine-readable identifier — must be unique, lowercase, no spaces (required)
+#   tone:          Writing style guide injected into the system prompt each turn
+#   max_length:    Character limit for captions; longer posts are not saved (required)
+#   hashtag_count: Number of hashtags a post must have, or a range like "10-20"
+#   hashtag_style: Guidance on hashtag selection — what kinds work on this platform
+#   format_hints:  Multi-line block of platform-specific formatting tips
+
+name: Instagram
+id: instagram
+tone: warm, visual, authentic — conversational and community-focused, celebrate people
+max_length: 2200
+hashtag_count: "10-20"
+hashtag_style: mix of broad (#nonprofit #charity) and niche (#[orgname] #communityimpact) — place in a block at the end
+format_hints: |
+  - Caption assumes a visual/image accompanies it
+  - First ~125 characters must hook before "more" truncation
+  - Emoji-forward, expressive, warm tone
+  - Short sentences, line breaks, energy
+  - Hashtag block separated by a line break at the very end
+  - Strong "we" and community language

@@ -1,0 +1,18 @@
+# Content-type skill: Event Announcement.
+# See donation_appeal.yaml for what a content type is and what each field means.
+# Safe to edit: all fields below. Run `python scripts/validate.py` after editing.
+
+kind: content_type
+id: event_announcement
+name: Event Announcement
+purpose: Get people to attend, register for, or share an upcoming event
+structure: |
+  1. Hook: why this event matters or what makes it special this year
+  2. What, when, where (date, time, place or link)
+  3. Who should come and what they'll get out of it
+  4. How to register or RSVP
+must_include:
+  - Date and time
+  - Registration or RSVP details
+avoid:
+  - Burying the date below the fold
