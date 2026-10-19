@@ -9,14 +9,27 @@ LLM call logic — it only reads os.environ.
 A provider counts as configured when every variable in its `requires` is set.
 LLM_PROVIDER picks which configured provider goes first; otherwise the
 registry order below decides. Every other configured provider is a fallback.
+FAST_PROVIDER and JUDGE_PROVIDER name the provider for FAST_MODEL and
+JUDGE_MODEL, for a model string more than one provider accepts.
 """
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
 from dataclasses import dataclass, field
 from typing import Any
+
+# Each background model's variable, and the variable naming its provider.
+_ROLE_VARIABLES: tuple[tuple[str, str], ...] = (
+    ("FAST_MODEL", "FAST_PROVIDER"),
+    ("JUDGE_MODEL", "JUDGE_PROVIDER"),
+)
+
+# Seconds before an LLM request is abandoned. For a streamed reply it applies to the
+# wait for each chunk, so a long answer is fine but a stalled provider is not.
+LLM_TIMEOUT_S: int = 120
 
 
 @dataclass(frozen=True)
@@ -67,7 +80,7 @@ PROVIDERS: list[_Provider] = [
         key_env="ANTHROPIC_API_KEY",
         model_env="ANTHROPIC_MODEL",
         model_prefixes=("claude", "anthropic/"),
-        default_model="claude-haiku-4-5-20251001",
+        default_model="claude-haiku-5-5",
         requires=("ANTHROPIC_API_KEY",),
     ),
     _Provider(
@@ -130,12 +143,13 @@ PROVIDERS: list[_Provider] = [
         requires=("OPENROUTER_API_KEY",),
         litellm_prefix="openrouter/",
     ),
-    _Provider(  # OpenCode Zen — OpenAI-compatible; free models may be used to train the provider's models
+    _Provider(  # OpenCode Zen — OpenAI-compatible; its free models refuse clients other than OpenCode
         id="opencode",
         key_env="OPENCODE_API_KEY",
         model_env="OPENCODE_MODEL",
         model_prefixes=("openai/",),
-        default_model="openai/space-bunny-free",
+        # Cheapest paid Chat Completions model ($0.15 in / $0.50 out per 1M tokens).
+        default_model="openai/glm-5.3-flash",
         requires=("OPENCODE_API_KEY",),
         litellm_prefix="openai/",
         base_url_env="OPENCODE_BASE_URL",
@@ -182,12 +196,42 @@ def _is_configured(provider: _Provider) -> bool:
     return all(os.getenv(name) for name in provider.requires)
 
 
+def _with_litellm_prefix(model: str, provider: _Provider) -> str:
+    """`model` with the provider's LiteLLM prefix in front, unless it already has it."""
+    if provider.litellm_prefix and not model.startswith(provider.litellm_prefix):
+        return provider.litellm_prefix + model
+    return model
+
+
 def _provider_model(provider: _Provider) -> str:
     """The provider's configured (or default) model, with its LiteLLM prefix added."""
-    model = os.getenv(provider.model_env) or provider.default_model
-    if provider.litellm_prefix and not model.startswith(provider.litellm_prefix):
-        model = provider.litellm_prefix + model
-    return model
+    return _with_litellm_prefix(os.getenv(provider.model_env) or provider.default_model, provider)
+
+
+def _named_provider(variable: str, configured: list[_Provider]) -> _Provider | None:
+    """
+    The configured provider whose id the environment variable names, else None.
+
+    An unknown or unconfigured id is reported once and then ignored.
+    """
+    name = os.getenv(variable, "").strip().lower()
+    if not name:
+        return None
+    provider = next((p for p in configured if p.id == name), None)
+    if provider is None:
+        _report_unusable_provider(variable, name)
+    return provider
+
+
+@functools.cache
+def _report_unusable_provider(variable: str, name: str) -> None:
+    """Print, once per variable and value, that it names no configured provider."""
+    known = ", ".join(p.id for p in PROVIDERS)
+    print(
+        f"ERROR: {variable}={name!r} is not a configured provider "
+        f"(known: {known}; its key variables must be set). Ignoring it.",
+        file=sys.stderr,
+    )
 
 
 def _configured_providers() -> list[_Provider]:
@@ -198,17 +242,8 @@ def _configured_providers() -> list[_Provider]:
     or unconfigured id prints an error and the registry order is used instead.
     """
     configured = [p for p in PROVIDERS if _is_configured(p)]
-    preferred = os.getenv("LLM_PROVIDER", "").strip().lower()
-    if not preferred:
-        return configured
-    chosen = next((p for p in configured if p.id == preferred), None)
+    chosen = _named_provider("LLM_PROVIDER", configured)
     if chosen is None:
-        known = ", ".join(p.id for p in PROVIDERS)
-        print(
-            f"ERROR: LLM_PROVIDER={preferred!r} is not a configured provider "
-            f"(known: {known}; its key variables must be set). Using the default order.",
-            file=sys.stderr,
-        )
         return configured
     return [chosen] + [p for p in configured if p is not chosen]
 
@@ -265,11 +300,52 @@ def resolve_fallbacks(primary: str) -> list[str]:
     return [m for m in dict.fromkeys(models) if m != primary]
 
 
+def _role_model(model_variable: str, provider_variable: str) -> tuple[str, _Provider | None]:
+    """
+    A background role's model and the provider it names, if any.
+
+    With a provider named, the model gets that provider's LiteLLM prefix, and
+    an unset model means the provider's own configured (or default) model.
+    Without one, an unset model means the main model.
+    """
+    provider = _named_provider(provider_variable, _configured_providers())
+    model = os.getenv(model_variable, "")
+    if provider is None:
+        return model or resolve_model(), None
+    return (_with_litellm_prefix(model, provider) if model else _provider_model(provider)), provider
+
+
 def _provider_for(model: str) -> _Provider | None:
-    """The configured provider whose model is exactly `model`, else the first whose prefixes match."""
+    """
+    The configured provider that serves `model`.
+
+    In order: the provider whose own model is exactly `model`; the provider
+    FAST_PROVIDER or JUDGE_PROVIDER names, when `model` is that role's model;
+    the first whose prefixes match. A prefix can belong to several providers:
+    "openai/" is OpenAI's and also OpenCode Zen's. With both configured and
+    no provider named, openai/deepseek-v4-pro goes to the one higher in
+    PROVIDERS (OpenAI), and a warning says so instead of failing silently.
+    """
     configured = _configured_providers()
-    return next((p for p in configured if _provider_model(p) == model), None) or next(
-        (p for p in configured if p.model_prefixes and model_matches_provider(model, p)), None
+    if exact := next((p for p in configured if _provider_model(p) == model), None):
+        return exact
+    for variables in _ROLE_VARIABLES:
+        role_model, named = _role_model(*variables)
+        if named and role_model == model:
+            return named
+    matching = [p for p in configured if p.model_prefixes and model_matches_provider(model, p)]
+    if len(matching) > 1:
+        _warn_ambiguous_model(model, tuple(p.id for p in matching))
+    return matching[0] if matching else None
+
+
+@functools.cache
+def _warn_ambiguous_model(model: str, provider_ids: tuple[str, ...]) -> None:
+    """Print, once per model, that several configured providers could serve it."""
+    print(
+        f"WARNING: {model!r} could belong to {' or '.join(provider_ids)}; using "
+        f"{provider_ids[0]}. To choose, set FAST_PROVIDER or JUDGE_PROVIDER to the provider's id.",
+        file=sys.stderr,
     )
 
 
@@ -287,9 +363,12 @@ def background_kwargs(model: str) -> dict[str, Any]:
     return {**connection_kwargs(model), **extra}
 
 
-def connection_kwargs(model: str) -> dict[str, str]:
+def connection_kwargs(model: str) -> dict[str, Any]:
     """
-    Return the api_base / api_key to pass to litellm.acompletion() with model.
+    Return the timeout, api_base and api_key to pass to litellm.acompletion() with model.
+
+    Every call gets LLM_TIMEOUT_S, so a provider that hangs ends in an error
+    (and the next provider, for chat replies) instead of a UI that waits forever.
 
     The provider is the configured one whose model is exactly `model`, else the
     first configured one whose prefixes match it. Native providers need nothing
@@ -302,17 +381,17 @@ def connection_kwargs(model: str) -> dict[str, str]:
         model: A LiteLLM model string, e.g. from resolve_model() or FAST_MODEL.
 
     Returns:
-        Dict with "api_base" and/or "api_key", only for values that are set.
+        Dict with "timeout", plus "api_base" and/or "api_key" for values that are set.
     """
     provider = _provider_for(model)
     if provider is None:
-        return {}
+        return {"timeout": LLM_TIMEOUT_S}
     settings = {
         "api_base": (os.getenv(provider.base_url_env) if provider.base_url_env else "")
         or provider.default_base_url,
         "api_key": os.getenv(provider.key_env, ""),
     }
-    return {name: value for name, value in settings.items() if value}
+    return {"timeout": LLM_TIMEOUT_S, **{name: value for name, value in settings.items() if value}}
 
 
 def resolve_fast_model() -> str:
@@ -320,7 +399,18 @@ def resolve_fast_model() -> str:
     Return the model for background work: summaries, org briefs, calendar plans.
 
     FAST_MODEL lets a deployment route that work to a cheaper model (cost
-    routing) while user-facing drafts keep the main model. Unset, it is the
-    same as resolve_model(). The provider for FAST_MODEL must be configured.
+    routing) while user-facing drafts keep the main model, and FAST_PROVIDER
+    names its provider (see _role_model). With neither set, it is the same as
+    resolve_model(). The provider must be configured.
     """
-    return os.getenv("FAST_MODEL") or resolve_model()
+    return _role_model("FAST_MODEL", "FAST_PROVIDER")[0]
+
+
+def resolve_judge_model() -> str:
+    """
+    Return the model that grades scripts/eval.py runs.
+
+    JUDGE_MODEL and JUDGE_PROVIDER work like FAST_MODEL and FAST_PROVIDER;
+    with neither set, the judge is the main model.
+    """
+    return _role_model("JUDGE_MODEL", "JUDGE_PROVIDER")[0]

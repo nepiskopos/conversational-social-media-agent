@@ -1,9 +1,10 @@
 """
 Loading and validation of the non-engineer-editable files in skills/.
 
-Owns: reading skills/*.yaml into platform and content-type skills, reading the
-content pillars (skills/content_pillars.yaml or a per-org override in the
-profile), and reporting problems in those files as plain-English messages.
+Owns: reading skills/*.yaml into platform, content-type and format skills,
+reading the content pillars (skills/content_pillars.yaml or a per-org override
+in the profile), and reporting problems in those files as plain-English
+messages.
 A broken file is skipped and reported, never raised, so one typo by a
 non-engineer cannot take every conversation down. Does not own how skills are
 rendered into the prompt (assistant.py) or used by tools (tools.py).
@@ -25,9 +26,10 @@ PILLARS_FILE: str = "content_pillars.yaml"
 REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "platform": ("id", "name", "max_length"),
     "content_type": ("id", "name", "purpose", "structure"),
+    "format": ("id", "name", "purpose", "structure"),
 }
-# Fields that must be text, and fields that must be lists of text, when present. The prompt
-# builder relies on these types; "format_hints:" followed by "- " lines is a YAML list.
+# Fields that must be text, lists of text, or true/false, when present. The prompt builder
+# and the post checks rely on these types; "format_hints:" followed by "- " lines is a list.
 TEXT_FIELDS: tuple[str, ...] = (
     "id",
     "name",
@@ -37,7 +39,8 @@ TEXT_FIELDS: tuple[str, ...] = (
     "purpose",
     "structure",
 )
-LIST_FIELDS: tuple[str, ...] = ("must_include", "avoid")
+LIST_FIELDS: tuple[str, ...] = ("must_include", "avoid", "platforms")
+BOOL_FIELDS: tuple[str, ...] = ("has_caption", "needs_visual")
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,7 @@ class SkillSet:
 
     platforms: list[dict[str, Any]] = field(default_factory=list)
     content_types: list[dict[str, Any]] = field(default_factory=list)
+    formats: list[dict[str, Any]] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
 
 
@@ -70,22 +74,52 @@ def _skill_problem(skill: Any, file_name: str) -> str | None:
         value = skill.get(name, [])
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             return f"{file_name}: {name} must be a list of '- ' lines"
+    for name in BOOL_FIELDS:
+        if name in skill and not isinstance(skill[name], bool):
+            return f"{file_name}: {name} must be true or false"
+    return None
+
+
+def _pillars_problem() -> str | None:
+    """
+    Return a plain-English problem with skills/content_pillars.yaml, or None.
+
+    A missing file is not a problem (the org simply has no default pillars).
+    load_content_pillars copes with a broken one; this says what to fix.
+    """
+    path = SKILLS_DIR / PILLARS_FILE
+    if not path.exists():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as e:
+        return f"{PILLARS_FILE}: not valid YAML ({e})"
+    pillars = data.get("pillars") if isinstance(data, dict) else None
+    if not isinstance(pillars, list):
+        return f"{PILLARS_FILE}: expected a 'pillars:' list of '- name: ...' entries"
+    if not all(isinstance(pillar, dict) and pillar.get("name") for pillar in pillars):
+        return f"{PILLARS_FILE}: every pillar needs a name (entries without one are skipped)"
     return None
 
 
 def load_skills() -> SkillSet:
     """
-    Load every skill file in skills/ except the content pillars file.
+    Load every skill file in skills/, and check the content pillars file.
 
     A skill's `kind` defaults to "platform" so existing platform files need no
-    change. Invalid files and duplicate ids are skipped and reported in
-    SkillSet.problems (and logged), not raised.
+    change. Invalid files and duplicate ids are skipped, and they and any
+    pillars problem are reported in SkillSet.problems (and logged), not raised.
 
     Returns:
-        SkillSet with platforms and content_types sorted by file name.
+        SkillSet with platforms, content_types and formats sorted by file name.
     """
     skills = SkillSet()
     seen_ids: set[str] = set()
+    skills_of_kind = {
+        "platform": skills.platforms,
+        "content_type": skills.content_types,
+        "format": skills.formats,
+    }
     for path in sorted(SKILLS_DIR.glob("*.yaml")):
         if path.name == PILLARS_FILE:
             continue
@@ -101,10 +135,9 @@ def load_skills() -> SkillSet:
             skills.problems.append(problem)
             continue
         seen_ids.add(skill["id"])
-        if skill.get("kind", "platform") == "platform":
-            skills.platforms.append(skill)
-        else:
-            skills.content_types.append(skill)
+        skills_of_kind[skill.get("kind", "platform")].append(skill)
+    if pillars_problem := _pillars_problem():
+        skills.problems.append(pillars_problem)
     for problem in skills.problems:
         logger.warning("Skipped skill file — %s", problem)
     return skills

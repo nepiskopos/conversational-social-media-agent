@@ -2,8 +2,9 @@
 Trust-boundary tags for text Mackie did not write: scraped pages, search
 snippets, and the org brief and conversation summary derived from them.
 
-Owns: wrapping such text in a named tag that the system prompt's Security
-Policy treats as data, and neutralising any copy of that tag inside the text so
+Owns: wrapping such text in a named tag that the prompt marks as data (the
+Security Policy for <external_content>; a note beside the brief and the
+summary), and neutralising any copy of that tag inside the text so
 a page containing "</external_content>" cannot close the wrapper early and pass
 the rest of its text off as instructions. Does not own deciding what is
 untrusted; callers choose what to wrap.

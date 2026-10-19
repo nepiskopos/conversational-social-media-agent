@@ -2,10 +2,12 @@
 Conversation loop and system prompt construction for Mackie.
 
 Owns: rendering the system prompt (org context and brief, learned preferences,
-voice examples, ledger, pillars, platform and content-type skills, working
-rules) and delegating each chat turn to the LangGraph graph in graph.py. Does
-not own memory I/O (memory.py), loading skill files (skills.py), tool logic
-(tools.py), research (research.py), or graph checkpointing (graph.py).
+voice examples, ledger, the agenda of posts that need attention,
+best-performing posts, pillars, platform, content-type and format skills,
+working rules), the greeting's agenda summary, and delegating each chat turn
+to the LangGraph graph in graph.py. Does not own memory I/O (memory.py),
+loading skill files (skills.py), tool logic (tools.py), research
+(research.py), or graph checkpointing (graph.py).
 """
 
 from __future__ import annotations
@@ -19,13 +21,26 @@ from langchain_core.messages import HumanMessage
 from . import memory as mem
 from . import skills
 from .config import resolve_model
-from .graph import build_graph, turn_reply
+from .graph import build_graph, prune_history, turn_reply
 from .untrusted import wrap_untrusted
 
 LEDGER_PROMPT_POSTS: int = 20
 MAX_PROMPT_SOURCES: int = 12
 VOICE_EXAMPLES_IN_PROMPT: int = 3
 VOICE_EXAMPLE_CHARS: int = 600
+TOP_POSTS_IN_PROMPT: int = 5
+# Posts listed per agenda group; the rest are counted, so a backlog can't flood every prompt.
+AGENDA_POSTS_PER_STEP: int = 5
+# Agenda groups from memory.agenda(), in the order the user should act on them.
+AGENDA_STEPS: dict[str, tuple[str, str]] = {
+    "awaiting_approval": ("draft waiting for your approval", "drafts waiting for your approval"),
+    "to_publish": ("approved post ready to publish", "approved posts ready to publish"),
+    "to_draft": ("planned post to write up this week", "planned posts to write up this week"),
+    "needs_results": (
+        "published post to report results for",
+        "published posts to report results for",
+    ),
+}
 
 
 def _format_platforms(platforms: list[dict[str, Any]]) -> str:
@@ -65,6 +80,24 @@ def _format_content_types(content_types: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _format_post_formats(formats: list[dict[str, Any]]) -> str:
+    """Render format skills (feed post, carousel, story, reel…); empty string when none are defined."""
+    if not formats:
+        return ""
+    lines = [
+        "## Post Formats",
+        "Each format plays a different role. Pick the one whose role fits the goal, follow its "
+        "structure in the draft, and pass its id as format to save_post.",
+    ]
+    for skill in formats:
+        where = ", ".join(skill.get("platforms", [])) or "all platforms"
+        lines.append(f"### {skill['name']} (id: {skill['id']}; on {where})")
+        lines.append(f"- Role: {skill['purpose']}")
+        lines.append(f"- Structure:\n{skill['structure'].strip()}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _format_pillars(pillars: list[dict[str, Any]]) -> str:
     """Render content pillars; empty string when there are none."""
     if not pillars:
@@ -79,9 +112,8 @@ def _build_org_section(profile: dict[str, Any]) -> str:
     Build the organization context block for the system prompt.
 
     Includes org name, website, research status, the org brief, and up to
-    MAX_PROMPT_SOURCES research sources
-    with type labels. Sources appear every turn so the model always has specific
-    URLs to cite without calling a tool.
+    MAX_PROMPT_SOURCES research sources with type labels. Sources appear every
+    turn so the model always has specific URLs to cite without calling a tool.
     """
     section = f"**Organization:** {profile.get('name') or 'Unknown'}\n"
     if profile.get("website"):
@@ -197,15 +229,98 @@ def _build_ledger_section(ledger: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _format_results(post: dict[str, Any]) -> str:
+    """One post's recorded counts and note as text, e.g. "1200 reach, 85 reactions — 3 donations"."""
+    performance = post["performance"]
+    counts = ", ".join(
+        f"{performance[name]} {name}"
+        for name in mem.PERFORMANCE_METRICS
+        if isinstance(performance.get(name), int) and not isinstance(performance[name], bool)
+    )
+    note = performance.get("note")
+    return " — ".join(part for part in (counts, note and str(note)) if part)
+
+
+def _build_performance_section(ledger: list[dict[str, Any]]) -> str:
+    """
+    Build the best-performing posts block: posts with reported results, highest engagement first.
+
+    This is what lets Mackie suggest what to post next from evidence rather
+    than guesswork. Returns an empty string when no results have been recorded.
+    """
+    top_posts = mem.top_performing(ledger, TOP_POSTS_IN_PROMPT)
+    if not top_posts:
+        return ""
+    lines = ["## What Performed Best (results the user reported)"]
+    for post in top_posts:
+        lines.append(
+            f"- **{post.get('id', '?')}** | {str(post.get('platform', '?')).upper()} | "
+            f"{post.get('pillar') or 'no pillar'} | {post.get('title') or 'untitled'}: "
+            f"{_format_results(post)}"
+        )
+    lines.append(
+        "\nWhen suggesting what to post next, build on the platforms, pillars and angles that "
+        "performed best, and say which result you are building on."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _build_agenda_section(ledger: list[dict[str, Any]], today: date) -> str:
+    """
+    Build the Needs Attention block from memory.agenda(), so Mackie can lead with it.
+
+    Each group lists its first AGENDA_POSTS_PER_STEP posts (the oldest, so the
+    most overdue) and counts the rest. Returns an empty string when nothing
+    needs attention.
+    """
+    groups = mem.agenda(ledger, today)
+    if not any(groups.values()):
+        return ""
+    lines = ["## Needs Attention"]
+    for key, (_, plural) in AGENDA_STEPS.items():
+        if groups[key]:
+            lines.append(f"### {plural[0].upper()}{plural[1:]}")
+            lines.extend(
+                f"- **{post.get('id', '?')}** | {str(post.get('platform', '?')).upper()} | "
+                f"{post.get('scheduled_for') or 'no date'} | {post.get('title') or 'untitled'}"
+                for post in groups[key][:AGENDA_POSTS_PER_STEP]
+            )
+            if (more := len(groups[key]) - AGENDA_POSTS_PER_STEP) > 0:
+                lines.append(f"- (+ {more} more — use search_ledger to list them)")
+    return "\n".join(lines) + "\n"
+
+
+def count_noun(count: int, singular: str, plural: str) -> str:
+    """ "1 draft waiting…" or "3 drafts waiting…": user-facing counts without "(s)"."""
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def agenda_summary(org_id: str) -> str:
+    """
+    One sentence saying what needs the user's attention, for the session greeting.
+
+    Returns an empty string when nothing does.
+
+    Raises:
+        ProfileError: the org's profile.json cannot be read.
+    """
+    groups = mem.agenda(mem.load_profile(org_id)["post_ledger"], date.today())
+    parts = [
+        count_noun(len(groups[key]), *labels) for key, labels in AGENDA_STEPS.items() if groups[key]
+    ]
+    return f"Here's what needs you: {'; '.join(parts)}." if parts else ""
+
+
 def _build_system_prompt_blocks(org_id: str) -> tuple[str, str]:
     """
     Build the system prompt as (stable, per_turn) blocks for a conversation turn.
 
     The stable block (identity, org context and brief, research sources,
-    pillars, platform and content-type skills, working rules) only changes when
-    research or skill files change, so graph.py marks it as the prompt-cache
-    prefix. The per-turn block (today's date, learned preferences, voice
-    examples, post ledger) changes almost every turn and comes after it so it
+    pillars, platform, content-type and format skills, working rules) only
+    changes when research or skill files change, so graph.py marks it as the
+    prompt-cache prefix. The per-turn block (today's date, learned preferences,
+    voice examples, post ledger, agenda, best-performing posts; graph.py adds
+    the running summary) changes almost every turn and comes after it so it
     does not invalidate the cached prefix.
 
     Args:
@@ -221,28 +336,38 @@ def _build_system_prompt_blocks(org_id: str) -> tuple[str, str]:
         pillars_section=_format_pillars(skills.load_content_pillars(profile)),
         skills_section=_format_platforms(skill_set.platforms),
         content_types_section=_format_content_types(skill_set.content_types),
+        formats_section=_format_post_formats(skill_set.formats),
     )
+    today = date.today()
     per_turn = "\n".join(
         [
-            f"## Today\n{date.today():%A, %B %d, %Y}\n",
+            f"## Today\n{today:%A, %B %d, %Y}\n",
             _build_prefs_section(profile["preferences"], profile["preference_notes"]),
             _build_voice_section(profile["voice_examples"]),
             _build_ledger_section(profile["post_ledger"]),
+            _build_agenda_section(profile["post_ledger"], today),
+            _build_performance_section(profile["post_ledger"]),
         ]
     )
     return stable, per_turn
 
 
-_STABLE_PROMPT_TEMPLATE: str = """You are Mackie, an AI social media assistant helping nonprofit marketing staff create on-brand content.
+_STABLE_PROMPT_TEMPLATE: str = """You are Mackie, an AI social media manager for nonprofit marketing staff. You keep the org's social media active and on-brand so they can spend their time on the mission. Your job has three parts:
+- **Plan:** content calendars built around the org's campaigns, events and the awareness days that matter to its cause.
+- **Create:** posts for each platform in the format that fits the goal (feed post, carousel, story, reel), plus email copy for supporters, in the org's own voice, each with an idea for the visual that goes with it.
+- **Optimize:** learn which posts performed best and use that to suggest what to post next.
+You work like a teammate, not a tool: you bring the next step without waiting to be asked. Nothing goes live without the user's approval: you draft and plan, they approve, and the org's staff publish, design the final graphics, and run any paid promotion.
 
 ## Current Organization
 {org_section}
 {pillars_section}
 {skills_section}
 {content_types_section}
+{formats_section}
 ## How to work
 - Talk like a knowledgeable colleague, not a form. Be warm and direct.
 - Before generating any content, ensure research has been done. If not, call `research_org` first.
+- **Lead with what needs doing.** When the user opens a conversation, greets you, or asks what's next, start from the Needs Attention section: list what's waiting in a sentence or two, then offer to start on the first item (draft the planned post, show the draft for approval, ask how the published post did). If nothing needs attention, propose this week's posts (two by default, in different formats) without being asked.
 - **Act first, ask only when truly stuck.** When the user asks for suggestions, produce 3–4 numbered post ideas right away — don't ask for more information first. If research is sparse, draw on the organization brief, the snippets found, and what you know about nonprofits like this one; label inferences as such and invite corrections after showing the posts. Ask a clarifying question only when a request can't be acted on at all (e.g. "write a post" with no topic and no earlier suggestions to pick from) — and then offer two or three concrete options to choose from.
 - **Suggestion format — use this exact structure for EVERY post suggestion, whether you're writing one post or several:**
   > **[n]. [Short title]** · [ledger id returned by save_post]
@@ -250,10 +375,12 @@ _STABLE_PROMPT_TEMPLATE: str = """You are Mackie, an AI social media assistant h
   > *Source: [description] — [URL from Research Sources above]*
   The Source line is mandatory on every single suggestion — including when you suggest only one post. Copy the URL exactly as it appears in Research Sources above — character for character, never retype or truncate from memory. A URL alone (e.g. "https://brcastrong.org") is not sufficient — pair it with a label. A label alone (e.g. "Breast Cancer Awareness Month") is not sufficient — pair it with a URL. If you don't have a URL for a source, call `web_search` first to find one. Showing the ledger id lets the user refer to a post later ("let's go with post_003").
 - **Save EVERY suggestion before displaying it.** Call `save_post` (status: "suggested") for each numbered idea — all of them, not just the first — with a short `title`, its content `pillar`, and the `source_url` you cite. A suggestion that isn't saved can't be tracked or avoided in future turns.
-- When you write a full platform draft, save it with `save_post` (status: "draft"). When it is a version of an earlier post — the platform draft of a suggestion, a rewrite after feedback, another platform's version — set `parent_id` to that post's id. If save_post says "Not saved" (too long, wrong number of hashtags), fix the post and save it again — only the fixed version is saved, so never save the same idea twice.
+- When you write a full platform draft, save it with `save_post` (status: "draft"). Choose a format from Post Formats for its role (a reel to reach new people, a story for a quick reminder, a carousel to explain) and pass it as `format`. For Instagram and Facebook drafts, add a line *Visual: [the photo or graphic to pair with it]* below the copy and pass the same text as `visual`; suggest something the org can realistically photograph or design, not stock imagery. End every draft by asking for approval. When it is a version of an earlier post — the platform draft of a suggestion, a rewrite after feedback, another platform's version — set `parent_id` to that post's id; a rewrite replaces the earlier version, so never mark that one "rejected" (rejected means the user turned the idea down). Ideas you save as "suggested" don't need hashtags yet; finished drafts do. If save_post says "Not saved" (too long, wrong number of hashtags), fix the post and save it again — only the fixed version is saved, so never save the same idea twice.
 - When the user selects a suggestion and asks you to write it up, update its status to "draft" with `update_post_status`. When the user turns an idea down ("not that one", "skip the gala idea"), set it to "rejected" and don't suggest similar angles again.
 - When the user approves a post ("approve it", "looks good", "that's the one", "ready to go"), call `update_post_status` with status "approved".
-- When the user says a post was published ("mark it as posted", "it went live", "we sent that"), call `update_post_status` with status "posted". When a post is meant for a specific date, set `scheduled_for` when saving it.
+- When the user says a post was published ("mark it as posted", "it went live", "we sent that"), call `update_post_status` with status "posted", then ask how it did once it has had a few days. When a post is meant for a specific date, set `scheduled_for` when saving it.
+- When the user reports results ("the volunteer post got 300 likes and 12 shares", "that email raised $400"), call `record_performance` with only the numbers they gave; anything that isn't a count goes in `note`. When they ask how posts are doing or what to post next, answer from the What Performed Best section and say plainly when there isn't enough data yet.
+- When the user wants to plan a month or a campaign, call `generate_calendar`, passing the campaign or goal as `focus` when they mention one and `posts_per_week` when they say how often they post.
 - When the user corrects tone, voice, or expresses ANY preference, immediately call `save_preference` with their own words as `quote` — then apply it to ALL responses: posts, Q&A answers, ledger summaries, everything. A "warm and grassroots" preference means conversational prose throughout, not just in post copy — avoid formal bullet lists when answering questions. For list-like preferences (banned topics, words to avoid) use `append: true` so earlier items are kept. A preference that only applies to one platform gets a platform-prefixed key, e.g. `linkedin_voice`.
 - When the user asks you to forget or stop applying a preference, call `forget_preference`. When they ask what you have learned about them, list the Learned Brand Preferences and Voice Examples sections in plain words and offer to change or forget any of them.
 - When the user pastes a post they wrote, or their own edited version of one of your drafts, call `save_voice_example` with it — those are the best evidence of their real voice.
@@ -291,9 +418,10 @@ class Assistant:
         """
         Process one conversation turn and return the assistant's reply.
 
-        Delegates to the LangGraph agent→tools loop in graph.py. Conversation
-        history is persisted to data/checkpoints.db keyed by thread_id, so turns
-        survive container restarts within the same session.
+        Delegates to the LangGraph loop in graph.py. Conversation history is
+        persisted to data/checkpoints.db keyed by thread_id, so it survives
+        restarts; afterwards only the thread's newest checkpoint is kept
+        (graph.prune_history).
 
         Args:
             user_message: The user's input text.
@@ -308,6 +436,7 @@ class Assistant:
                 {"messages": [HumanMessage(content=user_message)], "org_id": self.org_id},
                 config,
             )
+            await prune_history(graph, self.thread_id)
         return turn_reply(result["messages"])
 
     async def achat_stream(self, user_message: str) -> AsyncIterator[dict]:
@@ -316,10 +445,12 @@ class Assistant:
 
         Streams custom events from the LangGraph graph:
           - {"type": "tool_step", "tool": ..., "input_preview": ...,
-             "result_preview": ..., "latency_ms": ...}  — emitted after each tool call
-          - {"type": "text", "content": ...}  — one per streamed token of model text
+             "result_preview": ..., "latency_ms": ...}  — after each tool call,
+             and for the summarize_history and save_check steps
+          - {"type": "text", "content": ...}  — one per streamed chunk of model text
 
-        Chainlit uses this to show tool steps as they run and stream the final response.
+        The web UI uses this to show each tool step when it finishes and to
+        stream the reply.
 
         Args:
             user_message: The user's input text.
@@ -335,3 +466,4 @@ class Assistant:
                 stream_mode="custom",
             ):
                 yield event
+            await prune_history(graph, self.thread_id)

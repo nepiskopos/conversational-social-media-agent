@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from agent.config import (
+    LLM_TIMEOUT_S,
     PROVIDERS,
     connection_kwargs,
     is_anthropic_model,
@@ -13,6 +16,17 @@ from agent.config import (
     resolve_model,
 )
 
+TIMEOUT: dict = {"timeout": LLM_TIMEOUT_S}
+
+
+@pytest.fixture(autouse=True)
+def _fresh_warnings():
+    """Warnings print once per process; each test starts as if none had been printed."""
+    from agent.config import _report_unusable_provider, _warn_ambiguous_model
+
+    _report_unusable_provider.cache_clear()
+    _warn_ambiguous_model.cache_clear()
+
 
 def _env(**kwargs: str) -> dict[str, str]:
     """Build a full os.environ patch: unset all relevant vars, then apply overrides.
@@ -20,7 +34,7 @@ def _env(**kwargs: str) -> dict[str, str]:
     Empty string is falsy in os.getenv(), so unset vars are treated as absent
     by resolve_model(). This isolates tests from whatever the caller's shell has set.
     """
-    keys = {"LLM_PROVIDER", "FAST_MODEL"}
+    keys = {"LLM_PROVIDER", "FAST_MODEL", "FAST_PROVIDER", "JUDGE_MODEL", "JUDGE_PROVIDER"}
     for provider in PROVIDERS:
         keys |= {provider.key_env, provider.model_env, *provider.requires}
         if provider.base_url_env:
@@ -37,90 +51,40 @@ def _env(**kwargs: str) -> dict[str, str]:
 
 def test_no_keys_returns_anthropic_default():
     with patch.dict("os.environ", _env(), clear=False):
-        assert resolve_model() == "claude-haiku-4-5-20251001"
+        assert resolve_model() == "claude-haiku-5-5"
 
 
 # ---------------------------------------------------------------------------
-# Single provider selected
+# Provider selection
 # ---------------------------------------------------------------------------
 
-
-def test_anthropic_key_returns_default_anthropic_model():
-    with patch.dict("os.environ", _env(ANTHROPIC_API_KEY="sk-ant-abc"), clear=False):
-        assert resolve_model() == "claude-haiku-4-5-20251001"
+NAMED_PROVIDERS = [provider for provider in PROVIDERS if provider.id != "custom"]
 
 
-def test_anthropic_key_with_custom_model():
-    with patch.dict(
-        "os.environ",
-        _env(ANTHROPIC_API_KEY="sk-ant-abc", ANTHROPIC_MODEL="claude-opus-4-8"),
-        clear=False,
-    ):
-        assert resolve_model() == "claude-opus-4-8"
+def test_providers_are_chosen_in_registry_order():
+    """
+    With every key set, each provider wins once all those above it are unset.
+
+    The last round is the bottom provider alone, so every provider is also
+    shown to work on its own key(s) with its default model.
+    """
+    # The order the README documents; changing it changes which model users get.
+    documented = ["anthropic", "openai", "xai", "google", "mistral", "groq", "deepseek"]
+    documented += ["openrouter", "opencode", "qwen"]
+    assert [provider.id for provider in NAMED_PROVIDERS] == documented
+    for rank, provider in enumerate(NAMED_PROVIDERS):
+        keys = {name: "x" for below in NAMED_PROVIDERS[rank:] for name in below.requires}
+        with patch.dict("os.environ", _env(**keys)):
+            assert resolve_model() == provider.default_model, provider.id
 
 
-def test_openai_key_returns_default_openai_model():
-    with patch.dict("os.environ", _env(OPENAI_API_KEY="sk-abc"), clear=False):
-        assert resolve_model() == "gpt-4o-mini"
-
-
-def test_openai_key_with_custom_model():
-    with patch.dict(
-        "os.environ", _env(OPENAI_API_KEY="sk-abc", OPENAI_MODEL="gpt-4o"), clear=False
-    ):
-        assert resolve_model() == "gpt-4o"
-
-
-def test_xai_key_returns_default_xai_model():
-    with patch.dict("os.environ", _env(XAI_API_KEY="xai-abc"), clear=False):
-        assert resolve_model() == "xai/grok-3-mini"
-
-
-def test_gemini_key_returns_default_gemini_model():
-    with patch.dict("os.environ", _env(GEMINI_API_KEY="AIzaabc"), clear=False):
-        assert resolve_model() == "gemini/gemini-2.0-flash"
-
-
-# ---------------------------------------------------------------------------
-# Priority: multiple keys set → Anthropic wins
-# ---------------------------------------------------------------------------
-
-
-def test_anthropic_beats_openai_when_both_keys_set():
-    with patch.dict(
-        "os.environ", _env(ANTHROPIC_API_KEY="sk-ant-abc", OPENAI_API_KEY="sk-abc"), clear=False
-    ):
-        assert resolve_model().startswith("claude")
-
-
-def test_anthropic_beats_all_providers():
-    with patch.dict(
-        "os.environ",
-        _env(
-            ANTHROPIC_API_KEY="sk-ant-abc",
-            OPENAI_API_KEY="sk-abc",
-            XAI_API_KEY="xai-abc",
-            GEMINI_API_KEY="AIzaabc",
-        ),
-        clear=False,
-    ):
-        assert resolve_model().startswith("claude")
-
-
-def test_openai_beats_xai_and_google():
-    with patch.dict(
-        "os.environ",
-        _env(OPENAI_API_KEY="sk-abc", XAI_API_KEY="xai-abc", GEMINI_API_KEY="AIzaabc"),
-        clear=False,
-    ):
-        assert resolve_model().startswith("gpt-")
-
-
-def test_xai_beats_google():
-    with patch.dict(
-        "os.environ", _env(XAI_API_KEY="xai-abc", GEMINI_API_KEY="AIzaabc"), clear=False
-    ):
-        assert resolve_model().startswith("xai/")
+def test_each_providers_model_variable_replaces_its_default(capsys):
+    for provider in NAMED_PROVIDERS:
+        custom = f"{provider.default_model}-custom"
+        env = _env(**{name: "x" for name in provider.requires}, **{provider.model_env: custom})
+        with patch.dict("os.environ", env):
+            assert resolve_model() == custom, provider.id
+    assert capsys.readouterr().err == ""
 
 
 # ---------------------------------------------------------------------------
@@ -128,20 +92,7 @@ def test_xai_beats_google():
 # ---------------------------------------------------------------------------
 
 
-def test_mismatch_prints_error(capsys):
-    with patch.dict(
-        "os.environ",
-        _env(ANTHROPIC_API_KEY="sk-ant-abc", ANTHROPIC_MODEL="gpt-4o-mini"),
-        clear=False,
-    ):
-        resolve_model()
-    err = capsys.readouterr().err
-    assert "ERROR" in err
-    assert "ANTHROPIC_MODEL" in err
-    assert "gpt-4o-mini" in err
-
-
-def test_mismatch_still_returns_the_configured_model(capsys):
+def test_mismatch_prints_an_error_and_still_uses_the_configured_model(capsys):
     with patch.dict(
         "os.environ",
         _env(ANTHROPIC_API_KEY="sk-ant-abc", ANTHROPIC_MODEL="gpt-4o-mini"),
@@ -149,6 +100,10 @@ def test_mismatch_still_returns_the_configured_model(capsys):
     ):
         model = resolve_model()
     assert model == "gpt-4o-mini"
+    err = capsys.readouterr().err
+    assert "ERROR" in err
+    assert "ANTHROPIC_MODEL" in err
+    assert "gpt-4o-mini" in err
 
 
 def test_correct_model_no_error(capsys):
@@ -166,28 +121,25 @@ def test_correct_model_no_error(capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_is_anthropic_model_native_claude():
-    assert is_anthropic_model("claude-haiku-4-5-20251001") is True
-
-
-def test_is_anthropic_model_with_anthropic_prefix():
-    assert is_anthropic_model("anthropic/claude-haiku-4-5-20251001") is True
-
-
-def test_is_anthropic_model_rejects_openai():
-    assert is_anthropic_model("gpt-4o-mini") is False
-
-
-def test_is_anthropic_model_rejects_bedrock():
-    # Bedrock cross-region and bedrock/ prefix must NOT match — they use AWS-side caching.
-    assert is_anthropic_model("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0") is False
-    assert is_anthropic_model("us.anthropic.claude-3-5-sonnet-20241022-v2:0") is False
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("claude-haiku-5-5", True),
+        ("anthropic/claude-haiku-5-5", True),
+        ("gpt-4o-mini", False),
+        # Bedrock models must NOT match: they use AWS-side caching.
+        ("bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0", False),
+        ("us.anthropic.claude-3-5-sonnet-20241022-v2:0", False),
+    ],
+)
+def test_is_anthropic_model(model, expected):
+    assert is_anthropic_model(model) is expected
 
 
 def test_model_matches_provider_openai():
     openai = next(p for p in PROVIDERS if p.id == "openai")
     assert model_matches_provider("gpt-4o-mini", openai) is True
-    assert model_matches_provider("claude-haiku-4-5-20251001", openai) is False
+    assert model_matches_provider("claude-haiku-5-5", openai) is False
 
 
 def test_model_matches_provider_google():
@@ -208,7 +160,7 @@ def test_resolve_fallbacks_lists_other_configured_providers_in_priority_order():
         ANTHROPIC_API_KEY="a", OPENAI_API_KEY="o", GEMINI_API_KEY="g", OPENAI_MODEL="gpt-4.1"
     )
     with patch.dict("os.environ", env):
-        assert resolve_fallbacks("claude-haiku-4-5-20251001") == [
+        assert resolve_fallbacks("claude-haiku-5-5") == [
             "gpt-4.1",
             "gemini/gemini-2.0-flash",
         ]
@@ -218,14 +170,14 @@ def test_resolve_fallbacks_empty_with_a_single_key():
     from agent.config import resolve_fallbacks
 
     with patch.dict("os.environ", _env(ANTHROPIC_API_KEY="a")):
-        assert resolve_fallbacks("claude-haiku-4-5-20251001") == []
+        assert resolve_fallbacks("claude-haiku-5-5") == []
 
 
 def test_resolve_fast_model_uses_env_override_or_main_model():
     from agent.config import resolve_fast_model
 
     with patch.dict("os.environ", {**_env(ANTHROPIC_API_KEY="a"), "FAST_MODEL": ""}):
-        assert resolve_fast_model() == "claude-haiku-4-5-20251001"
+        assert resolve_fast_model() == "claude-haiku-5-5"
     with patch.dict("os.environ", {**_env(ANTHROPIC_API_KEY="a"), "FAST_MODEL": "gpt-4o-mini"}):
         assert resolve_fast_model() == "gpt-4o-mini"
 
@@ -238,8 +190,9 @@ def test_resolve_fast_model_uses_env_override_or_main_model():
 def test_opencode_zen_uses_its_endpoint_and_key():
     with patch.dict("os.environ", _env(OPENCODE_API_KEY="zen-key")):
         model = resolve_model()
-        assert model == "openai/space-bunny-free"
+        assert model == "openai/glm-5.3-flash"
         assert connection_kwargs(model) == {
+            **TIMEOUT,
             "api_base": "https://opencode.ai/zen/v1",
             "api_key": "zen-key",
         }
@@ -247,11 +200,15 @@ def test_opencode_zen_uses_its_endpoint_and_key():
 
 def test_qwen_needs_both_url_and_key():
     with patch.dict("os.environ", _env(QWEN_API_KEY="q")):
-        assert resolve_model() == "claude-haiku-4-5-20251001"  # URL missing → not configured
+        assert resolve_model() == "claude-haiku-5-5"  # URL missing → not configured
     with patch.dict("os.environ", _env(QWEN_API_KEY="q", QWEN_BASE_URL="http://gpu-box:8000/v1")):
         model = resolve_model()
         assert model == "hosted_vllm/qwen36-35b-a3b"
-        assert connection_kwargs(model) == {"api_base": "http://gpu-box:8000/v1", "api_key": "q"}
+        assert connection_kwargs(model) == {
+            **TIMEOUT,
+            "api_base": "http://gpu-box:8000/v1",
+            "api_key": "q",
+        }
 
 
 def test_litellm_prefix_added_to_a_bare_model_name(capsys):
@@ -264,26 +221,16 @@ def test_litellm_prefix_added_to_a_bare_model_name(capsys):
     assert capsys.readouterr().err == ""
 
 
-def test_each_named_provider_alone_resolves_to_its_default():
-    for provider in PROVIDERS:
-        if provider.id == "custom":
-            continue
-        env = _env(**{name: "x" for name in provider.requires})
-        with patch.dict("os.environ", env):
-            model = resolve_model()
-        assert model == provider.default_model, provider.id
-
-
 def test_llm_provider_moves_a_configured_provider_first():
     env = _env(ANTHROPIC_API_KEY="a", OPENCODE_API_KEY="z", LLM_PROVIDER="opencode")
     with patch.dict("os.environ", env):
-        assert resolve_model() == "openai/space-bunny-free"
-        assert resolve_fallbacks("openai/space-bunny-free") == ["claude-haiku-4-5-20251001"]
+        assert resolve_model() == "openai/glm-5.3-flash"
+        assert resolve_fallbacks("openai/glm-5.3-flash") == ["claude-haiku-5-5"]
 
 
 def test_llm_provider_unknown_or_unconfigured_prints_error_and_keeps_default_order(capsys):
     with patch.dict("os.environ", _env(ANTHROPIC_API_KEY="a", LLM_PROVIDER="qwen")):
-        assert resolve_model() == "claude-haiku-4-5-20251001"
+        assert resolve_model() == "claude-haiku-5-5"
     err = capsys.readouterr().err
     assert "LLM_PROVIDER" in err and "qwen" in err
 
@@ -297,8 +244,8 @@ def test_custom_model_accepts_any_litellm_string_and_takes_priority(capsys):
     with patch.dict("os.environ", env):
         model = resolve_model()
         assert model == "ollama_chat/llama3.1"
-        assert connection_kwargs(model) == {"api_base": "http://localhost:11434"}
-        assert resolve_fallbacks(model) == ["claude-haiku-4-5-20251001"]
+        assert connection_kwargs(model) == {**TIMEOUT, "api_base": "http://localhost:11434"}
+        assert resolve_fallbacks(model) == ["claude-haiku-5-5"]
     assert capsys.readouterr().err == ""
 
 
@@ -306,6 +253,7 @@ def test_connection_kwargs_matches_a_fast_model_by_prefix():
     env = _env(QWEN_API_KEY="q", QWEN_BASE_URL="http://x/v1")
     with patch.dict("os.environ", env):
         assert connection_kwargs("hosted_vllm/qwen3-8b") == {
+            **TIMEOUT,
             "api_base": "http://x/v1",
             "api_key": "q",
         }
@@ -313,8 +261,8 @@ def test_connection_kwargs_matches_a_fast_model_by_prefix():
 
 def test_connection_kwargs_empty_for_an_unconfigured_model():
     with patch.dict("os.environ", _env(ANTHROPIC_API_KEY="a")):
-        assert connection_kwargs("gpt-4o-mini") == {}
-        assert connection_kwargs("claude-haiku-4-5-20251001") == {"api_key": "a"}
+        assert connection_kwargs("gpt-4o-mini") == TIMEOUT
+        assert connection_kwargs("claude-haiku-5-5") == {**TIMEOUT, "api_key": "a"}
 
 
 def test_background_kwargs_turn_down_reasoning_for_background_work():
@@ -327,8 +275,111 @@ def test_background_kwargs_turn_down_reasoning_for_background_work():
         qwen = background_kwargs("hosted_vllm/qwen36-35b-a3b")
         assert qwen["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
         assert qwen["api_base"] == "http://x/v1"
-        assert background_kwargs("openai/space-bunny-free")["reasoning_effort"] == "low"
-        assert background_kwargs("claude-haiku-4-5-20251001") == {"api_key": "a"}  # nothing extra
+        assert background_kwargs("openai/glm-5.3-flash")["reasoning_effort"] == "low"
+        assert background_kwargs("claude-haiku-5-5") == {
+            **TIMEOUT,
+            "api_key": "a",
+        }  # nothing extra
         assert "extra_body" not in connection_kwargs(
             "hosted_vllm/qwen36-35b-a3b"
         )  # user-facing calls keep reasoning
+
+
+def test_every_llm_call_gets_a_timeout_so_a_hung_provider_cannot_freeze_the_ui():
+    from agent.config import background_kwargs
+
+    with patch.dict("os.environ", _env(ANTHROPIC_API_KEY="a")):
+        for kwargs in (
+            connection_kwargs("unknown/model"),
+            background_kwargs("claude-haiku-5-5"),
+        ):
+            assert kwargs["timeout"] == LLM_TIMEOUT_S
+
+
+def test_a_model_two_configured_providers_could_serve_warns_once(capsys):
+    """openai/ is both OpenAI's prefix and OpenCode Zen's: the choice must not be silent."""
+    with patch.dict("os.environ", _env(OPENAI_API_KEY="o", OPENCODE_API_KEY="z")):
+        for _ in range(3):
+            assert connection_kwargs("openai/deepseek-v4-pro")["api_key"] == "o"
+        assert connection_kwargs("openai/glm-5.3-flash")["api_key"] == "z"  # exact: no doubt
+    err = capsys.readouterr().err
+    assert err.count("WARNING") == 1
+    assert "'openai/deepseek-v4-pro' could belong to openai or opencode" in err
+    assert "JUDGE_PROVIDER" in err  # the warning says how to choose
+
+
+ROLES = [
+    ("FAST_MODEL", "FAST_PROVIDER", "resolve_fast_model"),
+    ("JUDGE_MODEL", "JUDGE_PROVIDER", "resolve_judge_model"),
+]
+
+
+@pytest.mark.parametrize(("model_var", "provider_var", "resolver"), ROLES)
+def test_a_named_provider_serves_its_roles_model_without_a_warning(
+    model_var, provider_var, resolver, capsys
+):
+    """openai/ is OpenAI's and OpenCode Zen's; naming Zen sends the call there."""
+    import agent.config as config
+    from agent.config import background_kwargs
+
+    env = _env(
+        OPENAI_API_KEY="o",
+        OPENCODE_API_KEY="z",
+        **{model_var: "deepseek-v4-pro", provider_var: "OpenCode"},
+    )
+    with patch.dict("os.environ", env):
+        model = getattr(config, resolver)()
+        assert model == "openai/deepseek-v4-pro"  # Zen's LiteLLM prefix added
+        assert connection_kwargs(model) == {
+            **TIMEOUT,
+            "api_base": "https://opencode.ai/zen/v1",
+            "api_key": "z",
+        }
+        assert background_kwargs(model)["reasoning_effort"] == "low"
+        assert resolve_model() == "gpt-4o-mini"  # the main model is untouched
+        assert connection_kwargs("gpt-4o-mini")["api_key"] == "o"
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(("model_var", "provider_var", "resolver"), ROLES)
+def test_a_named_provider_without_a_model_uses_that_providers_model(
+    model_var, provider_var, resolver
+):
+    import agent.config as config
+
+    env = _env(ANTHROPIC_API_KEY="a", GROQ_API_KEY="g", **{provider_var: "groq"})
+    with patch.dict("os.environ", env):
+        assert getattr(config, resolver)() == "groq/llama-3.3-70b-versatile"
+    with patch.dict("os.environ", _env(ANTHROPIC_API_KEY="a")):
+        assert getattr(config, resolver)() == "claude-haiku-5-5"  # nothing set: the main model
+
+
+@pytest.mark.parametrize(("model_var", "provider_var", "resolver"), ROLES)
+def test_an_unusable_provider_name_is_reported_once_and_ignored(
+    model_var, provider_var, resolver, capsys
+):
+    import agent.config as config
+
+    env = _env(
+        OPENAI_API_KEY="o", **{model_var: "openai/deepseek-v4-pro", provider_var: "opencode"}
+    )
+    with patch.dict("os.environ", env):
+        for _ in range(3):
+            model = getattr(config, resolver)()
+            assert model == "openai/deepseek-v4-pro"
+            assert connection_kwargs(model)["api_key"] == "o"
+    err = capsys.readouterr().err
+    assert err.count("ERROR") == 1
+    assert f"{provider_var}='opencode' is not a configured provider" in err
+
+
+def test_a_providers_own_model_stays_with_it_whatever_a_role_names():
+    """The main model and its fallbacks are never rerouted by FAST_PROVIDER."""
+    env = _env(
+        OPENAI_API_KEY="o",
+        OPENCODE_API_KEY="z",
+        FAST_MODEL="openai/glm-5.3-flash",
+        FAST_PROVIDER="openai",
+    )
+    with patch.dict("os.environ", env):
+        assert connection_kwargs("openai/glm-5.3-flash")["api_key"] == "z"

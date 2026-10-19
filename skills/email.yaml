@@ -1,0 +1,19 @@
+# Platform skill file for Email (newsletters, appeals and updates to supporters).
+# Mackie loads this file on every conversation turn — changes take effect immediately
+# without any restart or code change.
+#
+# Safe to edit: all fields below. See facebook.yaml for what each field means.
+# There is no hashtag_count, so hashtags are not counted; the style below says not to use them.
+# No needs_visual either: an email doesn't need a photo or graphic described.
+
+name: Email
+id: email
+tone: personal and direct — one person at the org writing to one supporter they know
+max_length: 4000
+hashtag_style: none — hashtags don't belong in email
+format_hints: |
+  - First line "Subject: …" (under 50 characters), second line "Preview: …" (under 90)
+  - Open with the supporter's connection to the cause, not with the org
+  - One story or one update per email; short paragraphs
+  - Exactly one call to action, written as a button label in [brackets]
+  - Sign off from a real person at the org, with their role

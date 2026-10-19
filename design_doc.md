@@ -2,13 +2,21 @@
 
 ## What It Is
 
-Mackie is a conversational assistant for nonprofit marketing staff. It researches an organization, then suggests and drafts on-brand posts for LinkedIn, Instagram and Facebook. It learns from feedback (corrections in the user's own words, approved posts, pasted posts) and remembers it across sessions. Every suggestion and draft goes into a post ledger with a status.
+Mackie is a conversational AI social media manager for nonprofit marketing staff, modelled on Vee's Maggie. Its job is Maggie's three steps:
+
+- **Plan:** a dated monthly calendar tied to the org's campaigns, events and relevant awareness days.
+- **Create:** on-brand posts for LinkedIn, Instagram and Facebook, and supporter email, each with an idea for the visual.
+- **Optimize:** record how posts performed and suggest what to post next from what worked.
+
+Two traits run through all three: Mackie is **proactive** (Vee: Maggie "doesn't wait for prompts"), and **nothing goes live without approval** ("Nothing goes live until you review and approve it"). It researches the org first, learns from feedback (corrections in the user's own words, approved posts, pasted posts) and remembers it across sessions. Every suggestion and draft goes into a post ledger with a status.
+
+**Scope versus Maggie.** Maggie also publishes, generates graphics, pulls analytics and advises on paid ads. Each of those needs platform accounts and API access (OAuth per org, analytics APIs, an image model with moderation), so Mackie stops at the draft: it describes the visual, and the user reports results in chat. The Roadmap lists the next steps.
 
 **Goals**
 
 - Content is grounded in research, and every suggestion names its source.
 - Corrections stick within the session and across sessions.
-- A non-engineer can add a platform or content type, and view or edit what Mackie learned, without a code change or a redeploy.
+- A non-engineer can add a platform, content type or format, and view or edit what Mackie learned, without a code change or a redeploy.
 - Switching LLM providers is a configuration change.
 - Each conversation's history is isolated.
 
@@ -30,8 +38,8 @@ User ──► app.py (Chainlit web UI)  or  main.py (terminal)
               ▼
          Assistant (agent/assistant.py)
               │  system prompt rebuilt every turn from profile.json and skills/:
-              │    stable block   — identity, org brief, sources, pillars, platforms, content types, rules
-              │    per-turn block — date, preferences, voice examples, recent ledger, conversation summary
+              │    stable block   — identity, org brief, sources, pillars, platforms, content types, formats, rules
+              │    per-turn block — date, preferences, voice examples, recent ledger, agenda, best-performing posts, summary
               ▼
          LangGraph (agent/graph.py) — AgentState checkpointed in SQLite per thread_id
               │  summarize → agent ⇄ tools   (tools → summarize → agent)
@@ -41,17 +49,18 @@ User ──► app.py (Chainlit web UI)  or  main.py (terminal)
               ▼
          LiteLLM ──► main provider, then fallbacks (agent/config.py)
               │
-              └─ 10 tools (agent/tools.py):
+              └─ 11 tools (agent/tools.py):
                    research_org, refresh_research, web_search      → agent/research.py
                    save_post, update_post_status, search_ledger,
-                   save_preference, forget_preference,
-                   save_voice_example                              → agent/memory.py
+                   record_performance, save_preference,
+                   forget_preference, save_voice_example           → agent/memory.py
                    generate_calendar                               → 4 parallel LLM calls
 
 Storage:  data/{org-id}/profile.json  (+ .bak)  org memory: research, brief, preferences, voice, ledger
+          data/{org-id}/.lock                  held while a profile is loaded, changed and saved
           data/{org-id}/trace.jsonl            one line per tool call
           data/checkpoints.db                  conversation history, keyed by thread_id
-Config:   skills/*.yaml                         platforms, content types, content pillars
+Config:   skills/*.yaml                         platforms, content types, formats, content pillars
 ```
 
 Each user message runs the loop until the model replies without calling a tool. If that reply shows post ids that were never saved, `save_check` sends one follow-up (see Checks enforced in code). Text streams token by token; each tool call appears as a step in the web UI when it finishes.
@@ -62,7 +71,7 @@ Each user message runs the loop until the model replies without calling a tool. 
 
 ### LLM access: LiteLLM behind one provider registry
 
-**What.** Every LLM call goes through `litellm.acompletion()`. `agent/config.py` holds a registry (`PROVIDERS`) of ten named providers, plus a `custom` entry that accepts any LiteLLM model string. The ten are Anthropic, OpenAI, xAI, Google, Mistral, Groq, DeepSeek, OpenRouter, OpenCode Zen and self-hosted Qwen on vLLM. A provider is configured when its required variables are set. The first configured provider in registry order is the main model, or the one named by `LLM_PROVIDER`. `connection_kwargs(model)` supplies `api_base` and `api_key` for OpenAI-compatible endpoints.
+**What.** Every LLM call goes through `litellm.acompletion()`. `agent/config.py` holds a registry (`PROVIDERS`) of ten named providers, plus a `custom` entry that accepts any LiteLLM model string. The ten are Anthropic, OpenAI, xAI, Google, Mistral, Groq, DeepSeek, OpenRouter, OpenCode Zen and self-hosted Qwen on vLLM. A provider is configured when its required variables are set. The first configured provider in registry order is the main model, or the one named by `LLM_PROVIDER`. `connection_kwargs(model)` supplies `api_base` and `api_key` for OpenAI-compatible endpoints. A model that isn't a provider's configured model is matched by prefix; `openai/` belongs to both OpenAI and OpenCode Zen, so `FAST_PROVIDER` and `JUDGE_PROVIDER` name the provider for those models. Without one, an `openai/…` model goes to OpenAI, the one higher in the registry, and a warning says so. **Why not one setting per call?** The provider is looked up from the model string inside `connection_kwargs`, so naming it per role keeps every call site unchanged. The trade-off: a role model identical to a provider's own main model goes to that provider.
 
 **Why.** Swapping models must not need code changes, and nonprofits may need free or self-hosted models. The alternative, provider SDKs called directly in each module, spreads provider logic everywhere. Adding a provider is one registry entry.
 
@@ -71,11 +80,23 @@ Each user message runs the loop until the model replies without calling a tool. 
 - OpenCode Zen gets `reasoning_effort="low"`. Its brief needed 2,112 thinking tokens at the default effort and 59 at low.
 - Qwen 3 has thinking switched off. Without that, it never finished the brief.
 
+**LiteLLM 1.106.0 is excluded.** On every call with `tools` it imports MCP gateway code that needs `mcp>=2.2`, while Chainlit pins `mcp<2`, so every chat turn failed with every provider. The offline tests mock `acompletion`, so `tests/test_deploy.py` makes one real offline tool call (`mock_response`) against the installed LiteLLM.
+
+**OpenCode Zen free models.** As of October 2026, every free model refuses clients other than the OpenCode app, so the default is `glm-5.3-flash`: the cheapest paid model on the Chat Completions endpoint, about $0.0008 for a typical turn (8K tokens in, 600 out), against $0.0014 for `deepseek-v4.1-flash` and $0.0017 for `minimax-m3`. Cheaper models on Zen's Anthropic and Responses endpoints (Haiku 5.5, `gpt-5-nano`) would need a second route; Haiku is already the Anthropic provider's default. Verified live in October 2026: streamed tool calls, a tool-result round trip, `reasoning_effort="low"` on background calls, and a full Mackie turn that saved a preference.
+
 Token limits on those calls are ceilings, not targets. User-facing replies keep full reasoning. If a reply has neither text nor a tool call, it is retried once with reasoning turned down, and then a short message is shown instead of a blank reply.
+
+### Timeouts
+
+**What.** `connection_kwargs()` adds `timeout=LLM_TIMEOUT_S` (120 s) to every LLM call, so `background_kwargs()` callers get it too. For a streamed reply it bounds the wait for each chunk, not the whole answer. Website fetches use `FETCH_TIMEOUT_S` (15 s) per page.
+
+**Why.** Without it, a provider that accepted a request and then stalled left the chat on "thinking" forever, and fallback never started, since fallback only runs when a request fails. Putting the timeout in the shared kwargs covers every current and future call site.
+
+**Trade-off.** LiteLLM's `num_retries=3` also retries timeouts, so a dead provider can take several minutes to give up before fallback. Lowering retries for chat replies is the next step if that matters.
 
 ### Provider fallback and cost routing
 
-**What.** `resolve_fallbacks()` lists the models of every other configured provider. `_open_stream()` tries them in order when a request fails to *start* (outage, rate limit, bad key). An error after tokens have streamed is not retried, because part of the reply is already on screen. `FAST_MODEL` routes background work to a cheaper model. `JUDGE_MODEL` picks the eval judge.
+**What.** `resolve_fallbacks()` lists the models of every other configured provider. `_open_stream()` tries them in order when a request fails to *start* (outage, rate limit, bad key). An error after tokens have streamed is not retried, because part of the reply is already on screen. `FAST_MODEL` routes background work to a cheaper model. `JUDGE_MODEL` picks the eval judge. `FAST_PROVIDER` and `JUDGE_PROVIDER` name their providers (see above).
 
 **Why.** A second API key is enough to survive one provider's outage. LiteLLM's `Router` was the alternative, but it would send Anthropic-format system blocks to other providers. `_system_content()` builds the system message per model instead.
 
@@ -90,6 +111,8 @@ Token limits on those calls are ceilings, not targets. User-facing replies keep 
 - **Web UI:** each browser session gets the thread `{org_id}:{uuid}`. A `:` can't occur in an org id, so a session thread can never equal another org's default thread.
 - **CLI:** resumes the thread `{org_id}`. Its `reset` command deletes that thread's checkpoints (`Assistant.clear_history()`); org memory is kept.
 
+**Concurrency.** Each turn opens its own connection (`aiosqlite`, 30-second busy wait), and the database runs in WAL mode with `synchronous=NORMAL`, so readers never wait for a writer and a commit doesn't wait for the disk. NORMAL can lose the last turns on a power cut but never corrupts the file. LangGraph runs its schema setup (`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS …`) on every new connection; with about 100 sessions starting at once those statements failed immediately with "database is locked", without waiting. `_ready_checkpointer()` runs the setup once per database and event loop, and later turns skip it; a failed setup is retried by the next turn. Measured with a mocked model: 400 simultaneous sessions, no errors, each reply in its own session, in under 8 seconds.
+
 **Limitation.** SQLite is single-process, so several replicas would need `langgraph-checkpoint-postgres`.
 
 ### Context management
@@ -99,7 +122,7 @@ Token limits on those calls are ceilings, not targets. User-facing replies keep 
 - **Ledger:** the prompt lists the 20 most recent posts. Older ones are reachable with `search_ledger`.
 - **Messages:** the model sees the last 40, starting at the first user message in that slice (`_window_start()`). A plain slice can start on a tool result whose tool call was cut off, and providers reject that. If one turn is longer than 40 messages, the whole turn is kept.
 - **Running summary:** messages that leave the window are folded into a summary of 300 words or less, one incremental LLM call each time the window moves (`summarize` node). It goes into the per-turn prompt block. If the call fails, the turn continues and the same messages are retried next time.
-- **Full history:** stays in the checkpoint; nothing is deleted.
+- **Full history:** stays in the checkpoint; no message is deleted. Each checkpoint is a full snapshot of the conversation and a turn writes several, so keeping them all grew a thread quadratically (431 MB after 400 turns, measured). After each turn `prune_history()` keeps only the thread's newest checkpoint: 2.7 MB after 400 turns. The cost is LangGraph's time travel (replaying from an earlier step), which Mackie doesn't use.
 
 **Why.** Without the summary, anything that lived only in old messages was lost, such as the scraped research, which exists only in tool results. Durable facts don't depend on the window at all: the org brief, preferences and ledger are in `profile.json` and rebuilt into every prompt.
 
@@ -110,13 +133,13 @@ Token limits on those calls are ceilings, not targets. User-facing replies keep 
 **What.** The system prompt is two blocks:
 
 - **Stable:** identity, org brief, sources, pillars, skills and rules. It changes only when research or skill files change.
-- **Per-turn:** date, preferences, voice examples, ledger and summary. It changes almost every turn.
+- **Per-turn:** date, preferences, voice examples, ledger, agenda, best-performing posts and summary. It changes almost every turn.
 
 For Anthropic models the stable block carries `cache_control`. Other providers get one plain string.
 
 **Why.** The ledger changes on almost every turn, so caching the whole prompt would invalidate the cache constantly.
 
-**Caveat.** Claude Haiku 4.5 caches only prefixes of 4,096 tokens or more. Tools plus the stable block are just above that once an org brief exists. The savings have not been measured; check `usage.cache_read_input_tokens`.
+**Caveat.** Claude Haiku 4.5, the previous default, cached only prefixes of 4,096 tokens or more; the minimum for Haiku 5.5, the current default, has not been checked. Tools plus the stable block come to about 5,600 tokens before any org brief (measured with an OpenAI tokenizer; Claude's count differs somewhat), so they clear that minimum. The savings have not been measured; check `usage.cache_read_input_tokens`.
 
 ### Org brief
 
@@ -149,8 +172,9 @@ If the brief call fails, research is still saved with an empty brief.
    - non-HTTP(S) schemes;
    - metadata hostnames, `localhost` and `*.localhost`;
    - any IP literal that isn't a public unicast address (`not is_global`), which covers loopback, private, link-local, unspecified and carrier-grade NAT (100.64.0.0/10, including Alibaba Cloud's metadata endpoint);
-   - IPv4-mapped IPv6;
-   - hex, decimal, octal and short IP forms.
+   - IPv6 addresses that carry an IPv4 address, judged by that address: IPv4-mapped (`::ffff:127.0.0.1`), NAT64 (`64:ff9b::a9fe:a9fe` reaches 169.254.169.254 through a NAT64 gateway, yet Python counts it as global) and IPv4-compatible (`::127.0.0.1`); the local-use NAT64 prefix `64:ff9b:1::/48` is always refused;
+   - hex, decimal, octal and short IP forms;
+   - hosts disguised with percent-encoding (`%31%32%37.0.0.1`) or fullwidth digits, which are decoded and NFKC-normalised first.
 2. **`_resolves_to_internal()`** resolves the hostname and blocks it if *any* address is internal, so a public-looking domain pointing at `127.0.0.1` is refused.
 
 **Remaining gap.** httpx resolves the name again when it connects, so a DNS server that answers differently the second time (DNS rebinding) is not caught. The fix is to pin the connection to the checked address.
@@ -178,9 +202,10 @@ The wrapper escapes any copy of its own tag inside the text, so a page containin
   "preferences": { "voice": "warm and grassroots", "banned_topics": ["politics"] },
   "preference_notes": { "voice": { "learned_at": "…", "quote": "Too corporate, we're more warm and grassroots" } },
   "voice_examples": [ { "content": "…", "source": "approved post_004", "added_at": "…" } ],
-  "post_ledger": [ { "id": "post_002", "title": "Volunteer spotlight", "platform": "linkedin",
-                     "status": "draft", "pillar": "Community Impact", "parent_id": "post_001",
-                     "source_url": "https://…", "created_at": "…" } ]
+  "post_ledger": [ { "id": "post_002", "title": "Volunteer spotlight", "platform": "instagram",
+                     "status": "posted", "format": "carousel", "visual": "Ana at the pantry",
+                     "pillar": "Community Impact", "parent_id": "post_001", "source_url": "https://…",
+                     "created_at": "…", "performance": { "reactions": 240, "shares": 30, "recorded_at": "…" } } ]
 }
 ```
 
@@ -188,22 +213,24 @@ The wrapper escapes any copy of its own tag inside the text, so a page containin
 
 **Hand-edit safety.**
 
-- **Saving:** writes go to a temp file that is swapped in atomically, and the previous version is kept as `profile.json.bak`.
+- **Saving:** writes go to a temp file (named per process) that is swapped in atomically, and the previous version is kept as `profile.json.bak`.
 - **Loading:** `ProfileError` describes the mistake in plain words: invalid JSON (with line and column), a top level that isn't an object, or a section of the wrong type (e.g. `"preferences": null`, or a `post_ledger` that isn't a list of objects). Keys missing from an older or hand-edited file get their defaults.
 - **Hand-written posts:** a post with missing fields doesn't break the prompt or the ledger tools.
 - **Post IDs:** `_next_post_id()` assigns one above the highest existing number, so deleting a post never causes an ID to be reused.
 
-**Org ids.** `slugify()` keeps only `[a-z0-9-]`, and `_org_dir()` refuses any id that isn't in that form, so no id can reach outside `data/`. A name with no Latin letters or digits (Greek, Japanese) gets a stable `org-<hash>` id instead of an empty one.
+**Org ids.** `slugify()` keeps only `[a-z0-9-]`, and `_org_dir()` refuses any id that isn't in that form, so no id can reach outside `data/`. A name with no Latin letters or digits (Greek, Japanese) gets a stable `org-<hash>` id instead of an empty one. A name with no letters or digits in any script ("!!!") gets no id, so the UIs ask again instead of creating an org.
 
-**Limitation.** Load, change and save is not locked: two people editing the same org at once can overwrite each other. A multi-user deployment needs a database with row-level locking.
+**Concurrent writers.** Every load, change and save holds the org's lock file (`memory.locked()`, an exclusive `flock` on `data/{org-id}/.lock`), and the temp file is named per process. Within one server process the sections never await, so web sessions never wait on each other; the lock makes separate processes (the web UI, the CLI, `scripts/eval.py`) take turns. Before it, two processes adding 50 posts each to one org kept 50 of 100, and one crashed because the other had already renamed their shared temp file. Research loads the profile only after its slow calls, so posts saved meanwhile survive. The lock is reentrant within a thread, so a locked caller can call `add_post`; other threads still wait.
+
+**Limitation.** `flock` is Unix-only, so Mackie runs on Linux, macOS, WSL or Docker but not on native Windows, and it works within one machine: several servers sharing `data/` need a database with row-level locking.
 
 ### Learning from feedback
 
 **What.**
 
 - `save_preference(key, value, quote, append)` keeps `preferences[key]` a plain value, or a list with `append` (e.g. `banned_topics`). It stores the date and the user's own words in `preference_notes`. Keys can be scoped to a platform, e.g. `linkedin_voice`.
-- `forget_preference(key, value?)` removes a key, one item of a list, or a string preference only when the value matches.
-- Approved posts and posts the user pastes become voice examples. The newest 5 are kept, and 3 appear in the prompt as "match their voice, not their topics".
+- `forget_preference(key, value?)` removes a key, one item of a list, or a string preference only when the value matches, ignoring case.
+- Approved posts (once, however often they are approved) and posts the user pastes become voice examples. The newest 5 are kept, and 3 appear in the prompt as "match their voice, not their topics".
 - Ideas the user turns down get the status `rejected`.
 - Asked "what have you learned about us?", Mackie answers from these sections.
 
@@ -211,22 +238,27 @@ The wrapper escapes any copy of its own tag inside the text, so a page containin
 
 ### Post ledger
 
-**What.** `save_post` requires a title. It optionally takes a pillar, content type, `parent_id` (the post this is a version of), `scheduled_for` and `source_url`. The statuses are `suggested`, `draft`, `approved`, `posted`, `planned` and `rejected` (`memory.POST_STATUSES`). Suggestions are shown with their ledger id (`**2. Volunteer spotlight** · post_003`), so "the second one" still resolves after a summary or in a new session. `search_ledger` filters by status, platform, date range and text.
+**What.** `save_post` requires a platform, the content and a title. It optionally takes a pillar, content type, `format`, `visual`, `parent_id` (the post this is a version of), `scheduled_for` and `source_url`. The statuses are `suggested`, `draft`, `approved`, `posted`, `planned` and `rejected` (`memory.POST_STATUSES`). Suggestions are shown with their ledger id (`**2. Volunteer spotlight** · post_003`), so "the second one" still resolves after a summary or in a new session. `search_ledger` filters by status, platform, date range and text.
 
 **Why.** Users ask "what did we work on this week?", which needs dates and a query beyond the 20 posts in the prompt. Versions link a LinkedIn draft, its rewrite and its Instagram version.
 
 ### Checks enforced in code
 
-**What.** `save_post` checks a post before saving it:
+**What.** `save_post` checks a finished post (status `draft`, `approved` or `posted`) before saving it. Ideas (`suggested`, `planned`) skip the platform rules, and `update_post_status` re-checks the stored text before a post becomes `approved` or `posted`, so nothing goes live unchecked:
 
 | Problem | Result |
 |---|---|
 | Longer than the platform's `max_length` | Not saved; the model is told to fix it and save again. |
-| Hashtag count outside `hashtag_count` | Not saved, same as above. |
+| Hashtag count outside `hashtag_count` (skipped for a format without a caption, such as a story) | Not saved, same as above. |
+| No `visual` on a platform with `needs_visual` (Instagram, Facebook) | Not saved, same as above. |
+| A `format` that doesn't exist, or not on this platform (a LinkedIn story, an email feed post) | Not saved, same as above. |
 | `parent_id` that isn't in the ledger | Not saved. |
+| A suggestion with no `source_url` while research sources exist | Not saved: every idea must cite its source. |
 | `source_url` that isn't a known research source | Saved, with a warning. |
 
-Tools that take a status or a date (`save_post`, `update_post_status`, `search_ledger`) reject a status outside `POST_STATUSES` and a date that isn't `YYYY-MM-DD`, with a message the model can act on. Platforms not defined in `skills/` (e.g. `general`) skip the platform checks.
+Tools that take a status or a date (`save_post`, `update_post_status`, `search_ledger`) reject a status outside `POST_STATUSES` and a date that isn't `YYYY-MM-DD`, with a message the model can act on. Platforms not defined in `skills/` (e.g. `general`) skip the platform checks. The platform is stored in lowercase, as skill ids are, so "LinkedIn" and "linkedin" are one platform. Research sources typed into `profile.json` as plain URLs instead of `{...}` entries are skipped rather than breaking `save_post` and `web_search`.
+
+**Found live.** Applying the rules to ideas made a live run add hashtags to rough suggestions, retry four rejected saves, take 67 seconds over one answer and tell the user "three posts need hashtag fixes". The same run showed a *Visual:* line in every Instagram reply but never saved one, so the visual is now required in code rather than asked for in the prompt.
 
 **Why.** Models miscount characters and don't always follow the tool schema:
 
@@ -234,7 +266,7 @@ Tools that take a status or a date (`save_post`, `update_post_status`, `search_l
 - A Qwen run invented a `parent_id`.
 - A date like "last week" was compared as text and silently matched the wrong posts.
 
-Sources only get a warning, because whether a source is good enough is a judgment call.
+A *wrong* source only gets a warning, because whether a source is good enough is a judgment call. A *missing* one on a suggestion is refused: the live eval found four suggestions whose reply cited a source that never reached the ledger.
 
 **Unsaved suggestions.** Two checks make sure a post shown to the user is in the ledger:
 
@@ -243,12 +275,35 @@ Sources only get a warning, because whether a source is good enough is a judgmen
 
 **Why.** In live evals, both Claude Haiku 4.5 and an OpenCode Zen model went straight from the research result to the suggestions without calling `save_post`, and wrote ledger ids themselves. "The second one" then pointed at a post that didn't exist, and step 7 repeated step 1's ideas because the ledger didn't contain them. The rule was already in the system prompt; a reminder in the tool result is where the model looks next. The id check is a backstop for any model, at the cost of one extra LLM call only when it fires. A reply with numbered ideas and no ids at all isn't caught; detecting that from free text would be guesswork.
 
-### Skills: platforms, content types and pillars as YAML
+### Post results (Optimize)
 
-**What.** Each `skills/*.yaml` file is one of two kinds:
+**What.** `record_performance(post_id, reach?, reactions?, comments?, shares?, clicks?, saves?, note?)` stores the counts the user reports under the post's `performance` key, with `recorded_at`, and sets its status to `posted`. A later report replaces the earlier one, because platforms show running totals. Counts must be whole numbers of zero or more; anything else ("raised $400") goes in `note`. Engagement is the sum of every count except reach (`memory.engagement`). The per-turn prompt lists the five posts with the most engagement, with their platform, pillar and numbers, under "What Performed Best", and the calendar is shown the top three.
 
-- **`kind: platform`** (the default): `id`, `name` and `max_length` are required; `tone`, `hashtag_count`, `hashtag_style` and `format_hints` are optional.
+**Why.** Maggie's Optimize step ("analyzes performance and suggests what to post next") is what turns a drafting tool into a manager. Without results, "what should we post next?" can only be answered by avoiding repeats. Entering numbers in chat needs no platform accounts and works for email too.
+
+**Trade-offs.** Ranking by raw engagement favors posts with a large reach; an engagement rate needs reach, which users often leave out. Numbers are only as good as what the user types. The next step is importing platform analytics (see Roadmap).
+
+### Agenda: leading with what needs the user
+
+**What.** `memory.agenda(ledger, today)` groups the posts that need the user by next step: drafts awaiting approval, approved posts to publish, `planned` posts due within 7 days (or overdue), and `posted` posts at least 3 days old with no results. A draft or approved post with a newer version on the *same* platform is left out, since that version is the one to act on; a version for another platform, or one the user rejected, doesn't replace it. The groups go into the per-turn prompt as "Needs Attention", at most 5 posts per group with the rest counted, so a backlog can't flood every prompt; and a stable rule tells Mackie to open with them when the user greets it or asks what's next, or else to propose this week's posts. `agenda_summary()` puts the same counts in the web and terminal greetings.
+
+**Why.** Maggie works without prompting and sends deliverables for approval. A chat app can't act between sessions, so Mackie does the next best thing: every session starts with the next step instead of an empty "what would you like to work on?". Computing the agenda in code means the model doesn't have to scan the ledger for overdue items itself.
+
+**Trade-off.** Without a scheduler, nothing happens until someone opens Mackie. Email or Slack reminders driven by the same `agenda()` are the next step (see Roadmap).
+
+### Post formats
+
+**What.** A third skill kind, `kind: format`: feed post, carousel, story and reel ship in `skills/`. Each has a `purpose` (the role it plays), a `structure` the draft follows (slides, frames, a hook and shot list), optional `platforms`, and optional `has_caption: false`. `save_post` takes a `format`. A format that doesn't exist, or doesn't exist on the post's platform (a LinkedIn story), is not saved. A format without a caption skips the platform's hashtag rule, so an Instagram story isn't refused for lacking 10 hashtags. The calendar picks a format for each post.
+
+**Why.** Vee's own material says "each post type plays a role": feed posts for the lasting record, stories for connection with followers, reels for reach. A caption-only assistant can't produce a story or a reel. Formats are independent of platform and purpose, so "a donation appeal as an Instagram reel" combines three files, and a new format is a new file.
+
+### Skills: platforms, content types, formats and pillars as YAML
+
+**What.** Each `skills/*.yaml` file is one of three kinds:
+
+- **`kind: platform`** (the default): `id`, `name` and `max_length` are required; `tone`, `hashtag_count`, `hashtag_style`, `format_hints` and `needs_visual` (true or false) are optional.
 - **`kind: content_type`**: `id`, `name`, `purpose` and `structure` are required; `must_include` and `avoid` are optional.
+- **`kind: format`**: `id`, `name`, `purpose` and `structure` are required; `platforms` (a list) and `has_caption` (true or false) are optional.
 
 `skills/content_pillars.yaml` holds the default pillars, and a `content_pillars` list in `profile.json` overrides them for one org. Everything is loaded on every turn by `agent/skills.py`, so no restart is needed.
 
@@ -260,21 +315,42 @@ Sources only get a warning, because whether a source is good enough is a judgmen
 - as a Heads-up at the start of a web chat;
 - by `scripts/validate.py`, which exits with code 1.
 
-A broken pillars file means no pillars, not a crash.
+A broken pillars file (invalid YAML, no `pillars:` list) means no pillars, not a crash, and a pillar without a name is skipped; both are reported the same way.
 
 ### Content calendar
 
-**What.** `generate_calendar` plans one post per week for four weeks, with the four LLM calls run in parallel. Each call gets the platforms from `skills/`, the org's pillars, its brief and preferences, and its recent posts. The results are saved as `planned` ledger entries and returned as a table. A failed week becomes an error row; the other weeks are still saved.
+**What.** `generate_calendar(month_year, focus?, posts_per_week?)` plans four weeks (days 1–7, 8–14, 15–21, 22–end), with the four LLM calls run in parallel. Each call asks for `posts_per_week` posts (default 2, capped at 1–3) on different platforms or formats, and replies `{"posts": [...]}`. A bare post object, a list or fenced JSON is also accepted (`_parse_week_plan`), extra posts are dropped, and a format that doesn't exist on the post's platform is cleared (a live plan put emails in `feed_post`). Each call gets the week's dates, the campaign `focus` if given, the platforms and formats from `skills/`, the org's pillars, its brief (wrapped as untrusted) and preferences, its best-performing posts, and its recent posts. It is asked to tie a post to an awareness day, giving day or org event in that week, and returns a date, platform, format, angle, pillar, key date and rationale for each post. A date outside the week is replaced by the week's first day. The results are saved as `planned` ledger entries with `scheduled_for` (and `key_date`) and returned as a table. A failed week becomes an error row; the other weeks are still saved. A `month_year` that isn't "July 2026" or "Jul 2026" is refused with an error the model can fix.
 
-**Why.** Running the weeks in parallel takes about as long as one call.
+**Why.** Maggie plans "a monthly content calendar aligned with the organization's goals" and "syncs with key calendar dates", and its Starter plan delivers "2 custom posts/week". One call per week, rather than per post, lets the posts within a week differ from each other. Real dates make the plan usable and searchable by `scheduled_for`. Awareness days come from the model's own knowledge, which avoids a dependency on a dates API but can miss local or new ones; the user can correct them in chat. Running the weeks in parallel takes about as long as one call.
 
 **Limitation.** The calendar plans angles; it doesn't write the posts.
 
 ### Tool failures become tool results
 
-**What.** `handle_tool_call()` never raises. An exception becomes the tool result `Error: {tool} failed — …` and is traced. Malformed tool-call JSON is parsed as `{}`.
+**What.** `handle_tool_call()` never raises. An exception becomes the tool result `Error: {tool} failed — …` and is traced. Tool-call JSON is parsed leniently: raw line breaks inside strings are accepted. JSON that still fails (malformed, or cut off) gets `Error: the arguments for {tool} were not valid JSON …`, and the trace keeps the raw text. It used to be parsed as `{}`, so in a live eval a broken `save_post` was told it lacked every argument, which hid the real cause. Required arguments are checked against each tool's schema first, so a call without one gets `Error: save_post needs content; …` instead of a `KeyError`. Optional arguments sent as `null` or `""` count as not given: models often fill every optional argument that way, and `status: ""` was refused while `max_results: null` crashed `web_search`.
 
 **Why.** The tool-call message is checkpointed before the tool runs. A raised exception left that call unanswered, and providers reject every later request in that thread. Returning the error keeps the thread valid and lets the model recover.
+
+### Testing
+
+**What.** Every test is offline: autouse fixtures fail any unmocked LLM call or HTTP request and stub DNS. Besides the per-module tests, these cover concerns that cut across modules:
+
+- **Security** (`test_security.py`): SSRF bypass forms, every tool in `TOOL_DEFINITIONS` called with malformed arguments (nulls, wrong types, 100 KB strings), bad org ids through every entry point, one org's memory never reaching another's prompt, injected text staying inside its tag through the agent loop, and the trace's fields.
+- **Performance** (`test_performance.py`): the parallel I/O; responsiveness (tokens streamed as produced, tool steps shown before the next model call, a slow session not stalling another, a timeout on every LLM call and page fetch, fallback after a timeout); scale (the prompt's size as memory grows to 2,000 posts, ledger operations at 20,000 posts); and linear-time parsing of hostile input.
+- **UIs and UX** (`test_ui.py`): onboarding, greetings (most urgent work first), broken memory files, tokens shown as they arrive, what a tool step shows, plain-language errors and the welcome copy, in `app.py` and `main.py`, with Chainlit and the terminal prompt faked.
+- **Sessions** (`test_sessions.py`): concurrent sessions whose tool writes must land in their own org, the schema set up once, two people on one org (shared memory, separate conversations), the CLI and web histories kept apart, interleaved streams, a model that names another org in its tool arguments, and separate processes writing to one org (every profile writer must wait for another process's lock).
+- **Browser** (`tests/browser/`, opt-in with `pytest -m browser`): the real Chainlit server and frontend in headless Chromium, with a scripted model (`serve.py`): onboarding, a reply visible while it is still streaming, a tool step and the ledger after a reload, the layout at phone width (390 px, no sideways scrolling), and two browsers on one org keeping their conversations apart. About 15 seconds, so it is a separate CI job outside the time budget.
+- **Deployment** (`test_deploy.py`): secrets kept out of git and the Docker image, Chainlit settings, and one unmocked LiteLLM tool call (`mock_response`, so still offline) that catches a release that breaks tool calls, as 1.106.0 did.
+
+`conftest.py` fails a run that takes more than 10 seconds (not under coverage or for the browser tests). CI also requires 95% branch coverage.
+
+**Why.** Parallelism is proven with `ConcurrencyProbe`, a stand-in that returns only once N calls are in flight together. A sequential loop times out instead, so a lost `asyncio.gather` fails a test, and no wall-clock timing is involved that could flake on a slow runner. Fuzzing every tool from its schema means a new tool is covered without a new test. Writing these tests found real problems, each now with a regression test: NAT64, IPv4-compatible, percent-encoded and fullwidth hosts passed the SSRF guard; the agenda section had no size limit; `slugify("!!!")` created an org; LLM calls had no timeout; about 100 concurrent sessions hit "database is locked" (see Agent loop); checkpoint storage grew quadratically with conversation length (see Context management); and separate processes overwrote each other's posts (see Memory).
+
+Streaming and isolation tests use gated streams: a mock model that only produces its next token after an event the test sets. A UI that buffered, or a session that blocked the event loop, deadlocks and fails at a 5-second bound instead of passing slowly. Each new test was checked by breaking the code it guards: setting up the schema on every turn, buffering tokens in the web UI, removing the timeout, skipping the org lock, and making the lock non-reentrant each made the intended test fail. The browser tests were checked the same way: buffered tokens, one shared thread per org and a page wider than a phone each failed theirs.
+
+**One owner per behavior.** Each behavior is tested in one place, and a new case extends an existing parametrized test rather than copying it. Overlap is kept only across layers that can break separately: the timeout as a setting and at every call site, and `app.py` with a fake Chainlit and in a real browser. An audit that merged duplicates (35 fewer test cases, coverage unchanged) also found three hollow tests, which pass whatever the code does: a temp-file check for a name no longer used, a `record_performance` case rejected before it reached the org-id check it was there for, and a prompt check for words that appear anyway.
+
+**Trade-offs.** Coverage instrumentation doubles the run time, so the time budget is skipped under coverage and CI runs the suite twice, plus the browser job. The live behavior of the model is covered only by `scripts/eval.py`, which costs API calls and isn't run in CI.
 
 ### Observability
 
@@ -298,12 +374,12 @@ A broken pillars file means no pillars, not a crash.
 
 It then reports two kinds of checks:
 
-- **LLM judge.** Each reply is scored 0–3 on source attribution, voice consistency, and step 7 not repeating step 1: 21 judge calls in parallel. For the repeat check the judge is also shown step 1's reply; without it, the judge was guessing. A failed judge call scores -1 and the others still count.
+- **LLM judge.** Each reply is scored 0–3 on source attribution, voice consistency, and step 7 not repeating step 1: 21 judge calls in parallel. For the repeat check the judge is also shown step 1's reply; without it, the judge was guessing. A failed judge call scores -1 and the others still count. The report totals the scores out of 63; 70% or more (`PASS_PERCENT`) is a pass.
 - **Saved data, no LLM.** From snapshots of the profile taken after each step: a preference saved by step 3, step 7 saving posts that aren't copies or versions of step 1's, and a `source_url` on every suggestion.
 
 **Why both.** The judge reads only the replies. In one run it contradicted itself, and nothing showed that the voice correction was never saved. The saved-data checks are exact about what the system learned, but they can't catch a paraphrased repeat; that is the judge's job.
 
-**Judge bias.** Set `JUDGE_MODEL` to a model from another provider, so the judge doesn't grade its own model's work.
+**Judge bias.** Set `JUDGE_MODEL` to a model from another provider, or at least another family, so the judge doesn't grade its own model's work. With only an OpenCode Zen key, use `openai/deepseek-v4-pro` against the assistant's `glm-5.3-flash`: Zen's Claude, GPT and Gemini models reject the Chat Completions path, and DeepSeek V4 Pro, Kimi K3 and MiniMax M3 all answered a judge-style probe in about 2 to 3 seconds. The report names both models. A reasoning judge thinks before answering, so `JUDGE_MAX_TOKENS` is a ceiling, not a target. In 60 DeepSeek V4 Pro calls on real Mackie replies, the old 1,000-token cap left 3 replies empty and cut 1 off, all at `finish_reason=length`. At 4,000 all 60 returned valid JSON, using at most 1,271 tokens (median 143). An empty reply is still asked once more before it scores -1.
 
 ---
 
@@ -311,16 +387,19 @@ It then reports two kinds of checks:
 
 | Gap | Today | Next step |
 |---|---|---|
-| Concurrent edits | `profile.json` writes are not locked | PostgreSQL for org memory; `langgraph-checkpoint-postgres` for history (also enables several replicas) |
+| Several servers | `profile.json` writes are locked per machine (`flock`), SQLite history is single-process | PostgreSQL for org memory; `langgraph-checkpoint-postgres` for history |
 | Authentication | Anyone who can reach the UI can open any org | Chainlit OAuth or a reverse proxy; per-org access rules |
 | Rate limiting | None | Per-org, per-tool counters in Redis or Postgres |
 | DNS rebinding | Names are checked, then resolved again by httpx | Connect to the checked address |
 | Injected preferences | Any key is accepted; quotes help spot injections | Key allowlist and value length cap; flag preferences that have no user quote |
 | Runtime quality check | The judge runs only in `scripts/eval.py` | A cheap judge call after `save_post` for voice, and a check for near-duplicate ideas |
-| Calendar output | Week-level angles, saved as `planned` | Draft each entry with the platform rules; specific dates |
+| Calendar output | Dated angles, saved as `planned` | Draft each entry with the platform rules |
 | Publishing and export | `posted` is only a status label | CSV export; Buffer or Hootsuite APIs; then native platform APIs gated on `approved` |
+| Analytics | Results are typed into chat (`record_performance`) | Import from the Meta Graph and LinkedIn APIs once publishing connects accounts; engagement rate when reach is known |
+| Proactive reminders | The agenda is shown when a session opens | Email or Slack digest from `memory.agenda()` on a schedule |
+| Paid promotion | Not supported | Suggest which top performers to boost, with a budget, for the staff to run |
 | Research freshness | Refreshed only when asked | Expiry date and a prompt to refresh at session start |
 | Org switching | One org per web session | An org switcher that starts a new thread |
 | Approval in the UI | Status changes through chat only | Approve and reject buttons on each post |
-| Images | Not supported | `litellm.image_generation` for Instagram and Facebook posts, with moderation |
+| Images | A *Visual:* description per Instagram and Facebook draft, saved as `visual` | `litellm.image_generation` from that description, with moderation |
 | JavaScript-rendered sites | Little text is extracted | A headless browser as a fallback |

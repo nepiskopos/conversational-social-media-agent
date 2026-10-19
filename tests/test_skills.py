@@ -79,11 +79,31 @@ def test_load_content_pillars_prefers_profile_override(skills_dir):
     assert [p["name"] for p in load_content_pillars({})] == ["Default"]
 
 
-def test_load_content_pillars_survives_broken_file(skills_dir):
-    from agent.skills import load_content_pillars
+@pytest.mark.parametrize(
+    "text, problem",
+    [
+        ("pillars: [unclosed\n", "not valid YAML"),
+        ("- just a list\n", "expected a 'pillars:' list"),
+        ("pillars: Community\n", "expected a 'pillars:' list"),
+        ("pillars:\n  - description: no name\n", "every pillar needs a name"),
+    ],
+)
+def test_a_broken_pillars_file_means_no_pillars_and_is_reported(skills_dir, text, problem):
+    """No crash for the conversation; a plain-English problem for the UI and validate.py."""
+    from agent.skills import load_content_pillars, load_skills
 
-    (skills_dir / "content_pillars.yaml").write_text("pillars: [unclosed\n")
+    (skills_dir / "content_pillars.yaml").write_text(text)
     assert load_content_pillars({}) == []
+    problems = load_skills().problems
+    assert len(problems) == 1
+    assert problems[0].startswith("content_pillars.yaml: ") and problem in problems[0]
+
+
+def test_a_missing_pillars_file_is_not_a_problem(skills_dir):
+    from agent.skills import load_content_pillars, load_skills
+
+    assert load_content_pillars({}) == []
+    assert load_skills().problems == []
 
 
 def test_load_content_pillars_drops_entries_without_name(skills_dir):
@@ -115,7 +135,7 @@ def test_shipped_skill_files_are_all_valid():
 
     skills = load_skills()
     assert skills.problems == []
-    assert {"linkedin", "instagram", "facebook"} <= {s["id"] for s in skills.platforms}
+    assert {"linkedin", "instagram", "facebook", "email"} <= {s["id"] for s in skills.platforms}
     assert len(skills.content_types) >= 3
 
 
@@ -162,3 +182,40 @@ def test_load_skills_reports_a_non_text_id_instead_of_crashing(skills_dir):
 
     (skills_dir / "bad.yaml").write_text("id: [a, b]\nname: X\nmax_length: 100\n")
     assert "id must be text" in load_skills().problems[0]
+
+
+FORMAT_YAML = "kind: format\nid: reel\nname: Reel\npurpose: Reach\nstructure: Hook\nplatforms:\n  - instagram\n"
+
+
+def test_load_skills_reads_formats(skills_dir):
+    from agent.skills import load_skills
+
+    (skills_dir / "reel.yaml").write_text(FORMAT_YAML)
+    skills = load_skills()
+    assert [f["id"] for f in skills.formats] == ["reel"]
+    assert skills.platforms == [] and skills.content_types == []
+
+
+@pytest.mark.parametrize(
+    "extra, expected_problem",
+    [
+        ("has_caption: no-thanks\n", "has_caption must be true or false"),
+        ("needs_visual: maybe\n", "needs_visual must be true or false"),
+        ("platforms: instagram\n", "platforms must be a list"),
+    ],
+)
+def test_load_skills_reports_format_fields_with_the_wrong_type(skills_dir, extra, expected_problem):
+    from agent.skills import load_skills
+
+    (skills_dir / "story.yaml").write_text(
+        "kind: format\nid: story\nname: Story\npurpose: Connect\nstructure: Frames\n" + extra
+    )
+    skills = load_skills()
+    assert skills.formats == []
+    assert expected_problem in skills.problems[0]
+
+
+def test_shipped_formats_cover_feed_carousel_story_and_reel():
+    from agent.skills import load_skills
+
+    assert {"feed_post", "carousel", "story", "reel"} <= {f["id"] for f in load_skills().formats}

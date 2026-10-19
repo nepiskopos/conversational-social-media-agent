@@ -44,6 +44,7 @@ def main() -> int:
     skill_set = skills.load_skills()
     print(f"Platforms:     {', '.join(s['id'] for s in skill_set.platforms) or '(none)'}")
     print(f"Content types: {', '.join(s['id'] for s in skill_set.content_types) or '(none)'}")
+    print(f"Formats:       {', '.join(s['id'] for s in skill_set.formats) or '(none)'}")
     problems = skill_set.problems + profile_problems()
     if not problems:
         print("All skill files and org profiles are valid.")

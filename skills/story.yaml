@@ -1,0 +1,15 @@
+# Format skill: Story. See feed_post.yaml for what a format is and what each field means.
+# Safe to edit: all fields below. Run `python scripts/validate.py` after editing.
+
+kind: format
+id: story
+name: Story
+purpose: Everyday, informal connection with people who already follow you — behind the scenes, reminders, polls; gone in 24 hours
+structure: |
+  1. "Frame 1:" to "Frame 4:" a few words of on-screen text per frame, plus what the frame shows
+  2. One interactive sticker (poll, question, countdown or link) on the frame that needs it
+  3. No caption and no hashtags
+has_caption: false
+platforms:
+  - instagram
+  - facebook

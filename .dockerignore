@@ -38,7 +38,10 @@ env/
 .mypy_cache/
 .coverage
 .coverage.*
+coverage.xml
 htmlcov/
+test-results/
+playwright-report/
 .files/
 
 # Editors and operating systems

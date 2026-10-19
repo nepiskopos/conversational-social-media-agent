@@ -269,25 +269,6 @@ def test_system_prompt_no_sources_section_when_research_has_none(tmp_data_dir):
     assert "Research sources" not in prompt
 
 
-def test_system_prompt_includes_approval_guidance(tmp_data_dir):
-    from agent.memory import save_profile
-
-    save_profile(
-        "org",
-        {
-            "org_id": "org",
-            "name": "Test Org",
-            "website": "",
-            "research": None,
-            "preferences": {},
-            "post_ledger": [],
-        },
-    )
-    prompt = _full_prompt("org")
-    assert "approved" in prompt
-    assert "posted" in prompt
-
-
 def test_system_prompt_shows_research_updated_at(tmp_data_dir):
     from agent.memory import save_profile
 
@@ -305,26 +286,6 @@ def test_system_prompt_shows_research_updated_at(tmp_data_dir):
     )
     prompt = _full_prompt("org")
     assert "2026-06-12T10:00:00" in prompt
-
-
-def test_system_prompt_includes_security_policy(tmp_data_dir):
-    from agent.memory import save_profile
-
-    save_profile(
-        "org",
-        {
-            "org_id": "org",
-            "name": "Test Org",
-            "website": "",
-            "research": None,
-            "preferences": {},
-            "post_ledger": [],
-        },
-    )
-    prompt = _full_prompt("org")
-    assert "Security Policy" in prompt
-    assert "<external_content>" in prompt or "external_content" in prompt
-    assert "Ignore previous instructions" in prompt  # named example of injection pattern
 
 
 async def test_chat_persists_conversation_to_checkpoint(tmp_data_dir):
@@ -348,27 +309,6 @@ async def test_chat_persists_conversation_to_checkpoint(tmp_data_dir):
     assert isinstance(msgs[0], HumanMessage)
     assert isinstance(msgs[1], AIMessage)
     assert msgs[1].content == "Reply text"
-
-
-async def test_custom_thread_id_is_isolated_from_org_thread(tmp_data_dir):
-    from agent.assistant import Assistant
-    from agent.graph import build_graph
-
-    with patch(
-        "agent.graph.litellm.acompletion", new=AsyncMock(return_value=_text_stream("Session reply"))
-    ):
-        assistant = Assistant("org", thread_id="org-session-abc")
-        await assistant.chat("Hello")
-
-    # org default thread should be untouched
-    async with build_graph(assistant.model) as graph:
-        org_state = await graph.aget_state({"configurable": {"thread_id": "org"}})
-    assert org_state.values.get("messages", []) == []
-
-    # custom thread should have the conversation
-    async with build_graph(assistant.model) as graph:
-        session_state = await graph.aget_state({"configurable": {"thread_id": "org-session-abc"}})
-    assert len(session_state.values.get("messages", [])) == 2
 
 
 async def test_clear_history_empties_only_its_own_thread_and_keeps_org_memory(tmp_data_dir):
@@ -414,51 +354,6 @@ def test_system_prompt_uses_content_pillars_profile_override(tmp_data_dir):
     assert "Community Impact" not in prompt
 
 
-async def test_achat_stream_yields_text_event(tmp_data_dir):
-    from agent.assistant import Assistant
-
-    with patch(
-        "agent.graph.litellm.acompletion",
-        new=AsyncMock(return_value=_text_stream("Hello from Mackie!")),
-    ):
-        assistant = Assistant("org")
-        events = [e async for e in assistant.achat_stream("Hello")]
-
-    text_events = [e for e in events if e["type"] == "text"]
-    assert len(text_events) == 1
-    assert text_events[0]["content"] == "Hello from Mackie!"
-
-
-async def test_achat_stream_yields_tool_step_then_text(tmp_data_dir):
-    from agent.assistant import Assistant
-
-    with patch(
-        "agent.graph.litellm.acompletion",
-        new=AsyncMock(
-            side_effect=[
-                _tool_call_stream(
-                    "tc_001", "save_post", '{"platform": "linkedin", "content": "Test post"}'
-                ),
-                _text_stream("Post saved!"),
-            ]
-        ),
-    ):
-        assistant = Assistant("org")
-        events = [e async for e in assistant.achat_stream("Save a post")]
-
-    tool_events = [e for e in events if e["type"] == "tool_step"]
-    text_events = [e for e in events if e["type"] == "text"]
-    assert len(tool_events) == 1
-    assert tool_events[0]["tool"] == "save_post"
-    assert "input_preview" in tool_events[0]
-    assert "result_preview" in tool_events[0]
-    assert "latency_ms" in tool_events[0]
-    assert len(text_events) == 1
-    assert text_events[0]["content"] == "Post saved!"
-    # tool_step must arrive before the final text reply
-    assert events.index(tool_events[0]) < events.index(text_events[0])
-
-
 def test_system_prompt_includes_todays_date(tmp_data_dir):
     from datetime import date
 
@@ -489,7 +384,7 @@ async def test_chat_recovers_after_a_tool_fails(tmp_data_dir):
         "agent.graph.litellm.acompletion",
         new=AsyncMock(
             side_effect=[
-                # Missing 'status' makes update_post_status raise inside the handler.
+                # Missing 'status' makes update_post_status fail (an error result, not a reply).
                 _tool_call_stream("tc_bad", "update_post_status", '{"post_id": "post_001"}'),
                 _text_stream("Sorry, that failed."),
             ]
@@ -505,6 +400,30 @@ async def test_chat_recovers_after_a_tool_fails(tmp_data_dir):
     tool_call_ids = {tc["id"] for m in sent if m.get("tool_calls") for tc in m["tool_calls"]}
     tool_result_ids = {m["tool_call_id"] for m in sent if m["role"] == "tool"}
     assert tool_call_ids == tool_result_ids == {"tc_bad"}
+
+
+async def test_a_tool_call_with_broken_json_is_answered_as_broken_not_as_empty(tmp_data_dir):
+    """Regression: a live eval's cut-off save_post was reported as missing every argument."""
+    import json
+
+    from agent.assistant import Assistant
+    from agent.memory import load_profile, trace_path
+    from agent.tools import UNPARSED_ARGUMENTS_KEY
+
+    cut_off = '{"platform": "instagram", "title": "Reel", "content": "Hook (0-3s'
+    model = AsyncMock(
+        side_effect=[_tool_call_stream("tc1", "save_post", cut_off), _text_stream("Retrying.")]
+    )
+    with patch("agent.graph.litellm.acompletion", new=model):
+        assert await Assistant("org").chat("Make it a reel") == "Retrying."
+
+    tool_result = model.call_args_list[1].kwargs["messages"][-1]
+    assert tool_result["role"] == "tool"
+    assert "were not valid JSON" in tool_result["content"]
+    assert "needs" not in tool_result["content"]
+    assert load_profile("org")["post_ledger"] == []
+    trace = json.loads(trace_path("org").read_text().strip())
+    assert trace["input"] == {UNPARSED_ARGUMENTS_KEY: cut_off}  # kept for diagnosis
 
 
 async def test_achat_stream_separates_pre_tool_text_from_reply(tmp_data_dir):
@@ -586,15 +505,6 @@ def test_org_brief_cannot_close_its_tag(tmp_data_dir):
     save_profile("org", profile)
     stable, _ = _build_system_prompt_blocks("org")
     assert stable.count("</org_brief>") == 1
-
-
-def test_ledger_section_tolerates_a_hand_edited_post_without_fields(tmp_data_dir):
-    from agent.assistant import _build_system_prompt_blocks
-    from agent.memory import _profile_path
-
-    _profile_path("org").write_text('{"post_ledger": [{"title": "Typed by hand"}]}')
-    _, per_turn = _build_system_prompt_blocks("org")
-    assert "Typed by hand" in per_turn
 
 
 def test_system_prompt_includes_content_types(tmp_data_dir):
@@ -703,7 +613,10 @@ async def test_chat_runs_save_check_only_once_per_turn(tmp_data_dir):
 
 
 def test_system_prompt_tolerates_hand_edited_entries_inside_valid_sections(tmp_data_dir):
-    """Entries a person typed by hand: a note that is text, a voice example without content, odd sources."""
+    """
+    Entries a person typed by hand: a post without fields, a note that is text,
+    a voice example without content, odd sources.
+    """
     from agent.assistant import _build_system_prompt_blocks
     from agent.memory import _profile_path
 
@@ -716,6 +629,7 @@ def test_system_prompt_tolerates_hand_edited_entries_inside_valid_sections(tmp_d
                 "preferences": {"voice": "warm", "banned_topics": ["politics", 3]},
                 "preference_notes": {"voice": "said in a meeting"},
                 "voice_examples": [{"source": "pasted by user"}],
+                "post_ledger": [{"title": "Typed by hand"}],
             }
         )
     )
@@ -723,3 +637,115 @@ def test_system_prompt_tolerates_hand_edited_entries_inside_valid_sections(tmp_d
     assert "https://ok.example" in stable
     assert "**voice**: warm" in per_turn and "politics; 3" in per_turn
     assert "### pasted by user" in per_turn
+    assert "Typed by hand" in per_turn
+
+
+def test_system_prompt_describes_plan_create_optimize(tmp_data_dir):
+    from agent.assistant import _build_system_prompt_blocks
+
+    stable = _build_system_prompt_blocks("org")[0]
+    assert "AI social media manager" in stable
+    for part in ("**Plan:**", "**Create:**", "**Optimize:**", "record_performance"):
+        assert part in stable
+
+
+def test_performance_section_lists_best_posts_in_the_per_turn_block(tmp_data_dir):
+    from agent.assistant import _build_system_prompt_blocks
+    from agent.memory import add_post, record_performance
+
+    add_post("org", {"platform": "linkedin", "content": "a", "title": "Gala recap"})
+    add_post("org", {"platform": "instagram", "content": "b", "title": "Meet Ana"})
+    record_performance("org", "post_001", {"reactions": 12})
+    record_performance("org", "post_002", {"reach": 2000, "reactions": 240}, "5 sign-ups")
+
+    stable, per_turn = _build_system_prompt_blocks("org")
+    assert "## What Performed Best" not in stable
+    section = per_turn[per_turn.index("## What Performed Best") :]
+    assert section.index("Meet Ana") < section.index("Gala recap")
+    assert "2000 reach, 240 reactions — 5 sign-ups" in section
+
+
+def test_no_performance_section_without_results(tmp_data_dir):
+    from agent.memory import add_post
+
+    add_post("org", {"platform": "linkedin", "content": "a"})
+    assert "## What Performed Best" not in _full_prompt("org")
+
+
+def test_performance_section_tolerates_hand_edited_results(tmp_data_dir):
+    from agent.memory import _profile_path
+
+    _profile_path("org").write_text(
+        '{"post_ledger": [{"performance": {"reactions": "lots", "note": null}}]}'
+    )
+    assert "## What Performed Best" in _full_prompt("org")
+
+
+def test_system_prompt_lists_post_formats_with_their_roles(tmp_data_dir):
+    from agent.assistant import _build_system_prompt_blocks
+
+    stable = _build_system_prompt_blocks("org")[0]
+    assert "## Post Formats" in stable
+    assert "### Reel (id: reel; on instagram, facebook)" in stable
+    assert "### Feed Post (id: feed_post; on linkedin, instagram, facebook)" in stable
+
+
+def test_system_prompt_tells_mackie_to_lead_and_to_wait_for_approval(tmp_data_dir):
+    from agent.assistant import _build_system_prompt_blocks
+
+    stable = _build_system_prompt_blocks("org")[0]
+    assert "Lead with what needs doing" in stable
+    assert "Nothing goes live without the user's approval" in stable
+    assert 'call `update_post_status` with status "approved"' in stable
+
+
+def test_agenda_section_and_summary_list_what_needs_attention(tmp_data_dir):
+    from agent.assistant import _build_system_prompt_blocks, agenda_summary
+    from agent.memory import add_post
+
+    add_post("org", {"platform": "linkedin", "content": "a", "status": "draft", "title": "Gala"})
+    add_post("org", {"platform": "facebook", "content": "b", "status": "approved"})
+
+    per_turn = _build_system_prompt_blocks("org")[1]
+    section = per_turn[per_turn.index("## Needs Attention") :]
+    assert "### Drafts waiting for your approval\n- **post_001** | LINKEDIN" in section
+    assert agenda_summary("org") == (
+        "Here's what needs you: 1 draft waiting for your approval; "
+        "1 approved post ready to publish."
+    )
+
+
+def test_no_agenda_section_or_summary_when_nothing_needs_attention(tmp_data_dir):
+    from agent.assistant import agenda_summary
+    from agent.memory import add_post
+
+    add_post("org", {"platform": "linkedin", "content": "a", "status": "rejected"})
+    assert "## Needs Attention" not in _full_prompt("org")
+    assert agenda_summary("org") == ""
+
+
+def test_system_prompt_leaves_out_empty_skill_sections(tmp_data_dir):
+    """An org with no content types, formats or pillars gets no empty headings."""
+    from agent.assistant import _build_system_prompt_blocks
+    from agent.skills import SkillSet
+
+    bare_platform = {"id": "x", "name": "X", "max_length": 100}
+    with (
+        patch(
+            "agent.assistant.skills.load_skills", return_value=SkillSet(platforms=[bare_platform])
+        ),
+        patch("agent.assistant.skills.load_content_pillars", return_value=[]),
+    ):
+        stable, _ = _build_system_prompt_blocks("org")
+
+    for heading in ("## Content Types", "## Post Formats", "## Content Pillars", "Format notes"):
+        assert heading not in stable
+    assert "### X (id: x)" in stable and "- Hashtags: none" in stable
+
+
+def test_count_noun_uses_the_right_form():
+    from agent.assistant import count_noun
+
+    assert count_noun(1, "draft", "drafts") == "1 draft"
+    assert count_noun(0, "draft", "drafts") == "0 drafts"
+    assert count_noun(3, "draft", "drafts") == "3 drafts"

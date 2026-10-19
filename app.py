@@ -1,8 +1,11 @@
 """
 Chainlit web UI entry point for Mackie.
 
-Owns: session initialization, org identification prompt, and message routing.
-Does not own conversation logic (assistant.py) or persistence (memory.py).
+Owns: onboarding (asking for and confirming the org), the greeting with the
+agenda of what needs the user, warnings about skipped skill files or a broken
+profile, one conversation thread per browser session, and streaming each reply
+with its tool steps. Does not own conversation logic (assistant.py) or
+persistence (memory.py).
 """
 
 from __future__ import annotations
@@ -17,10 +20,10 @@ load_dotenv(Path(__file__).parent / ".env")
 
 from agent import memory as mem  # after load_dotenv, which config reads
 from agent import skills
-from agent.assistant import Assistant
+from agent.assistant import Assistant, agenda_summary, count_noun
 
 ORG_PROMPT: str = (
-    "Hi! I'm **Mackie**, your NPO social media assistant. "
+    "Hi! I'm **Mackie**, your AI social media manager. "
     "What organization are you working with?\n\n"
     "Share the **name** and **website URL** (optional) — one per line or separated by a comma."
 )
@@ -93,9 +96,8 @@ async def start() -> None:
         await cl.Message(content=f"I can't read this organization's memory file. {e}").send()
         return
     if not profile.get("name"):
+        mem.fill_org_details(org_id, org_name, org_url)
         profile["name"] = org_name
-        profile["website"] = org_url
-        mem.save_profile(org_id, profile)
 
     # Each browser session gets its own thread_id so concurrent users on the
     # same org don't share or corrupt each other's conversation history. The ":"
@@ -105,9 +107,12 @@ async def start() -> None:
 
     remembered = len(profile.get("preferences", {})), len(profile.get("post_ledger", []))
     if any(remembered):
+        # Lead with what needs doing, like a teammate would, instead of waiting to be asked.
+        next_step = agenda_summary(org_id) or "What would you like to work on?"
         greeting = (
-            f"Welcome back! I remember {remembered[0]} brand preference(s) and "
-            f"{remembered[1]} post(s) for **{profile['name']}**. What would you like to work on?"
+            f"Welcome back! I remember "
+            f"{count_noun(remembered[0], 'brand preference', 'brand preferences')} and "
+            f"{count_noun(remembered[1], 'post', 'posts')} for **{profile['name']}**. {next_step}"
         )
     else:
         greeting = (

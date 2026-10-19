@@ -1,8 +1,10 @@
 """
 CLI entry point for Mackie.
 
-Owns: org identification prompt, conversation loop, and rich terminal output.
-Does not own LLM interaction (assistant.py) or persistence (memory.py).
+Owns: asking for the org, the greeting with the agenda of what needs the user,
+the conversation loop with its commands (reset clears the conversation and
+keeps org memory; quit exits), and rich terminal output. Does not own LLM
+interaction (assistant.py) or persistence (memory.py).
 """
 
 from __future__ import annotations
@@ -18,14 +20,14 @@ from rich.prompt import Prompt
 load_dotenv(Path(__file__).parent / ".env")
 
 from agent import memory as mem  # after load_dotenv, which config reads
-from agent.assistant import Assistant
+from agent.assistant import Assistant, agenda_summary
 
 console = Console()
 
 
 async def main() -> None:
     """Run the interactive CLI conversation loop."""
-    console.print("\n[bold cyan]Mackie[/bold cyan] — NPO Social Media Assistant\n")
+    console.print("\n[bold cyan]Mackie[/bold cyan] — AI Social Media Manager for Nonprofits\n")
 
     org_name = Prompt.ask("[bold]Organization name[/bold]")
     while not mem.slugify(org_name):
@@ -39,9 +41,7 @@ async def main() -> None:
         console.print(f"[red]Can't read this organization's memory file.[/red] {e}")
         return
     if not profile.get("name"):
-        profile["name"] = org_name
-        profile["website"] = org_url
-        mem.save_profile(org_id, profile)
+        mem.fill_org_details(org_id, org_name, org_url)
 
     assistant = Assistant(org_id)
 
@@ -49,6 +49,8 @@ async def main() -> None:
     console.print(
         "[dim]Commands: 'quit' to exit · 'reset' to clear conversation (memory kept)[/dim]\n"
     )
+    if summary := agenda_summary(org_id):
+        console.print(f"{summary}\n")
 
     while True:
         try:

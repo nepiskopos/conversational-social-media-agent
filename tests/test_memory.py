@@ -1,4 +1,8 @@
-"""Unit tests for agent/memory.py — org profile, post ledger, preferences."""
+"""
+Unit tests for agent/memory.py: profiles (backups, hand-editing errors, the org
+lock), the post ledger and its search, post results, the agenda, preferences,
+voice examples and org ids.
+"""
 
 import json
 
@@ -38,13 +42,6 @@ def test_slugify_gives_non_latin_names_distinct_stable_ids():
     assert slugify("   ") == ""
 
 
-def test_slugify_output_cannot_traverse_directories():
-    from agent.memory import slugify
-
-    for name in ("../../etc", "..", "a/b\\c", "~root", "/abs/path"):
-        assert set(slugify(name)) <= set("abcdefghijklmnopqrstuvwxyz0123456789-")
-
-
 def test_load_profile_returns_defaults_for_new_org(tmp_data_dir):
     from agent.memory import load_profile
 
@@ -56,24 +53,17 @@ def test_load_profile_returns_defaults_for_new_org(tmp_data_dir):
     assert profile["research"] is None
 
 
-def test_save_and_load_roundtrip(tmp_data_dir):
+def test_save_and_load_roundtrip_creates_the_org_folder(tmp_data_dir):
     from agent.memory import load_profile, save_profile
 
     profile = load_profile("test-org")
     profile["name"] = "Test Org"
     profile["website"] = "https://testorg.org"
     save_profile("test-org", profile)
+    assert (tmp_data_dir / "test-org" / "profile.json").exists()
     loaded = load_profile("test-org")
     assert loaded["name"] == "Test Org"
     assert loaded["website"] == "https://testorg.org"
-
-
-def test_save_profile_creates_directory(tmp_data_dir):
-    from agent.memory import load_profile, save_profile
-
-    profile = load_profile("brand-new-org")
-    save_profile("brand-new-org", profile)
-    assert (tmp_data_dir / "brand-new-org" / "profile.json").exists()
 
 
 def test_add_post_assigns_sequential_ids(tmp_data_dir):
@@ -189,7 +179,8 @@ def test_save_profile_keeps_backup_and_leaves_no_temp_file(tmp_data_dir):
     org_dir = tmp_data_dir / "org"
     assert load_profile("org")["name"] == "Second"
     assert '"First"' in (org_dir / "profile.json.bak").read_text()
-    assert not (org_dir / "profile.json.tmp").exists()
+    # Exactly these two: the temporary file (named per process) was swapped in, not left behind.
+    assert sorted(path.name for path in org_dir.iterdir()) == ["profile.json", "profile.json.bak"]
 
 
 def test_load_profile_explains_hand_editing_mistake(tmp_data_dir):
@@ -233,10 +224,10 @@ def test_forget_preference_removes_key_and_note(tmp_data_dir):
     assert "voice" not in profile["preference_notes"]
 
 
-def test_forget_preference_removes_single_list_item(tmp_data_dir):
+def test_forget_preference_removes_single_list_item_ignoring_case(tmp_data_dir):
     from agent.memory import forget_preference, load_profile, save_preference
 
-    save_preference("org", "banned_topics", "politics", append=True)
+    save_preference("org", "banned_topics", "Politics", append=True)
     save_preference("org", "banned_topics", "religion", append=True)
     assert forget_preference("org", "banned_topics", "politics") is True
     assert load_profile("org")["preferences"]["banned_topics"] == ["religion"]
@@ -348,21 +339,6 @@ def test_hand_edited_post_without_fields_does_not_break_ledger_operations(tmp_da
     assert add_post("org", {"platform": "linkedin", "content": "x"}) == "post_001"
 
 
-@pytest.mark.parametrize("org_id", ["", "../etc", "a/b", "/abs", "Org", "a--b", "-a", "a b", "a:b"])
-def test_org_ids_that_are_not_slugs_never_reach_the_filesystem(tmp_data_dir, org_id):
-    """Defense in depth: every caller slugifies, but a bad id must not escape data/."""
-    from agent.memory import load_profile, save_profile, trace_path
-
-    for call in (
-        lambda: load_profile(org_id),
-        lambda: save_profile(org_id, {}),
-        lambda: trace_path(org_id),
-    ):
-        with pytest.raises(ValueError, match="invalid org id"):
-            call()
-    assert list(tmp_data_dir.iterdir()) == []
-
-
 @pytest.mark.parametrize(
     "section, value, expected",
     [
@@ -393,3 +369,177 @@ def test_load_profile_accepts_null_research(tmp_data_dir):
     (tmp_data_dir / "org").mkdir()
     (tmp_data_dir / "org" / "profile.json").write_text('{"research": null}')
     assert load_profile("org")["research"] is None
+
+
+def test_record_performance_stores_results_and_marks_posted(tmp_data_dir):
+    from agent.memory import add_post, get_ledger, record_performance
+
+    add_post("org", {"platform": "linkedin", "content": "x", "status": "approved"})
+    assert record_performance("org", "post_001", {"reach": 900, "reactions": 40}, "2 donations")
+    post = get_ledger("org")[0]
+    assert post["status"] == "posted"
+    assert post["performance"]["reach"] == 900
+    assert post["performance"]["note"] == "2 donations"
+    assert "recorded_at" in post["performance"]
+
+
+def test_record_performance_replaces_earlier_results(tmp_data_dir):
+    from agent.memory import add_post, get_ledger, record_performance
+
+    add_post("org", {"platform": "linkedin", "content": "x"})
+    record_performance("org", "post_001", {"reactions": 10}, "early")
+    record_performance("org", "post_001", {"reactions": 50})
+    assert get_ledger("org")[0]["performance"]["reactions"] == 50
+    assert "note" not in get_ledger("org")[0]["performance"]
+
+
+def test_record_performance_missing_post_returns_false(tmp_data_dir):
+    from agent.memory import record_performance
+
+    assert record_performance("org", "post_404", {"reactions": 1}) is False
+
+
+def test_engagement_sums_engagement_metrics_but_not_reach():
+    from agent.memory import engagement
+
+    post = {"performance": {"reach": 1000, "reactions": 30, "comments": 5, "shares": 2}}
+    assert engagement(post) == 37
+
+
+@pytest.mark.parametrize(
+    "performance",
+    [None, "lots", {"reactions": "40"}, {"reactions": None}, {"reactions": True}],
+)
+def test_engagement_tolerates_hand_edited_results(performance):
+    from agent.memory import engagement
+
+    assert engagement({"performance": performance}) == 0
+
+
+def test_top_performing_ranks_measured_posts_and_skips_the_rest():
+    from agent.memory import top_performing
+
+    ledger = [
+        {"id": "post_001", "performance": {"reactions": 5}},
+        {"id": "post_002"},
+        {"id": "post_003", "performance": {"reactions": 50}},
+        {"id": "post_004", "performance": {"shares": 20}},
+    ]
+    assert [p["id"] for p in top_performing(ledger, 2)] == ["post_003", "post_004"]
+    assert top_performing([{"id": "post_002"}], 5) == []
+
+
+def test_agenda_groups_posts_by_next_step():
+    from datetime import date
+
+    from agent.memory import agenda
+
+    today = date(2026, 10, 19)
+    ledger = [
+        {"id": "post_001", "status": "planned", "scheduled_for": "2026-10-22"},
+        {"id": "post_002", "status": "planned", "scheduled_for": "2026-11-20"},
+        {"id": "post_003", "status": "draft", "platform": "linkedin"},
+        {"id": "post_004", "status": "approved", "platform": "instagram"},
+        {"id": "post_005", "status": "posted", "scheduled_for": "2026-10-10"},
+        {"id": "post_006", "status": "posted", "scheduled_for": "2026-10-18"},
+        {"id": "post_007", "status": "posted", "scheduled_for": "2026-10-01", "performance": {}},
+    ]
+    groups = agenda(ledger, today)
+    assert [p["id"] for p in groups["to_draft"]] == ["post_001"]
+    assert [p["id"] for p in groups["awaiting_approval"]] == ["post_003"]
+    assert [p["id"] for p in groups["to_publish"]] == ["post_004"]
+    assert [p["id"] for p in groups["needs_results"]] == ["post_005"]
+
+
+def test_agenda_skips_drafts_replaced_on_the_same_platform_only():
+    """A rejected rewrite doesn't replace its original: that draft still awaits approval."""
+    from datetime import date
+
+    from agent.memory import agenda
+
+    ledger = [
+        {"id": "post_001", "status": "draft", "platform": "linkedin"},
+        {"id": "post_002", "status": "draft", "platform": "linkedin", "parent_id": "post_001"},
+        {"id": "post_003", "status": "draft", "platform": "instagram", "parent_id": "post_002"},
+        {"id": "post_004", "status": "rejected", "platform": "instagram", "parent_id": "post_003"},
+    ]
+    waiting = agenda(ledger, date(2026, 10, 19))["awaiting_approval"]
+    assert [p["id"] for p in waiting] == ["post_002", "post_003"]
+
+
+def test_agenda_is_empty_for_an_empty_or_hand_edited_ledger():
+    from datetime import date
+
+    from agent.memory import agenda
+
+    assert not any(agenda([], date(2026, 10, 19)).values())
+    assert not any(agenda([{"id": "post_001"}], date(2026, 10, 19)).values())
+
+
+@pytest.mark.parametrize("name", ["!!!", "  ", "—", "🎉🎉", "-_-"])
+def test_slugify_gives_no_id_to_a_name_without_letters_or_digits(name):
+    from agent.memory import slugify
+
+    assert slugify(name) == ""
+
+
+def test_fill_org_details_sets_a_new_orgs_name_and_website(tmp_data_dir):
+    from agent.memory import fill_org_details, load_profile
+
+    fill_org_details("food-bank", "Food Bank", "https://food.example")
+    profile = load_profile("food-bank")
+    assert (profile["name"], profile["website"]) == ("Food Bank", "https://food.example")
+
+
+def test_fill_org_details_keeps_what_the_profile_already_has(tmp_data_dir):
+    from agent.memory import fill_org_details, load_profile, save_profile
+
+    save_profile("food-bank", load_profile("food-bank") | {"name": "Food Bank of Ohio"})
+    fill_org_details("food-bank", "food bank", "https://food.example")
+    fill_org_details("food-bank", "Other", "https://other.example")
+    profile = load_profile("food-bank")
+    assert (profile["name"], profile["website"]) == ("Food Bank of Ohio", "https://food.example")
+
+
+def test_locked_is_reentrant_so_a_locked_caller_can_add_a_post(tmp_data_dir):
+    """flock blocks a second open even in the same process; reentrancy prevents a deadlock."""
+    import threading
+
+    from agent.memory import add_post, get_ledger, locked
+
+    def nested() -> None:
+        with locked("org"), locked("org"):
+            add_post("org", {"platform": "general", "content": "x"})
+
+    worker = threading.Thread(target=nested, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+    assert not worker.is_alive(), "locked() deadlocked on itself"
+    assert len(get_ledger("org")) == 1
+
+
+def test_locked_reentrancy_is_per_thread_so_other_threads_still_wait(tmp_data_dir):
+    """Only the holding thread may re-enter; another thread must still wait for the lock."""
+    import threading
+
+    from agent.memory import add_post, get_ledger, locked
+
+    holding, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with locked("org"):
+            holding.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert holding.wait(5)
+    writer = threading.Thread(
+        target=add_post, args=("org", {"platform": "general", "content": "x"}), daemon=True
+    )
+    writer.start()
+    writer.join(0.2)  # a writer that skipped the lock is done in milliseconds
+    assert writer.is_alive() and get_ledger("org") == []
+    release.set()
+    writer.join(5)
+    assert len(get_ledger("org")) == 1

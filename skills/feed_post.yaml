@@ -1,0 +1,31 @@
+# Format skill: Feed Post.
+# A format describes the SHAPE a post takes (a single image, slides, a story, a short video)
+# and the job that shape does best. Mackie combines it with a platform and, optionally, a
+# content type: "a donation appeal as an Instagram reel" follows all three files.
+# Mackie reloads this file on every turn — changes apply without a restart.
+#
+# Safe to edit: all fields below. To add a format, copy this file to
+# skills/{something}.yaml and give it a new, unique id. Run
+# `python scripts/validate.py` afterwards to check the file.
+#
+# Fields:
+#   kind:      Must be "format" (this is what makes it a format)
+#   id:        Machine-readable identifier — unique, lowercase, no spaces      (required)
+#   name:      Display name                                                     (required)
+#   purpose:   The role this format plays in the org's social media mix         (required)
+#   structure: What the draft must contain, one part per line                   (required)
+#   platforms: Platform ids this format exists on; leave out for all platforms  (optional)
+#   has_caption: false for a format with no caption (e.g. a story), so the
+#              platform's hashtag rule is not applied                          (optional)
+
+kind: format
+id: feed_post
+name: Feed Post
+purpose: The lasting record on the profile — key updates, milestones and stories people find when they look you up
+structure: |
+  1. The caption, following the platform's guidelines
+  2. One image or graphic, described in the Visual line
+platforms:
+  - linkedin
+  - instagram
+  - facebook

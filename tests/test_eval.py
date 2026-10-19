@@ -1,4 +1,8 @@
-"""Unit tests for scripts/eval.py — the saved-state checks (no LLM, no network)."""
+"""
+Unit tests for scripts/eval.py: the saved-state checks, judge scoring (which
+replies the judge sees, retries, failed and unparseable calls) and the report.
+The judge and the assistant are mocked, so no LLM or network is used.
+"""
 
 import importlib.util
 import json
@@ -153,3 +157,78 @@ def test_voice_invariant_checks_the_posts_in_steps_4_and_7_only(eval_module):
     assert eval_module._check_invariants(scores({5: 0, 6: 0}))["voice_consistency_steps4_7"]
     assert not eval_module._check_invariants(scores({4: 1}))["voice_consistency_steps4_7"]
     assert not eval_module._check_invariants(scores({7: 1}))["voice_consistency_steps4_7"]
+
+
+@pytest.mark.parametrize(
+    "reply, score",
+    [
+        ('{"score": 2, "reason": "fine"}', 2),
+        ('```json\n{"score": 3, "reason": "fenced"}\n```', 3),
+        ('Here you go: {"score": 1, "reason": "prose around it"} — hope that helps', 1),
+        ('{"score": "high", "reason": "not a number"}', -1),
+        ("I can't score this.", -1),
+        ("", -1),
+    ],
+)
+async def test_score_one_reads_the_judge_reply_shapes(eval_module, reply, score):
+    verdict = MagicMock(choices=[MagicMock(message=MagicMock(content=reply))])
+    with patch.object(eval_module.litellm, "acompletion", AsyncMock(return_value=verdict)):
+        result = await eval_module._score_one(1, "msg", "reply", "voice", "desc")
+    assert result["rubric"] == "voice" and result["score"] == score
+
+
+def test_run_scenario_snapshots_memory_after_every_step(eval_module, tmp_data_dir):
+    from agent.memory import add_post, load_profile
+
+    assistant = MagicMock()
+    turns = iter(range(1, 8))
+
+    async def chat(message: str) -> str:
+        step = next(turns)
+        add_post("eval-org", {"platform": "general", "content": message, "title": f"Step {step}"})
+        return f"reply {step}"
+
+    assistant.chat.side_effect = chat
+    with patch("agent.assistant.Assistant", return_value=assistant) as assistant_class:
+        responses, snapshots = eval_module.run_scenario("Eval Org", "https://eval.example")
+
+    assert [r["reply"] for r in responses] == [f"reply {n}" for n in range(1, 8)]
+    assert [len(s["ledger"]) for s in snapshots] == list(range(8))
+    assert ":eval-" in assistant_class.call_args.kwargs["thread_id"]  # fresh history per run
+    assert load_profile("eval-org")["website"] == "https://eval.example"
+
+
+async def test_an_empty_judge_reply_is_asked_again(eval_module):
+    """A reasoning judge can spend its tokens thinking and answer nothing; ask once more."""
+    empty = MagicMock(choices=[MagicMock(message=MagicMock(content=""))])
+    verdict = MagicMock(
+        choices=[MagicMock(message=MagicMock(content='{"score": 3, "reason": "fine"}'))]
+    )
+    judge = AsyncMock(side_effect=[empty, verdict])
+    with patch.object(eval_module.litellm, "acompletion", judge):
+        result = await eval_module._score_one(1, "msg", "reply", "voice", "desc")
+    assert result["score"] == 3 and judge.await_count == 2
+
+
+async def test_a_judge_that_stays_empty_is_scored_as_a_parse_error(eval_module):
+    empty = MagicMock(choices=[MagicMock(message=MagicMock(content=None))])
+    judge = AsyncMock(return_value=empty)
+    with patch.object(eval_module.litellm, "acompletion", judge):
+        result = await eval_module._score_one(1, "msg", "reply", "voice", "desc")
+    assert result["score"] == -1 and result["reason"].startswith("parse error")
+    assert judge.await_count == eval_module.JUDGE_ATTEMPTS
+
+
+def test_report_names_the_assistant_and_the_judge(eval_module, capsys):
+    responses = [{"step": i, "user": "u", "reply": "r"} for i in range(1, 8)]
+    scores = [
+        [{"rubric": name, "score": 3, "reason": "ok"} for name in eval_module.RUBRICS]
+        for _ in range(7)
+    ]
+    checks = {
+        key: (True, "ok")
+        for key in ("preference_saved_by_step3", "step7_posts_new", "suggestions_have_sources")
+    }
+    with patch.object(eval_module, "JUDGE_MODEL", "openai/deepseek-v4-pro"):
+        eval_module.print_report(responses, scores, checks)
+    assert "Judge: `openai/deepseek-v4-pro`" in capsys.readouterr().out

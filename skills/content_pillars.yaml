@@ -1,10 +1,12 @@
 # Content pillars define the framework for organizing post suggestions.
-# Each suggestion is labeled with a pillar so the ledger can group by theme.
+# Each suggestion and calendar entry is labeled with a pillar so the ledger can group by theme.
+# Mackie sees each pillar's name and description; the examples are notes for people.
 #
 # Safe to edit: add, rename, or remove pillars here without any code changes.
 # To override these for a specific org, add a "content_pillars" key to
 # data/{org-id}/profile.json with the same list structure (name + description).
 # When a per-org override is present it replaces this file entirely.
+# Run `python scripts/validate.py` after editing (a broken file means no pillars, not a crash).
 
 pillars:
   - name: Community Impact

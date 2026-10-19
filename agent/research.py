@@ -3,8 +3,9 @@ Website scraping and web search for org research.
 
 Owns: fetching and parsing org websites (homepage plus About/Programs-style
 pages, with an SSRF guard on every request and redirect), searching the web
-via Tavily, and combining results into a structured research dict. All I/O runs in parallel
-via asyncio.gather. Does not own memory, tool dispatch, or the conversation loop.
+via Tavily, and combining results into a structured research dict. All I/O
+runs in parallel via asyncio.gather. Does not own memory, tool dispatch, or
+the conversation loop.
 """
 
 from __future__ import annotations
@@ -14,15 +15,18 @@ import ipaddress
 import os
 import re
 import socket
+import unicodedata
 from datetime import date
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 from tavily import AsyncTavilyClient
 
 MAX_REDIRECTS: int = 5
+# Seconds to wait for one page; a slow or stalled website must not hold up the reply.
+FETCH_TIMEOUT_S: float = 15.0
 SITE_PAGE_CHARS: int = 4000  # per page when several pages of one site are combined
 MAX_SUBPAGES: int = 3
 # URL path fragments of the pages that usually describe what an org does.
@@ -49,6 +53,18 @@ _BLOCKED_HOSTS: frozenset[str] = frozenset(
 )
 
 
+# IPv6 ranges that carry an IPv4 address in their last 32 bits: NAT64 gateways
+# (RFC 6052) translate 64:ff9b::a9fe:a9fe to 169.254.169.254, and the deprecated
+# IPv4-compatible form ::a.b.c.d embeds one directly. Judged by the IPv4 address.
+_IPV4_EMBEDDING_NETWORKS: tuple[ipaddress.IPv6Network, ...] = (
+    ipaddress.IPv6Network("64:ff9b::/96"),
+    ipaddress.IPv6Network("::/96"),
+)
+# Local-use NAT64 prefix (RFC 8215): operators put it in front of their own networks.
+_LOCAL_NAT64_NETWORK: ipaddress.IPv6Network = ipaddress.IPv6Network("64:ff9b:1::/48")
+_IPV4_BITS: int = 0xFFFFFFFF
+
+
 def _is_internal_address(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """
     True for any address that is not a public unicast address.
@@ -56,10 +72,18 @@ def _is_internal_address(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) ->
     "Not global" covers loopback, private, link-local, reserved, unspecified
     (0.0.0.0, ::) and carrier-grade NAT (100.64.0.0/10, home of Alibaba
     Cloud's metadata endpoint 100.100.100.200), which is_private misses.
-    IPv4-mapped IPv6 addresses (::ffff:127.0.0.1) are checked as IPv4.
+    IPv6 addresses that carry an IPv4 address (IPv4-mapped ::ffff:127.0.0.1,
+    NAT64 64:ff9b::7f00:1, IPv4-compatible ::127.0.0.1) are checked as that
+    IPv4 address; Python counts NAT64 as global, which let a NAT64 gateway
+    reach internal IPv4 hosts.
     """
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
-        addr = addr.ipv4_mapped
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr in _LOCAL_NAT64_NETWORK:
+            return True
+        if addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        elif any(addr in network for network in _IPV4_EMBEDDING_NETWORKS):
+            addr = ipaddress.IPv4Address(int(addr) & _IPV4_BITS)
     return not addr.is_global or addr.is_multicast
 
 
@@ -79,6 +103,8 @@ def _is_safe_url(url: str) -> bool:
     - Non-standard IP representations (hex "0x7f000001", decimal "2130706433",
       octal "0177.0.0.1", short "127.1") that ipaddress.ip_address() rejects
       but some resolvers accept
+    - Hosts disguised with percent-encoding or fullwidth digits, which are
+      decoded and normalised before any of the checks above
 
     Domain names are checked again after DNS lookup by _resolves_to_internal.
 
@@ -96,7 +122,9 @@ def _is_safe_url(url: str) -> bool:
     if parsed.scheme not in ("http", "https"):
         return False
 
-    host = (parsed.hostname or "").rstrip(".")  # hostname is already lowercase
+    # Decode before judging: "%31%32%37.0.0.1" and fullwidth "１２７.０.０.１" both
+    # become 127.0.0.1 further down the stack (IDNA maps fullwidth digits to ASCII).
+    host = unicodedata.normalize("NFKC", unquote(parsed.hostname or "")).lower().rstrip(".")
     if not host:
         return False
 
@@ -161,7 +189,7 @@ async def _fetch_html(url: str) -> tuple[str, str]:
                 raise BlockedURLError(f"URL '{url}' is not allowed (not a public http(s) address).")
             response = await client.get(
                 url,
-                timeout=15,
+                timeout=FETCH_TIMEOUT_S,
                 follow_redirects=False,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; MackieBot/1.0)"},
             )
@@ -260,8 +288,9 @@ async def search_web(query: str, max_results: int = 5) -> list[dict[str, Any]]:
         client = AsyncTavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
         response = await client.search(query, max_results=max_results)
         return [
-            {"title": r["title"], "url": r["url"], "snippet": r["content"]}
+            {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")}
             for r in response.get("results", [])
+            if r.get("url")
         ]
     except Exception as e:
         return [{"error": str(e)}]

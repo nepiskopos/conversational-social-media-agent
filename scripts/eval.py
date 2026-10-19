@@ -1,10 +1,11 @@
 """
 LLM-as-judge evaluator for the end-to-end 7-step acceptance scenario.
 
-Owns: driving the 7-step scenario against a test org, scoring each
-response on three rubrics in parallel (21 total judge calls), checking what
-the run saved to profile.json (no LLM involved), and printing a markdown
-report. Does not own the assistant logic — it imports and drives it.
+Owns: driving the 7-step scenario against a real org (it saves to that org's
+profile under data/, like a normal chat), scoring each response on three
+rubrics in parallel (21 total judge calls), checking what the run saved to
+profile.json (no LLM involved), and printing a markdown report. Does not own
+the assistant logic — it imports and drives it.
 
 Usage (run from project root):
     python scripts/eval.py
@@ -12,9 +13,9 @@ Usage (run from project root):
 
 Requires at least one configured provider (see agent/config.py and
 .env.example) and TAVILY_API_KEY for the research step.
-The judge model is JUDGE_MODEL if set (recommended: a different provider than
-the assistant, to avoid self-grading bias), otherwise resolve_model() with the
-same provider-selection logic as the main app.
+The judge model is JUDGE_MODEL (and JUDGE_PROVIDER) if set (recommended: a
+different provider, or at least another model family, than the assistant, to
+avoid self-grading bias), otherwise the assistant's own model.
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import re
 import sys
 import time
@@ -34,10 +34,14 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent))
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from agent.config import background_kwargs, resolve_model  # needs the path and .env above
+from agent.config import (
+    background_kwargs,
+    resolve_judge_model,
+    resolve_model,
+)  # needs the path and .env above
 
 # A judge from a different model family avoids the assistant grading its own work.
-JUDGE_MODEL: str = os.getenv("JUDGE_MODEL") or resolve_model()
+JUDGE_MODEL: str = resolve_judge_model()
 
 SCENARIO: list[str] = [
     "Suggest some posts for us.",
@@ -78,12 +82,34 @@ RUBRICS: dict[str, str] = {
     ),
 }
 
-# A ceiling, not a target: a reasoning-model judge thinks before it answers, and 120 tokens
-# left Qwen with no answer at all.
-JUDGE_MAX_TOKENS: int = 1000
+# A ceiling, not a target: a reasoning-model judge thinks before it answers. 120 tokens left
+# Qwen with no answer at all. With DeepSeek V4 Pro, 60 calls on real replies used up to 1,271
+# tokens (median 143); at a 1,000 cap 3 of them came back empty and 1 was cut off.
+JUDGE_MAX_TOKENS: int = 4000
+# An empty judge reply is asked once more before it is scored as a parse error.
+JUDGE_ATTEMPTS: int = 2
 
 # A rubric score of MIN_PASS_SCORE or above counts as passing for invariant checks.
 MIN_PASS_SCORE: int = 2
+# An overall score of PASS_PERCENT or above is reported as PASS.
+PASS_PERCENT: int = 70
+
+
+async def _ask_judge(prompt: str) -> str:
+    """The judge's reply text; an empty reply is asked again, up to JUDGE_ATTEMPTS times."""
+    text = ""
+    for _ in range(JUDGE_ATTEMPTS):
+        response = await litellm.acompletion(
+            model=JUDGE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=JUDGE_MAX_TOKENS,
+            temperature=0,
+            **background_kwargs(JUDGE_MODEL),
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if text:
+            break
+    return text
 
 
 async def _score_one(
@@ -111,20 +137,13 @@ async def _score_one(
         '{"score": <integer 0-3>, "reason": "<one sentence>"}'
     )
     try:
-        response = await litellm.acompletion(
-            model=JUDGE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=JUDGE_MAX_TOKENS,
-            temperature=0,
-            **background_kwargs(JUDGE_MODEL),
-        )
+        text = await _ask_judge(prompt)
     except Exception as exc:  # one failed judge call must not lose the other 20 scores
         return {
             "rubric": rubric_name,
             "score": -1,
             "reason": f"judge error: {type(exc).__name__}: {exc}"[:120],
         }
-    text = (response.choices[0].message.content or "").strip()
     # Strip markdown fences if the model wrapped its JSON (e.g. ```json...```)
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text.strip())
@@ -179,10 +198,9 @@ def run_scenario(org_name: str, org_url: str) -> tuple[list[dict], list[dict]]:
     """
     Drive the Assistant through the 7-step acceptance scenario.
 
-    Initialises the org profile with the name and website before the first
-    turn so the system prompt shows the correct org and the assistant can
-    call research_org immediately when asked for suggestions. This mirrors
-    what app.py does via the AskUserMessage onboarding prompts.
+    Records the org's name and website before the first turn, as onboarding
+    does in app.py, so the system prompt shows the right org and the
+    assistant can call research_org as soon as it is asked for suggestions.
 
     Args:
         org_name: Test org name (used as org_id after slugification).
@@ -195,19 +213,10 @@ def run_scenario(org_name: str, org_url: str) -> tuple[list[dict], list[dict]]:
         profile before the scenario, index i the profile after step i.
     """
     from agent.assistant import Assistant
-    from agent.memory import load_profile, save_profile, slugify
+    from agent.memory import fill_org_details, load_profile, slugify
 
     org_id = slugify(org_name)
-
-    # Pre-populate the profile so the system prompt shows the correct org
-    # name and website — the same information the user supplies via the
-    # onboarding prompts in app.py.
-    profile = load_profile(org_id)
-    if not profile["name"]:
-        profile["name"] = org_name
-    if not profile["website"] and org_url:
-        profile["website"] = org_url
-    save_profile(org_id, profile)
+    fill_org_details(org_id, org_name, org_url)
 
     def _snapshot() -> dict:
         saved = load_profile(org_id)
@@ -315,7 +324,10 @@ def print_report(
     saved_checks: dict[str, tuple[bool, str]],
 ) -> None:
     """Print the full evaluation report as markdown to stdout."""
-    lines: list[str] = ["# Eval Report\n"]
+    lines: list[str] = [
+        "# Eval Report\n",
+        f"Assistant: `{resolve_model()}` · Judge: `{JUDGE_MODEL}`\n",
+    ]
 
     total, max_total = 0, 0
     for item, step_scores in zip(responses, scores, strict=True):
@@ -330,7 +342,7 @@ def print_report(
         lines.append("")
 
     pct = round(total / max_total * 100) if max_total else 0
-    verdict = "PASS" if pct >= 70 else "NEEDS WORK"
+    verdict = "PASS" if pct >= PASS_PERCENT else "NEEDS WORK"
     lines.append(f"## Overall: {total}/{max_total} ({pct}%) — {verdict}\n")
 
     lines.append("## Invariant Checks\n")

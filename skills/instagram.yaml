@@ -6,14 +6,15 @@
 # To add a new platform, copy this file to skills/{platform}.yaml with a unique id field.
 #
 # Fields:
-#   kind:          Optional — "platform" (the default) or "content_type"
+#   kind:          Optional — leave it out; "platform" is the default
 #   name:          Display name referenced in responses (e.g. "Instagram") (required)
 #   id:            Machine-readable identifier — must be unique, lowercase, no spaces (required)
 #   tone:          Writing style guide injected into the system prompt each turn
-#   max_length:    Character limit for captions; longer posts are not saved (required)
-#   hashtag_count: Number of hashtags a post must have, or a range like "10-20"
+#   max_length:    Character limit for captions; a longer finished post is not saved (required)
+#   hashtag_count: Number of hashtags a finished post must have, or a range like "10-20"
 #   hashtag_style: Guidance on hashtag selection — what kinds work on this platform
 #   format_hints:  Multi-line block of platform-specific formatting tips
+#   needs_visual:  true if a finished post must describe its photo or graphic (optional)
 
 name: Instagram
 id: instagram
@@ -28,3 +29,4 @@ format_hints: |
   - Short sentences, line breaks, energy
   - Hashtag block separated by a line break at the very end
   - Strong "we" and community language
+needs_visual: true

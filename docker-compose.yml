@@ -6,9 +6,9 @@ services:
     env_file:
       - .env
     volumes:
-      # Persist org profiles, post ledgers, and learned preferences across restarts
+      # Persist org memory (profiles, ledgers, preferences) and conversation history
       - ./data:/app/data
-      # Skills are mounted so a non-engineer can add a new platform YAML
-      # without rebuilding the image
+      # Skills are mounted so a non-engineer can add or edit a platform, content type
+      # or format YAML without rebuilding the image
       - ./skills:/app/skills
     restart: unless-stopped

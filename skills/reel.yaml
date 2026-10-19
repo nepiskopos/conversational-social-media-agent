@@ -1,0 +1,15 @@
+# Format skill: Reel. See feed_post.yaml for what a format is and what each field means.
+# Safe to edit: all fields below. Run `python scripts/validate.py` after editing.
+
+kind: format
+id: reel
+name: Reel
+purpose: Reach people who don't follow you yet — short, vertical video is what the platforms show to new audiences
+structure: |
+  1. "Hook (0–3s):" the first line said or shown on screen
+  2. "Shots:" three to five numbered shots, each with what to film and any on-screen text
+  3. "Audio:" voiceover lines, or the kind of trending sound to use
+  4. The caption, following the platform's guidelines
+platforms:
+  - instagram
+  - facebook

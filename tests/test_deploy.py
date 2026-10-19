@@ -3,11 +3,15 @@ Regression tests for deployment settings that protect secrets and the server.
 
 Owns: checks on .gitignore, .dockerignore and .chainlit/config.toml. These
 files are not code, so nothing else would notice a change that ships a key
-in the Docker image or reopens file uploads.
+in the Docker image or reopens file uploads. Also checks that the installed
+LiteLLM can make a tool call, which every other test mocks away.
 """
 
 import tomllib
 from pathlib import Path
+
+# Bound before conftest's autouse fixture replaces litellm.acompletion.
+from litellm import acompletion as real_acompletion
 
 ROOT = Path(__file__).parent.parent
 
@@ -43,3 +47,19 @@ def test_chainlit_does_not_render_raw_html():
     """Replies contain scraped text; raw HTML rendering would let a web page inject markup."""
     config = tomllib.loads((ROOT / ".chainlit" / "config.toml").read_text())
     assert config["features"]["unsafe_allow_html"] is False
+
+
+async def test_installed_litellm_accepts_tool_calls():
+    """
+    LiteLLM 1.106.0 imports mcp>=2.2 on every call with tools, but Chainlit pins
+    mcp<2, so every chat turn failed with any provider. mock_response stays offline.
+    """
+    tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
+    response = await real_acompletion(
+        model="openai/any",
+        api_key="test",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[tool],
+        mock_response="ok",
+    )
+    assert response.choices[0].message.content == "ok"

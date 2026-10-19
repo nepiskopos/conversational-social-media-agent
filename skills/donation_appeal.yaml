@@ -1,7 +1,8 @@
 # Content-type skill: Donation Appeal.
 # A content type describes WHAT a post is for (fundraising, recruiting, an event…),
 # independent of the platform it goes on. Mackie combines it with a platform file:
-# "a donation appeal for Instagram" follows both this file and instagram.yaml.
+# "a donation appeal for Instagram" follows both this file and instagram.yaml
+# (and a format file, such as reel.yaml, when one is chosen).
 # Mackie reloads this file on every turn — changes apply without a restart.
 #
 # Safe to edit: all fields below. To add a content type, copy this file to

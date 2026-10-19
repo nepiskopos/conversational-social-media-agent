@@ -79,7 +79,8 @@ async def test_search_web_returns_formatted_results():
     mock_response = {
         "results": [
             {"title": "Title 1", "url": "https://a.com", "content": "Snippet 1"},
-            {"title": "Title 2", "url": "https://b.com", "content": "Snippet 2"},
+            {"title": "Title 2", "url": "https://b.com"},  # no snippet: still a result
+            {"title": "No URL", "content": "nothing to cite"},  # dropped
         ]
     }
     with patch("agent.research.AsyncTavilyClient") as mock_class:
@@ -91,6 +92,7 @@ async def test_search_web_returns_formatted_results():
     assert results[0]["title"] == "Title 1"
     assert results[0]["url"] == "https://a.com"
     assert results[0]["snippet"] == "Snippet 1"
+    assert results[1] == {"title": "Title 2", "url": "https://b.com", "snippet": ""}
 
 
 async def test_search_web_handles_exception():
@@ -155,116 +157,94 @@ async def test_research_org_without_url_skips_scrape():
     assert result["website_content"] == ""
 
 
-def test_is_safe_url_allows_public_https():
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://brcastrong.org",
+        "http://example.com",
+        # "127.0.0.1@" is userinfo; the host is example.com, which DNS checks later.
+        "http://127.0.0.1@example.com/",
+    ],
+)
+def test_is_safe_url_allows_public_hosts(url):
     from agent.research import _is_safe_url
 
-    assert _is_safe_url("https://brcastrong.org") is True
-    assert _is_safe_url("http://example.com") is True
-
-
-def test_is_safe_url_blocks_localhost():
-    from agent.research import _is_safe_url
-
-    assert _is_safe_url("http://localhost/admin") is False
-    assert _is_safe_url("http://127.0.0.1:8080") is False
-    assert _is_safe_url("http://127.255.255.255") is False
-
-
-def test_is_safe_url_blocks_aws_metadata():
-    from agent.research import _is_safe_url
-
-    assert _is_safe_url("http://169.254.169.254/latest/meta-data/") is False
-
-
-def test_is_safe_url_blocks_gcp_metadata():
-    from agent.research import _is_safe_url
-
-    assert _is_safe_url("http://metadata.google.internal/") is False
-
-
-def test_is_safe_url_blocks_private_ranges():
-    from agent.research import _is_safe_url
-
-    assert _is_safe_url("http://10.0.0.1") is False
-    assert _is_safe_url("http://192.168.1.1") is False
-    assert _is_safe_url("http://172.16.0.1") is False
-
-
-def test_is_safe_url_blocks_nonstandard_ip_representations():
-    from agent.research import _is_safe_url
-
-    # Hex notation — 0x7f000001 = 127.0.0.1
-    assert _is_safe_url("http://0x7f000001/") is False
-    # Decimal integer — 2130706433 = 127.0.0.1
-    assert _is_safe_url("http://2130706433/") is False
-
-
-def test_is_safe_url_blocks_non_http_schemes():
-    from agent.research import _is_safe_url
-
-    assert _is_safe_url("file:///etc/passwd") is False
-    assert _is_safe_url("ftp://files.example.com") is False
+    assert _is_safe_url(url) is True
 
 
 @pytest.mark.parametrize(
     "url",
     [
+        "http://localhost/admin",
+        "http://127.0.0.1:8080",
+        "http://127.255.255.255",
+        "http://169.254.169.254/latest/meta-data/",  # AWS metadata
+        "http://metadata.google.internal/",  # GCP metadata
+        "http://100.100.100.200/",  # Alibaba Cloud metadata
+        "http://10.0.0.1",
+        "http://192.168.1.1",
+        "http://172.16.0.1",
+        "http://100.64.0.1/",  # carrier-grade NAT
+        "http://0.0.0.0/",  # unspecified, reaches localhost on Linux
+        "http://[::]/",
         "http://[::1]/",  # IPv6 loopback
         "http://[::ffff:127.0.0.1]/",  # IPv4-mapped loopback
         "http://[fc00::1]/",  # IPv6 unique local
         "http://[fe80::1]/",  # IPv6 link-local
-        "http://0.0.0.0/",  # unspecified, reaches localhost on Linux
-        "http://[::]/",
-        "http://100.64.0.1/",  # carrier-grade NAT
-        "http://100.100.100.200/",  # Alibaba Cloud metadata
-        "HTTP://127.0.0.1/",  # uppercase scheme
-        "http://user@127.0.0.1/",  # userinfo before the real host
+        "http://0x7f000001/",  # hex form of 127.0.0.1
+        "http://2130706433/",  # decimal form of 127.0.0.1
         "http://127.1/",  # short form of 127.0.0.1
         "http://0177.0.0.1/",  # octal form of 127.0.0.1
+        "HTTP://127.0.0.1/",  # uppercase scheme
+        "http://user@127.0.0.1/",  # userinfo before the real host
         "http://localhost./",  # trailing dot
         "http://admin.localhost/",
+        "file:///etc/passwd",
+        "ftp://files.example.com",
         "javascript:alert(1)",
     ],
 )
-def test_is_safe_url_blocks_bypass_variants(url):
+def test_is_safe_url_blocks_internal_hosts_and_non_http_schemes(url):
+    """The basics; disguised and embedded forms (NAT64, encoded hosts) are in test_security.py."""
     from agent.research import _is_safe_url
 
     assert _is_safe_url(url) is False
 
 
-def test_is_safe_url_judges_the_real_host_not_userinfo():
-    from agent.research import _is_safe_url
-
-    # "127.0.0.1@" is userinfo; the host is example.com, which DNS checks later.
-    assert _is_safe_url("http://127.0.0.1@example.com/") is True
-
-
-async def test_scrape_site_blocks_domain_that_resolves_to_carrier_grade_nat():
-    with patch("agent.research._resolve_host", new=AsyncMock(return_value=["100.100.100.200"])):
+@pytest.mark.parametrize(
+    "address",
+    [
+        "169.254.169.254",  # cloud metadata
+        "100.100.100.200",  # carrier-grade NAT (Alibaba Cloud metadata)
+        # Regression: DNS64 answers with NAT64 addresses, so these passed before.
+        "64:ff9b::a9fe:a9fe",
+        "::ffff:10.0.0.1",
+        "fd00::1",
+    ],
+)
+async def test_scrape_site_blocks_a_domain_that_resolves_to_an_internal_address(address):
+    with patch("agent.research._resolve_host", new=AsyncMock(return_value=[address])):
         result, client = await _scrape_with_responses("https://innocent-looking.example", [])
     assert "not allowed" in result
     client.get.assert_not_called()
 
 
-async def test_scrape_site_blocks_redirect_to_non_http_scheme():
+@pytest.mark.parametrize(
+    "location", ["file:///etc/passwd", "http://169.254.169.254/latest/meta-data/"]
+)
+async def test_scrape_site_does_not_follow_a_redirect_to_a_blocked_url(location):
     result, client = await _scrape_with_responses(
-        "https://example.org",
-        [
-            _response(location="file:///etc/passwd"),
-        ],
+        "https://example.org", [_response(location=location)]
     )
     assert "not allowed" in result
     assert client.get.call_count == 1
 
 
-async def test_scrape_site_rejects_blocked_url():
-    result, _ = await _scrape_with_responses("http://169.254.169.254/", [])
+@pytest.mark.parametrize("url", ["http://169.254.169.254/", "http://localhost:6379/"])
+async def test_scrape_site_refuses_a_blocked_url_without_fetching(url):
+    result, client = await _scrape_with_responses(url, [])
     assert "not allowed" in result
-
-
-async def test_scrape_site_rejects_localhost():
-    result, _ = await _scrape_with_responses("http://localhost:6379/", [])
-    assert "not allowed" in result
+    client.get.assert_not_called()
 
 
 async def test_research_org_populates_sources():
@@ -313,17 +293,6 @@ async def test_scrape_site_resolves_relative_redirect():
     assert client.get.call_args_list[1][0][0] == "https://example.org/new"
 
 
-async def test_scrape_site_blocks_redirect_to_private_address():
-    result, client = await _scrape_with_responses(
-        "https://example.org",
-        [
-            _response(location="http://169.254.169.254/latest/meta-data/"),
-        ],
-    )
-    assert "not allowed" in result
-    assert client.get.call_count == 1
-
-
 async def test_scrape_site_stops_after_too_many_redirects():
     from agent.research import MAX_REDIRECTS
 
@@ -340,13 +309,6 @@ async def test_scrape_site_reports_http_error_status():
         ],
     )
     assert "Could not scrape" in result
-
-
-async def test_scrape_site_blocks_domain_that_resolves_to_private_address():
-    with patch("agent.research._resolve_host", new=AsyncMock(return_value=["169.254.169.254"])):
-        result, client = await _scrape_with_responses("https://innocent-looking.example", [])
-    assert "not allowed" in result
-    client.get.assert_not_called()
 
 
 async def test_scrape_site_blocks_redirect_to_domain_that_resolves_to_loopback():

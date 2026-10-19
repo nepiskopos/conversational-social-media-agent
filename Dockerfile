@@ -7,8 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# data/ is mounted as a volume at runtime — this just ensures the dir exists
-# in the image for runs without a volume mount
+# data/ is mounted as a volume at runtime; this makes sure the folder exists
+# for a run without the volume
 RUN mkdir -p data
 
 EXPOSE 8000

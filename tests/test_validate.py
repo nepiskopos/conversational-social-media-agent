@@ -41,12 +41,14 @@ def test_validate_passes_valid_files(validate_module, tmp_data_dir, skills_dir, 
 
 def test_validate_reports_every_broken_file(validate_module, tmp_data_dir, skills_dir, capsys):
     (skills_dir / "broken.yaml").write_text("id: x\nname: X\nmax_length: lots\n")
+    (skills_dir / "content_pillars.yaml").write_text("pillars:\n  - description: no name\n")
     (tmp_data_dir / "org").mkdir()
     (tmp_data_dir / "org" / "profile.json").write_text('{"name": "Org",}')
     assert validate_module.main() == 1
     out = capsys.readouterr().out
-    assert "2 problem(s):" in out
+    assert "3 problem(s):" in out
     assert "broken.yaml: max_length must be a whole number" in out
+    assert "content_pillars.yaml: every pillar needs a name" in out
     assert "formatting error at line 1" in out
 
 

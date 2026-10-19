@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: Unit tests
+    name: Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,4 +25,28 @@ jobs:
         run: ruff check . && ruff format --check .
 
       - name: Run tests
+        # Everything but the browser tests; conftest.py fails a run over 10 seconds.
         run: pytest -v
+
+      - name: Coverage
+        run: >-
+          pytest -q --cov=agent --cov=scripts --cov=app --cov=main --cov-branch
+          --cov-report=term-missing --cov-fail-under=95
+
+  browser:
+    name: Browser tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt && playwright install --with-deps chromium
+
+      - name: Run browser tests
+        # The real web UI in headless Chromium, with a scripted model: no API keys needed.
+        run: pytest -m browser -v

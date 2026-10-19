@@ -1,4 +1,8 @@
-"""Unit tests for agent/graph.py — message conversion, graph routing, and prompt caching."""
+"""
+Unit tests for agent/graph.py: message conversion, routing (tools, save_check),
+the sliding window and running summary, prompt caching, provider fallback and
+empty-reply retries, and checkpoint pruning.
+"""
 
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -345,7 +349,7 @@ async def test_call_model_adds_summary_to_uncached_block(tmp_data_dir):
         patch("agent.graph.litellm.acompletion", mock_completion),
         patch("agent.graph.get_stream_writer", return_value=lambda x: None),
     ):
-        await _build_call_model("claude-haiku-4-5-20251001")(state)
+        await _build_call_model("claude-haiku-5-5")(state)
 
     cached, per_turn = mock_completion.call_args.kwargs["messages"][0]["content"]
     assert "zz-summary-fact" in per_turn["text"]
@@ -362,11 +366,15 @@ def test_summary_section_cannot_be_closed_by_the_summary():
 
 def test_parse_tool_args_handles_empty_and_malformed_json():
     from agent.graph import _parse_tool_args
+    from agent.tools import UNPARSED_ARGUMENTS_KEY
 
     assert _parse_tool_args('{"a": 1}') == {"a": 1}
     assert _parse_tool_args("") == {}
-    assert _parse_tool_args('{"content": "truncated') == {}
-    assert _parse_tool_args("[1, 2]") == {}
+    assert _parse_tool_args('{"content": "line one\nline two"}') == {
+        "content": "line one\nline two"
+    }  # a raw line break inside a string, as models often write it
+    for bad in ('{"content": "truncated', "[1, 2]"):
+        assert _parse_tool_args(bad) == {UNPARSED_ARGUMENTS_KEY: bad}
 
 
 async def test_prompt_caching_adds_cache_control_for_anthropic_model(tmp_data_dir):
@@ -390,7 +398,7 @@ async def test_prompt_caching_adds_cache_control_for_anthropic_model(tmp_data_di
         patch("agent.graph.litellm.acompletion", mock_completion),
         patch("agent.graph.get_stream_writer", return_value=lambda x: None),
     ):
-        call_model = _build_call_model("claude-haiku-4-5-20251001")
+        call_model = _build_call_model("claude-haiku-5-5")
         await call_model({"messages": [HumanMessage(content="test")], "org_id": "org"})
 
     messages = mock_completion.call_args.kwargs["messages"]
@@ -425,7 +433,7 @@ async def test_prompt_caching_leaves_per_turn_block_uncached(tmp_data_dir):
         patch("agent.graph.litellm.acompletion", mock_completion),
         patch("agent.graph.get_stream_writer", return_value=lambda x: None),
     ):
-        call_model = _build_call_model("claude-haiku-4-5-20251001")
+        call_model = _build_call_model("claude-haiku-5-5")
         await call_model({"messages": [HumanMessage(content="test")], "org_id": "org"})
 
     cached, per_turn = mock_completion.call_args.kwargs["messages"][0]["content"]
@@ -486,7 +494,7 @@ async def test_prompt_caching_with_anthropic_provider_prefix(tmp_data_dir):
         patch("agent.graph.litellm.acompletion", mock_completion),
         patch("agent.graph.get_stream_writer", return_value=lambda x: None),
     ):
-        call_model = _build_call_model("anthropic/claude-haiku-4-5-20251001")
+        call_model = _build_call_model("anthropic/claude-haiku-5-5")
         await call_model({"messages": [HumanMessage(content="test")], "org_id": "org"})
 
     messages = mock_completion.call_args.kwargs["messages"]
@@ -511,11 +519,11 @@ async def test_call_model_falls_back_to_next_provider_when_primary_fails(tmp_dat
         patch("agent.graph.litellm.acompletion", new=completion),
         patch("agent.graph.get_stream_writer", return_value=lambda x: None),
     ):
-        call_model = _build_call_model("claude-haiku-4-5-20251001", ["gpt-4o-mini"])
+        call_model = _build_call_model("claude-haiku-5-5", ["gpt-4o-mini"])
         result = await call_model({"messages": [HumanMessage(content="hi")], "org_id": "org"})
 
     assert result["messages"][0].content == "from backup"
-    assert [c["model"] for c in calls] == ["claude-haiku-4-5-20251001", "gpt-4o-mini"]
+    assert [c["model"] for c in calls] == ["claude-haiku-5-5", "gpt-4o-mini"]
     assert isinstance(calls[0]["messages"][0]["content"], list)  # Anthropic: cache blocks
     assert isinstance(calls[1]["messages"][0]["content"], str)  # OpenAI: plain string
 
@@ -552,7 +560,7 @@ async def test_call_model_sends_endpoint_settings_for_an_openai_compatible_provi
         patch("agent.graph.litellm.acompletion", new=completion),
         patch("agent.graph.get_stream_writer", return_value=lambda x: None),
     ):
-        call_model = _build_call_model("openai/space-bunny-free")
+        call_model = _build_call_model("openai/glm-5.3-flash")
         await call_model({"messages": [HumanMessage(content="hi")], "org_id": "org"})
 
     assert calls[0]["api_base"] == "https://opencode.ai/zen/v1"
@@ -749,3 +757,92 @@ def test_summary_transcript_labels_the_save_check_message():
         ]
     )
     assert transcript == "USER: hi\nAUTOMATIC CHECK: save them"
+
+
+async def _checkpoint_rows(thread_id: str) -> int:
+    """How many checkpoints the database holds for a thread."""
+    import aiosqlite
+
+    from agent.graph import CHECKPOINTS_DB
+
+    async with aiosqlite.connect(CHECKPOINTS_DB) as conn:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?", (thread_id,)
+        )
+        return (await cursor.fetchone())[0]
+
+
+async def test_prune_history_keeps_one_checkpoint_with_the_whole_conversation(tmp_data_dir):
+    from agent.assistant import Assistant
+    from agent.graph import build_graph
+
+    assistant = Assistant("org")
+    for n in range(3):
+        with patch(
+            "agent.graph.litellm.acompletion", new=AsyncMock(return_value=_text_stream(f"a{n}"))
+        ):
+            await assistant.chat(f"q{n}")
+
+    assert await _checkpoint_rows("org") == 1
+    async with build_graph(assistant.model) as graph:
+        state = await graph.aget_state({"configurable": {"thread_id": "org"}})
+    assert [m.content for m in state.values["messages"]] == ["q0", "a0", "q1", "a1", "q2", "a2"]
+
+    model = AsyncMock(return_value=_text_stream("a3"))
+    with patch("agent.graph.litellm.acompletion", new=model):
+        await assistant.chat("q3")
+    sent = [m["content"] for m in model.call_args.kwargs["messages"][1:]]
+    assert sent == ["q0", "a0", "q1", "a1", "q2", "a2", "q3"]
+
+
+async def test_prune_history_leaves_other_threads_alone(tmp_data_dir):
+    from agent.assistant import Assistant
+    from agent.graph import build_graph, prune_history
+
+    for thread in ("org:a", "org:b"):
+        with patch(
+            "agent.graph.litellm.acompletion", new=AsyncMock(return_value=_text_stream("x"))
+        ):
+            await Assistant("org", thread_id=thread).chat("hi")
+    async with build_graph("claude-haiku-4-5-20251001") as graph:
+        await prune_history(graph, "org:missing")  # an unknown thread is a no-op
+    assert await _checkpoint_rows("org:a") == await _checkpoint_rows("org:b") == 1
+
+
+async def test_streamed_turns_are_pruned_too(tmp_data_dir):
+    from agent.assistant import Assistant
+
+    assistant = Assistant("org")
+    for _ in range(2):
+        with patch(
+            "agent.graph.litellm.acompletion", new=AsyncMock(return_value=_text_stream("x"))
+        ):
+            async for _event in assistant.achat_stream("hi"):
+                pass
+    assert await _checkpoint_rows("org") == 1
+
+
+async def test_read_stream_skips_usage_only_chunks_and_tool_fragments_without_a_function():
+    """Regression: a chunk with no choices, or a tool delta with function None, crashed the turn."""
+    from agent.graph import _read_stream
+
+    def chunk(content=None, tool_calls=None) -> MagicMock:
+        c = MagicMock()
+        c.choices = [MagicMock(delta=MagicMock(content=content, tool_calls=tool_calls))]
+        return c
+
+    named = MagicMock(index=0, id="tc1")
+    named.function.name, named.function.arguments = "web_search", '{"query": "q"}'
+    bare = MagicMock(index=0, id=None, function=None)
+    usage_only = MagicMock(choices=[])
+
+    async def stream():
+        for c in (chunk("Hi"), chunk(tool_calls=[named]), chunk(tool_calls=[bare]), usage_only):
+            yield c
+
+    text, tool_calls = await _read_stream(stream(), lambda event: None)
+    assert text == "Hi"
+    assert tool_calls[0] == {
+        "id": "tc1",
+        "function": {"name": "web_search", "arguments": '{"query": "q"}'},
+    }
