@@ -68,6 +68,13 @@ CALENDAR_TOP_POSTS: int = 3
 # Posts planned per calendar week: Maggie's Starter plan publishes two a week.
 DEFAULT_POSTS_PER_WEEK: int = 2
 MAX_POSTS_PER_WEEK: int = 3
+# Preferences are shown in every prompt; real ones are a sentence or two (the longest seen: 145).
+MAX_PREFERENCE_KEY_CHARS: int = 60
+MAX_PREFERENCE_TEXT_CHARS: int = 500
+# A list built with append, in total, so a long text can't be saved in parts.
+MAX_PREFERENCE_LIST_CHARS: int = 1000
+# All preferences and their quotes (about 1,000 tokens), so a long text can't be split across keys.
+MAX_PREFERENCES_TOTAL_CHARS: int = 4000
 # The argument graph.py passes, holding the raw text, when a tool call's JSON can't be parsed.
 UNPARSED_ARGUMENTS_KEY: str = "_unparsed_arguments"
 UNPARSED_ARGUMENTS_ERROR: str = (
@@ -238,7 +245,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "Persist a learned brand preference or guideline for this org. "
                 "Call this immediately when the user corrects tone, voice, or expresses any content preference. "
                 "Examples of keys: 'voice', 'banned_topics', 'tone_notes', 'linkedin_voice' (platform-specific). "
-                "Use append=true to add to a list (e.g. one more banned topic) instead of replacing it."
+                "Use append=true to add to a list (e.g. one more banned topic) instead of replacing it. "
+                "Keep the value to a sentence or two; long ones are refused, as is a list over "
+                f"{MAX_PREFERENCE_LIST_CHARS} characters or preferences over "
+                f"{MAX_PREFERENCES_TOTAL_CHARS} characters in all, quotes included."
             ),
             "parameters": {
                 "type": "object",
@@ -813,6 +823,10 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
         return f"Updated {post_id} → {status}"
 
     elif tool_name == "save_preference":
+        if problem := _preference_size_problem(tool_input) or _preference_growth_problem(
+            org_id, tool_input
+        ):
+            return f"Not saved: {problem}"
         mem.save_preference(
             org_id,
             tool_input["key"],
@@ -906,6 +920,83 @@ def _performance_context(ledger: list[dict[str, Any]]) -> str:
         for post in mem.top_performing(ledger, CALENDAR_TOP_POSTS)
     ]
     return "\n".join(lines) or "No results recorded yet."
+
+
+def _preference_size_problem(tool_input: dict[str, Any]) -> str:
+    """
+    Say which save_preference argument is too long, or return "".
+
+    Every preference is in the prompt of every turn, so a size cap keeps an
+    injected wall of instructions, or a pasted document, out of it.
+    """
+    limits = {
+        "key": MAX_PREFERENCE_KEY_CHARS,
+        "value": MAX_PREFERENCE_TEXT_CHARS,
+        "quote": MAX_PREFERENCE_TEXT_CHARS,
+    }
+    for name, limit in limits.items():
+        length = len(str(tool_input.get(name, "")))
+        if length > limit:
+            return (
+                f"the {name} is {length} characters; the limit is {limit}. "
+                "Save the preference in a sentence or two."
+            )
+    return ""
+
+
+def _preference_chars(value: Any) -> int:
+    """Length of a preference as it appears in the prompt, adding up a list's items."""
+    items = value if isinstance(value, list) else [value]
+    return sum(len(str(item)) for item in items)
+
+
+def _quote_chars(note: Any) -> int:
+    """Length of the user's words shown beside a preference in the prompt."""
+    return len(str(note.get("quote") or "")) if isinstance(note, dict) else 0
+
+
+def _preference_growth_problem(org_id: str, tool_input: dict[str, Any]) -> str:
+    """
+    Say if the save would take a list or all preferences over their caps, or return "".
+
+    The total counts each preference's quote too, as the prompt shows both.
+    Only a save that adds length is refused, so shortening or replacing a
+    preference always works, even in a profile.json edited past the caps.
+    """
+    profile = mem.load_profile(org_id)
+    prefs, notes = profile["preferences"], profile["preference_notes"]
+    key, value = tool_input["key"], tool_input["value"]
+    before = prefs.get(key, [])
+    after: Any = value
+    if tool_input.get("append"):
+        items = before if isinstance(before, list) else [before]
+        after = items if value in items else items + [value]
+    before_chars, after_chars = _preference_chars(before), _preference_chars(after)
+    if after_chars > max(before_chars, MAX_PREFERENCE_LIST_CHARS):
+        return (
+            f"{key} would be {after_chars} characters in all; "
+            f"the limit is {MAX_PREFERENCE_LIST_CHARS}. "
+            f"Tell the user, and offer to replace {key} with a shorter version."
+        )
+    shown_before = before_chars + _quote_chars(notes.get(key))
+    shown_after = after_chars + _quote_chars(tool_input)
+    if shown_after <= shown_before:
+        return ""
+    shown_now = sum(_preference_chars(v) + _quote_chars(notes.get(k)) for k, v in prefs.items())
+    total = shown_now - shown_before + shown_after
+    if total > MAX_PREFERENCES_TOTAL_CHARS:
+        return (
+            f"all preferences together, with their quotes, would be {total} characters; "
+            f"the limit is {MAX_PREFERENCES_TOTAL_CHARS}. Tell the user, and offer to forget "
+            "preferences that no longer apply or to shorten some."
+        )
+    return ""
+
+
+def _calendar_platform(post: dict[str, Any], platform_ids: list[str]) -> str:
+    """The planned post's platform in lowercase if a skill file defines it, else "general"."""
+    platform = str(post.get("platform", "")).lower()
+    return platform if platform in platform_ids else "general"
 
 
 def _calendar_format(post: dict[str, Any], format_platforms: dict[str, Any]) -> str:
@@ -1038,6 +1129,7 @@ async def _generate_calendar_async(
                 "rationale": "Generated from org research",
             }
         ]
+        planned = [{**post, "platform": _calendar_platform(post, platform_ids)} for post in posts]
         return [
             {
                 **post,
@@ -1045,7 +1137,7 @@ async def _generate_calendar_async(
                 "week": week_label,
                 "date": _week_post_date(post.get("date"), start, end),
             }
-            for post in posts
+            for post in planned
         ]
 
     weeks = _calendar_weeks(first_day)
@@ -1067,7 +1159,7 @@ async def _generate_calendar_async(
         for item in week_posts:
             optional = {k: str(item[k]) for k in ("format", "key_date") if item.get(k)}
             post = {
-                "platform": str(item.get("platform", "general")).lower(),
+                "platform": item["platform"],
                 "title": str(item.get("angle", ""))[:80],
                 "content": f"[{item['week']} of {month_label}] {item.get('angle', '')}",
                 "pillar": str(item.get("pillar", "")),
@@ -1079,7 +1171,7 @@ async def _generate_calendar_async(
             saved += 1
             lines.append(
                 f"| {item['week']} | {item['date']:%a %b} {item['date'].day} "
-                f"| {str(item.get('platform', '')).capitalize()} "
+                f"| {item['platform'].capitalize()} "
                 f"| {optional.get('format', '—')} "
                 f"| {item.get('angle', '')} | {item.get('pillar', '')} "
                 f"| {optional.get('key_date', '—')} |"

@@ -92,7 +92,7 @@ Token limits on those calls are ceilings, not targets. User-facing replies keep 
 
 **Why.** Without it, a provider that accepted a request and then stalled left the chat on "thinking" forever, and fallback never started, since fallback only runs when a request fails. Putting the timeout in the shared kwargs covers every current and future call site.
 
-**Trade-off.** LiteLLM's `num_retries=3` also retries timeouts, so a dead provider can take several minutes to give up before fallback. Lowering retries for chat replies is the next step if that matters.
+**Trade-off.** LiteLLM's `num_retries` also retries timeouts, so each retry can wait another 120 s. A chat reply therefore retries once on a model that has a fallback after it, so a dead provider hands over after two timeouts, not four. The last model keeps 3 retries, since nothing comes after it, and so do the summary and the org brief, which have no fallback.
 
 ### Provider fallback and cost routing
 
@@ -189,7 +189,7 @@ If the brief call fails, research is still saved with an empty brief.
 
 The wrapper escapes any copy of its own tag inside the text, so a page containing `</external_content>` can't close the wrapper and pass the rest of its text off as instructions. It also HTML-escapes attribute values. The stable prompt ends with a Security Policy telling the model to treat tagged content as data. The writers of the brief and the summary are told the same.
 
-**Limitation.** It still depends on the model obeying its system prompt. `save_preference` accepts any key, so an injected preference that the model obeys would persist. Each preference records the user's quote, which helps spot one. A key allowlist and a check on the model's output are the next steps.
+**Limitation.** It still depends on the model obeying its system prompt. `save_preference` accepts any key, so an injected preference that the model obeys would persist. Each preference must come with the user's quote, which helps spot one. The key is capped at 60 characters and the value and quote at 500 each (the longest real one so far is 145), since every preference is in every prompt: an injected essay or a pasted document is refused with a message asking for a sentence or two. A list built with `append` is capped at 1,000 characters in all, since a live run saved a refused 641-character style guide in two appended parts. All preferences together, with the quotes the prompt shows beside them, are capped at 4,000 characters (about 1,000 tokens), since another live run split the text across `style_guide` and `style_guide_2`. Only a save that adds length is refused, so shortening or replacing a preference always works. A key allowlist and a check on the model's output are the next steps.
 
 ### Memory: JSON on disk
 
@@ -319,7 +319,7 @@ A broken pillars file (invalid YAML, no `pillars:` list) means no pillars, not a
 
 ### Content calendar
 
-**What.** `generate_calendar(month_year, focus?, posts_per_week?)` plans four weeks (days 1–7, 8–14, 15–21, 22–end), with the four LLM calls run in parallel. Each call asks for `posts_per_week` posts (default 2, capped at 1–3) on different platforms or formats, and replies `{"posts": [...]}`. A bare post object, a list or fenced JSON is also accepted (`_parse_week_plan`), extra posts are dropped, and a format that doesn't exist on the post's platform is cleared (a live plan put emails in `feed_post`). Each call gets the week's dates, the campaign `focus` if given, the platforms and formats from `skills/`, the org's pillars, its brief (wrapped as untrusted) and preferences, its best-performing posts, and its recent posts. It is asked to tie a post to an awareness day, giving day or org event in that week, and returns a date, platform, format, angle, pillar, key date and rationale for each post. A date outside the week is replaced by the week's first day. The results are saved as `planned` ledger entries with `scheduled_for` (and `key_date`) and returned as a table. A failed week becomes an error row; the other weeks are still saved. A `month_year` that isn't "July 2026" or "Jul 2026" is refused with an error the model can fix.
+**What.** `generate_calendar(month_year, focus?, posts_per_week?)` plans four weeks (days 1–7, 8–14, 15–21, 22–end), with the four LLM calls run in parallel. Each call asks for `posts_per_week` posts (default 2, capped at 1–3) on different platforms or formats, and replies `{"posts": [...]}`. A bare post object, a list or fenced JSON is also accepted (`_parse_week_plan`), extra posts are dropped, a platform without a skill file is saved as `general`, an idea for any platform, and a format that doesn't exist on the post's platform is cleared (a live plan put emails in `feed_post`). Each call gets the week's dates, the campaign `focus` if given, the platforms and formats from `skills/`, the org's pillars, its brief (wrapped as untrusted) and preferences, its best-performing posts, and its recent posts. It is asked to tie a post to an awareness day, giving day or org event in that week, and returns a date, platform, format, angle, pillar, key date and rationale for each post. A date outside the week is replaced by the week's first day. The results are saved as `planned` ledger entries with `scheduled_for` (and `key_date`) and returned as a table. A failed week becomes an error row; the other weeks are still saved. A `month_year` that isn't "July 2026" or "Jul 2026" is refused with an error the model can fix.
 
 **Why.** Maggie plans "a monthly content calendar aligned with the organization's goals" and "syncs with key calendar dates", and its Starter plan delivers "2 custom posts/week". One call per week, rather than per post, lets the posts within a week differ from each other. Real dates make the plan usable and searchable by `scheduled_for`. Awareness days come from the model's own knowledge, which avoids a dependency on a dates API but can miss local or new ones; the user can correct them in chat. Running the weeks in parallel takes about as long as one call.
 
@@ -391,7 +391,7 @@ It then reports two kinds of checks:
 | Authentication | Anyone who can reach the UI can open any org | Chainlit OAuth or a reverse proxy; per-org access rules |
 | Rate limiting | None | Per-org, per-tool counters in Redis or Postgres |
 | DNS rebinding | Names are checked, then resolved again by httpx | Connect to the checked address |
-| Injected preferences | Any key is accepted; quotes help spot injections | Key allowlist and value length cap; flag preferences that have no user quote |
+| Injected preferences | Any key is accepted; a user quote is required, and keys, values, quotes, appended lists and all preferences together are capped in length | Key allowlist; a check on the model's output |
 | Runtime quality check | The judge runs only in `scripts/eval.py` | A cheap judge call after `save_post` for voice, and a check for near-duplicate ideas |
 | Calendar output | Dated angles, saved as `planned` | Draft each entry with the platform rules |
 | Publishing and export | `posted` is only a status label | CSV export; Buffer or Hootsuite APIs; then native platform APIs gated on `approved` |
@@ -403,3 +403,7 @@ It then reports two kinds of checks:
 | Approval in the UI | Status changes through chat only | Approve and reject buttons on each post |
 | Images | A *Visual:* description per Instagram and Facebook draft, saved as `visual` | `litellm.image_generation` from that description, with moderation |
 | JavaScript-rendered sites | Little text is extracted | A headless browser as a fallback |
+| Native Windows | The org lock uses `fcntl.flock`, so Linux, macOS, WSL or Docker only | `msvcrt.locking` behind the same `locked()` |
+| Long conversations | Older turns survive only as a lossy running summary | A vector store to retrieve old turns |
+| Parallel tool calls | Calls in one model reply run one after another, so post ids come out in order | Run read-only tools (search, ledger) together with `asyncio.gather` |
+| Role models | A `FAST_MODEL` or `JUDGE_MODEL` identical to a provider's own main model goes to that provider, whatever `*_PROVIDER` says | Pass the provider with each call instead of finding it from the model string |

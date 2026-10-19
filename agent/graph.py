@@ -71,6 +71,10 @@ EMPTY_REPLY_MESSAGE: str = (
 # A ceiling, not a target: reasoning models (Qwen 3, gpt-oss, ...) spend tokens thinking before
 # they answer, and a tight cap leaves no answer at all. SUMMARY_INSTRUCTIONS sets the length.
 SUMMARY_MAX_TOKENS: int = 2000
+# LiteLLM retries for a chat reply. A model with a fallback after it retries once, so a dead
+# provider hands over quickly; the last model keeps the full retries, as nothing comes after it.
+CHAT_RETRIES_BEFORE_FALLBACK: int = 1
+CHAT_RETRIES_LAST_MODEL: int = 3
 SUMMARY_MESSAGE_CHARS: int = 3000  # research results run ~4k chars; keep most of them
 SUMMARY_INSTRUCTIONS: str = (
     "You maintain the running summary of the earlier part of a conversation between "
@@ -357,7 +361,8 @@ async def _open_stream(
 
     Only failures to start the request fall through to the next model (outage,
     rate limit, bad key); an error after tokens have streamed is not retried,
-    since part of the reply has already been shown. Raises the last model's
+    since part of the reply has already been shown. A model with a fallback after
+    it is retried less (CHAT_RETRIES_BEFORE_FALLBACK). Raises the last model's
     error if every model fails. quick=True adds the provider's background_kwargs
     (reasoning turned down), used to retry an empty reply.
     """
@@ -370,7 +375,9 @@ async def _open_stream(
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
                 max_tokens=4096,
-                num_retries=3,
+                num_retries=(
+                    CHAT_RETRIES_BEFORE_FALLBACK if i < len(models) - 1 else CHAT_RETRIES_LAST_MODEL
+                ),
                 stream=True,
                 **(background_kwargs(model) if quick else connection_kwargs(model)),
             )

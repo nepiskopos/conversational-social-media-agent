@@ -9,6 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent.tools import MAX_PREFERENCE_KEY_CHARS, MAX_PREFERENCE_TEXT_CHARS
+
 _EMPTY_RESEARCH = {
     "org_name": "Test Org",
     "website_content": "",
@@ -536,6 +538,108 @@ async def test_rejected_status_does_not_create_voice_example(tmp_data_dir):
     )
     assert "rejected" in result
     assert load_profile("test-org").get("voice_examples", []) == []
+
+
+@pytest.mark.parametrize(
+    "field, limit",
+    [
+        ("key", MAX_PREFERENCE_KEY_CHARS),
+        ("value", MAX_PREFERENCE_TEXT_CHARS),
+        ("quote", MAX_PREFERENCE_TEXT_CHARS),
+    ],
+)
+async def test_save_preference_refuses_an_overlong_key_value_or_quote(tmp_data_dir, field, limit):
+    """Preferences are in every prompt, so a pasted document or injected essay stays out."""
+    from agent.memory import load_profile
+    from agent.tools import handle_tool_call
+
+    pref = {"key": "voice", "value": "warm", "quote": "be warm"}
+    at_limit = await handle_tool_call("save_preference", {**pref, field: "x" * limit}, "test-org")
+    assert at_limit.startswith("Preference saved")
+    over = await handle_tool_call("save_preference", {**pref, field: "x" * (limit + 1)}, "test-org")
+    assert over == (
+        f"Not saved: the {field} is {limit + 1} characters; the limit is {limit}. "
+        "Save the preference in a sentence or two."
+    )
+    assert len(load_profile("test-org")["preferences"]) == 1  # only the one at the limit
+
+
+async def test_save_preference_refuses_a_list_that_appending_would_take_over_its_cap(tmp_data_dir):
+    """A text refused as too long can't be saved in parts under one key instead."""
+    from agent.memory import load_profile, save_preference
+    from agent.tools import MAX_PREFERENCE_LIST_CHARS, handle_tool_call
+
+    save_preference("test-org", "style_guide", "a" * 400)  # a plain value counts as the first item
+    part = {"key": "style_guide", "quote": "save it all", "append": True}
+    for value in ("b" * 400, "c" * (MAX_PREFERENCE_LIST_CHARS - 800)):
+        saved = await handle_tool_call("save_preference", {**part, "value": value}, "test-org")
+        assert saved.startswith("Preference saved")
+    over = await handle_tool_call("save_preference", {**part, "value": "d"}, "test-org")
+    assert over == (
+        f"Not saved: style_guide would be {MAX_PREFERENCE_LIST_CHARS + 1} characters in all; "
+        f"the limit is {MAX_PREFERENCE_LIST_CHARS}. "
+        "Tell the user, and offer to replace style_guide with a shorter version."
+    )
+    assert sum(map(len, load_profile("test-org")["preferences"]["style_guide"])) == (
+        MAX_PREFERENCE_LIST_CHARS
+    )
+    # An item already in the list adds nothing, and replacing the list is the way out.
+    again = await handle_tool_call("save_preference", {**part, "value": "a" * 400}, "test-org")
+    assert again.startswith("Preference saved")
+    # A long value typed into profile.json counts too.
+    save_preference("test-org", "voice", "v" * (MAX_PREFERENCE_LIST_CHARS - 100))
+    added = await handle_tool_call(
+        "save_preference", {**part, "key": "voice", "value": "w" * 101}, "test-org"
+    )
+    assert added.startswith("Not saved: voice would be")
+    for item in ("e" * 500, "f" * 500, "g" * 500):  # a list typed past the cap stays usable
+        save_preference("test-org", "pasted", item, append=True)
+    readded = await handle_tool_call(
+        "save_preference", {**part, "key": "pasted", "value": "e" * 500}, "test-org"
+    )
+    assert readded.startswith("Preference saved")
+    shorter = await handle_tool_call(
+        "save_preference", {**part, "append": False, "value": "short"}, "test-org"
+    )
+    assert shorter.startswith("Preference saved")
+    assert load_profile("test-org")["preferences"]["style_guide"] == "short"
+
+
+async def test_save_preference_refuses_what_would_take_all_preferences_over_their_cap(
+    tmp_data_dir,
+):
+    """A text refused as too long can't be split across keys, or moved into the quotes."""
+    from agent.memory import load_profile, save_preference
+    from agent.tools import MAX_PREFERENCES_TOTAL_CHARS, handle_tool_call
+
+    quote = "q" * 10  # every preference below shows 400 characters with its quote
+    for n in range(MAX_PREFERENCES_TOTAL_CHARS // 400):
+        save_preference("test-org", f"part_{n}", "x" * (389 if n == 0 else 390), quote=quote)
+    pref = {"key": "part_0", "value": "x" * 390, "quote": quote}
+    at_limit = await handle_tool_call("save_preference", pref, "test-org")
+    assert at_limit.startswith("Preference saved")  # replaces part_0, so 4,000 in all
+    over = await handle_tool_call(
+        "save_preference", {**pref, "key": "part_extra", "value": "y"}, "test-org"
+    )
+    assert over == (
+        f"Not saved: all preferences together, with their quotes, would be "
+        f"{MAX_PREFERENCES_TOTAL_CHARS + 11} characters; the limit is {MAX_PREFERENCES_TOTAL_CHARS}. "
+        "Tell the user, and offer to forget preferences that no longer apply or to shorten some."
+    )
+    longer_quote = await handle_tool_call(
+        "save_preference", {**pref, "quote": quote + "q"}, "test-org"
+    )
+    assert longer_quote.startswith("Not saved: all preferences")
+    # Replacing one with a value of the same length or shorter still works.
+    same = await handle_tool_call("save_preference", {**pref, "value": "z" * 390}, "test-org")
+    assert same.startswith("Preference saved")
+    assert "part_extra" not in load_profile("test-org")["preferences"]
+    # In a profile.json edited past the cap, shortening is still allowed.
+    save_preference("test-org", "pasted", "p" * 500)
+    shorter = await handle_tool_call(
+        "save_preference", {**pref, "key": "pasted", "value": "brief"}, "test-org"
+    )
+    assert shorter.startswith("Preference saved")
 
 
 async def test_forget_preference_tool(tmp_data_dir):
@@ -1247,3 +1351,49 @@ def test_calendar_keeps_a_format_only_where_the_platform_has_it(post, expected):
 
     platforms = {"feed_post": ["linkedin", "instagram", "facebook"], "story": ["instagram"]}
     assert _calendar_format(post, platforms) == expected
+
+
+@pytest.mark.parametrize(
+    "planned, saved",
+    [("Instagram", "instagram"), ("TikTok", "general"), ("", "general"), (None, "general")],
+)
+async def test_calendar_saves_a_platform_without_a_skill_file_as_general(
+    tmp_data_dir, planned, saved
+):
+    """A planned post on a platform Mackie has no rules for is kept, as an idea for any platform."""
+    from agent.memory import get_ledger, save_profile
+    from agent.tools import handle_tool_call
+
+    save_profile("test-org", _profile_with_sources())
+    plan = {"platform": planned, "format": "reel", "angle": "a", "pillar": "p", "rationale": "r"}
+    week = MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps(plan)))])
+    with patch("agent.tools.litellm.acompletion", new=AsyncMock(return_value=week)):
+        table = await handle_tool_call(
+            "generate_calendar", {"month_year": "November 2026", "posts_per_week": 1}, "test-org"
+        )
+    ledger = get_ledger("test-org")
+    assert {post["platform"] for post in ledger} == {saved}
+    # A format is kept only on a platform that has it: reels are Instagram's.
+    assert {post.get("format") for post in ledger} == {"reel" if saved == "instagram" else None}
+    assert f"| {saved.capitalize()} |" in table
+
+
+async def test_calendar_without_platform_skill_files_plans_general_ideas(tmp_data_dir):
+    """With every platform file removed or broken, the plan still saves, as ideas."""
+    from agent.memory import get_ledger, save_profile
+    from agent.skills import SkillSet
+    from agent.tools import handle_tool_call
+
+    save_profile("test-org", _profile_with_sources())
+    plan = {"platform": "instagram", "angle": "a", "pillar": "p", "rationale": "r"}
+    week = MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps(plan)))])
+    model = AsyncMock(return_value=week)
+    with (
+        patch("agent.tools.skills.load_skills", return_value=SkillSet()),
+        patch("agent.tools.litellm.acompletion", new=model),
+    ):
+        await handle_tool_call(
+            "generate_calendar", {"month_year": "November 2026", "posts_per_week": 1}, "test-org"
+        )
+    assert '"platform": one of "general"' in model.call_args.kwargs["messages"][0]["content"]
+    assert [post["platform"] for post in get_ledger("test-org")] == ["general"] * 4

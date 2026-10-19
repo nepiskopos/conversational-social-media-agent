@@ -524,6 +524,7 @@ async def test_call_model_falls_back_to_next_provider_when_primary_fails(tmp_dat
 
     assert result["messages"][0].content == "from backup"
     assert [c["model"] for c in calls] == ["claude-haiku-5-5", "gpt-4o-mini"]
+    assert [c["num_retries"] for c in calls] == [1, 3]  # hand over fast; the last keeps retrying
     assert isinstance(calls[0]["messages"][0]["content"], list)  # Anthropic: cache blocks
     assert isinstance(calls[1]["messages"][0]["content"], str)  # OpenAI: plain string
 
@@ -531,13 +532,20 @@ async def test_call_model_falls_back_to_next_provider_when_primary_fails(tmp_dat
 async def test_call_model_raises_when_every_model_fails(tmp_data_dir):
     from agent.graph import _build_call_model
 
+    down = AsyncMock(side_effect=Exception("all down"))
     with (
-        patch("agent.graph.litellm.acompletion", new=AsyncMock(side_effect=Exception("all down"))),
+        patch("agent.graph.litellm.acompletion", new=down),
         patch("agent.graph.get_stream_writer", return_value=lambda x: None),
     ):
         call_model = _build_call_model("gpt-4o-mini", ["xai/grok-3-mini"])
         with pytest.raises(Exception, match="all down"):
             await call_model({"messages": [HumanMessage(content="hi")], "org_id": "org"})
+        down.reset_mock()
+        with pytest.raises(Exception, match="all down"):  # one model: nothing to hand over to
+            await _build_call_model("gpt-4o-mini")(
+                {"messages": [HumanMessage(content="hi")], "org_id": "org"}
+            )
+    assert [c.kwargs["num_retries"] for c in down.call_args_list] == [3]
 
 
 async def test_call_model_sends_endpoint_settings_for_an_openai_compatible_provider(tmp_data_dir):
