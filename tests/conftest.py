@@ -1,7 +1,8 @@
 """
 Shared pytest fixtures for the Mackie test suite.
 
-Owns: the throwaway PostgreSQL database (created once per run on the server
+Owns: blanking the database and model settings so .env never changes a run; the throwaway
+PostgreSQL database (created once per run on the server
 at TEST_DATABASE_URL, migrated as an owner role and used through an app role,
 as in production) and the database fixture that empties it before each test;
 autouse fixtures that block database access without the database fixture,
@@ -48,18 +49,42 @@ SELECT c.relname,
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND c.relname NOT LIKE '%\_migrations'
 """
+# Settings outside PROVIDERS that choose a model or reach a paid service.
+_MODEL_SELECTORS: tuple[str, ...] = (
+    "LLM_PROVIDER",
+    "FAST_MODEL",
+    "FAST_PROVIDER",
+    "JUDGE_MODEL",
+    "JUDGE_PROVIDER",
+    "TAVILY_API_KEY",
+)
 # ConcurrencyProbe's wait for its expected calls; a lost asyncio.gather fails after this.
 PROBE_TIMEOUT_S: float = 1.0
 
 
 def pytest_configure(config: pytest.Config) -> None:
     """
-    Blank the database settings before any module loads .env, so no test can reach a real database.
+    Blank the database and model settings, so .env can't change what the tests reach or see.
 
-    load_dotenv() never overrides a variable that is already set.
+    No test can reach a real database, and every run picks the model CI picks (no provider
+    configured), whatever keys the developer's .env holds. load_dotenv() never overrides a
+    variable that is already set; tests that need a provider set it with monkeypatch.
     """
     os.environ["MACKIE_DATABASE_URL"] = ""
     os.environ["MACKIE_MIGRATION_URL"] = ""
+    from agent.config import PROVIDERS
+
+    for provider in PROVIDERS:
+        for name in (
+            provider.key_env,
+            provider.model_env,
+            provider.base_url_env,
+            *provider.requires,
+        ):
+            if name:
+                os.environ[name] = ""
+    for name in _MODEL_SELECTORS:
+        os.environ[name] = ""
 
 
 def _tables_to_empty(conn: psycopg.Connection) -> tuple[str, ...]:

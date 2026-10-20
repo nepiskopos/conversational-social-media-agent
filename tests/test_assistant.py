@@ -345,7 +345,7 @@ async def test_a_restarted_assistant_carries_on_from_the_stored_summary(database
 
     [after_restart] = calls  # no summary call: fewer than a batch has left the window since
     system, *sent = after_restart["messages"]
-    assert "- zz-older-context" in system["content"]
+    assert "- zz-older-context" in system["content"][-1]["text"]  # the per-turn block
     assert [m["content"] for m in sent] == [
         m.content for m in stored["messages"][summarized_count:]
     ] + ["after the restart"]
