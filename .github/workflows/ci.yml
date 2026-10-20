@@ -10,6 +10,17 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Throwaway database server; tests/conftest.py creates a database per run (and its
+        # roles, if missing).
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: mackie
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v4
 
@@ -25,7 +36,10 @@ jobs:
         run: ruff check . && ruff format --check .
 
       - name: Run tests
-        # Everything but the browser tests; conftest.py fails a run over 10 seconds.
+        # Everything but the opt-in tests. conftest.py fails a run over its time budget:
+        # 30 s on a developer's machine, 60 s here, since shared runners vary in speed.
+        env:
+          MACKIE_TEST_BUDGET_S: "60"
         run: pytest -v
 
       - name: Coverage
@@ -36,6 +50,17 @@ jobs:
   browser:
     name: Browser tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Throwaway database server; tests/conftest.py creates a database per run (and its
+        # roles, if missing).
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: mackie
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v4
 
@@ -50,3 +75,73 @@ jobs:
       - name: Run browser tests
         # The real web UI in headless Chromium, with a scripted model: no API keys needed.
         run: pytest -m browser -v
+
+  deploy:
+    name: Docker deployment
+    runs-on: ubuntu-latest
+    env:
+      # Its own project name, so the stack can never be mistaken for, or reuse the database
+      # volume of, a real deployment on the same Docker host (e.g. when run locally with act).
+      COMPOSE_PROJECT_NAME: mackie-ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the test dependencies
+        run: pip install -r requirements-dev.txt && playwright install --with-deps chromium
+
+      - name: Write a .env with throwaway secrets
+        # Placeholder model keys: the check never calls a model.
+        run: |
+          grep -vE '^(POSTGRES_PASSWORD|MACKIE_OWNER_PASSWORD|MACKIE_APP_PASSWORD|MACKIE_DEFAULT_PASSWORD|CHAINLIT_AUTH_SECRET)=' .env.example > .env
+          {
+            echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)"
+            echo "MACKIE_OWNER_PASSWORD=$(openssl rand -hex 16)"
+            echo "MACKIE_APP_PASSWORD=$(openssl rand -hex 16)"
+            echo "MACKIE_DEFAULT_PASSWORD=ci-$(openssl rand -hex 12)"
+            echo "CHAINLIT_AUTH_SECRET=$(openssl rand -hex 32)"
+          } >> .env
+
+      - name: Start the stack
+        run: docker compose up --build --detach --wait mackie
+
+      - name: Check the deployment's settings
+        # Each value is captured before it is compared, so a failed command fails the step
+        # (under bash -e) instead of comparing an empty string.
+        run: |
+          # The migrate service ran to the end and set up the default account.
+          migrate_state=$(docker compose ps --all migrate --format '{{.State}} {{.ExitCode}}')
+          test "$migrate_state" = "exited 0"
+          docker compose logs migrate | grep -q "Created the default account admin"
+          # The app runs as an unprivileged user.
+          uid=$(docker compose exec -T mackie id -u)
+          test "$uid" -gt 0
+          # The database publishes no port to the host (an unpublished port shows as {}).
+          bindings=$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$(docker compose ps -q postgres)")
+          test "$bindings" = "{}"
+          # The app's database role is neither a superuser nor exempt from row-level security.
+          privileged=$(docker compose exec -T postgres psql -U postgres -d mackie -Atc \
+            "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = 'mackie_app'")
+          test "$privileged" = f
+          # The web UI answers.
+          for _ in $(seq 1 60); do curl -sf -o /dev/null http://127.0.0.1:8000 && break; sleep 1; done
+          curl -sf -o /dev/null http://127.0.0.1:8000
+
+      - name: Log in and onboard an organization in a browser
+        run: >-
+          MACKIE_DEPLOYED_PASSWORD="$(grep '^MACKIE_DEFAULT_PASSWORD=' .env | cut -d= -f2)"
+          MACKIE_DEPLOYED_REQUIRED=1 pytest -m deployed -v
+
+      - name: Show the stack's logs
+        if: failure()
+        run: docker compose logs
+
+      - name: Remove the stack and its database volume
+        # Always, so nothing is left behind, its throwaway passwords in the database volume
+        # above all.
+        if: always()
+        run: docker compose down --volumes --remove-orphans

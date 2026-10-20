@@ -1,9 +1,13 @@
 """
-Unit tests for scripts/eval.py: the saved-state checks, judge scoring (which
-replies the judge sees, retries, failed and unparseable calls) and the report.
+Unit tests for scripts/eval.py: running the scenario (a fresh thread, a memory
+snapshot per step), the saved-state checks, the voice invariant, judge scoring
+(which replies the judge sees, retries, failed and unparseable calls), the
+memory check (a date pushed out of the window, kept in the summary's open
+items and recalled) and the report.
 The judge and the assistant are mocked, so no LLM or network is used.
 """
 
+import asyncio
 import importlib.util
 import json
 import sys
@@ -27,6 +31,7 @@ def eval_module():
 
 
 def _post(post_id: str, title: str, source_url: str = "https://org.example/about", **extra) -> dict:
+    """A ledger post with the fields the saved-state checks read."""
     return {"id": post_id, "title": title, "source_url": source_url, **extra}
 
 
@@ -51,16 +56,16 @@ def test_check_saved_state_passes_a_good_run(eval_module):
     assert "brand_voice" in checks["preference_saved_by_step3"][1]
 
 
-def test_check_saved_state_fails_when_nothing_was_learned(eval_module):
-    snaps = _snapshots([_post("post_001", "A")], [_post("post_002", "B")], {})
+@pytest.mark.parametrize(
+    "before, after_step3",
+    [({}, {}), ({"tone": "warm"}, {"tone": "warm"})],
+    ids=["nothing saved", "saved before the run"],
+)
+def test_check_saved_state_fails_when_nothing_was_learned(eval_module, before, after_step3):
+    snaps = _snapshots([_post("post_001", "A")], [_post("post_002", "B")], after_step3)
+    snaps[0]["preferences"] = before
     passed, detail = eval_module.check_saved_state(snaps)["preference_saved_by_step3"]
     assert not passed and detail == "no preference saved"
-
-
-def test_check_saved_state_ignores_preferences_that_existed_before(eval_module):
-    snaps = _snapshots([_post("post_001", "A")], [_post("post_002", "B")], {"tone": "warm"})
-    snaps[0]["preferences"] = {"tone": "warm"}
-    assert not eval_module.check_saved_state(snaps)["preference_saved_by_step3"][0]
 
 
 def test_check_saved_state_flags_step7_repeats_by_title_or_parent(eval_module):
@@ -90,27 +95,59 @@ def test_check_saved_state_fails_when_step7_saved_nothing(eval_module):
     )
 
 
-def test_check_saved_state_flags_suggestions_without_source(eval_module):
-    snaps = _snapshots(
-        [_post("post_001", "A", source_url="")], [_post("post_002", "B")], {"tone": "warm"}
-    )
-    passed, detail = eval_module.check_saved_state(snaps)["suggestions_have_sources"]
-    assert not passed and "post_001" in detail
+@pytest.mark.parametrize(
+    "step1, detail",
+    [
+        ([_post("post_001", "A", source_url="")], "no source_url: post_001"),
+        ([], "no post saved in step 1"),
+    ],
+    ids=["unsourced", "step 1 saved nothing"],
+)
+def test_check_saved_state_flags_suggestions_without_source(eval_module, step1, detail):
+    snaps = _snapshots(step1, [_post("post_002", "B")], {"tone": "warm"})
+    assert eval_module.check_saved_state(snaps)["suggestions_have_sources"] == (False, detail)
 
 
-def test_print_report_includes_saved_state_section(eval_module, capsys):
-    responses = [{"step": i, "user": "u", "reply": "r"} for i in range(1, 8)]
-    scores = [
-        [{"rubric": name, "score": 3, "reason": "ok"} for name in eval_module.RUBRICS]
-        for _ in range(7)
+def _scores(eval_module, score: int, judge_errors: int = 0) -> list[list[dict]]:
+    """Every rubric of every step scored score, except the first judge_errors calls failed (-1)."""
+    per_step = len(eval_module.RUBRICS)
+    flat = [-1] * judge_errors + [score] * (7 * per_step - judge_errors)
+    return [
+        [
+            {"rubric": name, "score": flat[step * per_step + i], "reason": "ok"}
+            for i, name in enumerate(eval_module.RUBRICS)
+        ]
+        for step in range(7)
     ]
+
+
+@pytest.mark.parametrize(
+    "score, judge_errors, overall, step1",
+    [
+        (3, 0, "63/63 (100%) — PASS", "**Score: 9/9**"),
+        (2, 0, "42/63 (67%) — NEEDS WORK", "**Score: 6/9**"),
+        # A failed judge call scores -1: left out of the sum rather than subtracted from it.
+        (3, 1, "60/63 (95%) — PASS", "**Score: 6/9**"),
+    ],
+)
+def test_print_report_scores_names_models_and_shows_saved_state(
+    eval_module, capsys, score, judge_errors, overall, step1
+):
+    from agent.config import resolve_model
+
+    assert len(eval_module.RUBRICS) == 3  # the expected totals below assume three rubrics
+    responses = [{"step": i, "user": "u", "reply": "r"} for i in range(1, 8)]
     checks = {
         "preference_saved_by_step3": (False, "no preference saved"),
         "step7_posts_new": (True, "1 new post(s)"),
         "suggestions_have_sources": (True, "all sourced"),
     }
-    eval_module.print_report(responses, scores, checks)
+    with patch.object(eval_module, "JUDGE_MODEL", "openai/deepseek-v4-pro"):
+        eval_module.print_report(responses, _scores(eval_module, score, judge_errors), checks)
     out = capsys.readouterr().out
+    assert f"Assistant: `{resolve_model()}` · Judge: `openai/deepseek-v4-pro`" in out
+    assert f"## Overall: {overall}" in out
+    assert out.split("## Step 1: u\n", 1)[1].startswith(step1)
     assert "## Saved-State Checks" in out
     assert (
         "**FAIL** — The voice correction was saved as a preference by step 3 (no preference saved)"
@@ -177,7 +214,9 @@ async def test_score_one_reads_the_judge_reply_shapes(eval_module, reply, score)
     assert result["rubric"] == "voice" and result["score"] == score
 
 
-def test_run_scenario_snapshots_memory_after_every_step(eval_module, tmp_data_dir):
+async def test_run_scenario_snapshots_memory_after_every_step(eval_module, database):
+    """run_scenario runs its own event loop, so it runs in a thread here; it closes its pool."""
+    from agent import db
     from agent.memory import add_post, load_profile
 
     assistant = MagicMock()
@@ -185,17 +224,26 @@ def test_run_scenario_snapshots_memory_after_every_step(eval_module, tmp_data_di
 
     async def chat(message: str) -> str:
         step = next(turns)
-        add_post("eval-org", {"platform": "general", "content": message, "title": f"Step {step}"})
+        await add_post(
+            "eval-org", {"platform": "general", "content": message, "title": f"Step {step}"}
+        )
         return f"reply {step}"
 
     assistant.chat.side_effect = chat
-    with patch("agent.assistant.Assistant", return_value=assistant) as assistant_class:
-        responses, snapshots = eval_module.run_scenario("Eval Org", "https://eval.example")
+    close_pool = AsyncMock(wraps=db.close_pool)
+    with (
+        patch("agent.assistant.Assistant", return_value=assistant) as assistant_class,
+        patch.object(db, "close_pool", close_pool),
+    ):
+        responses, snapshots = await asyncio.to_thread(
+            eval_module.run_scenario, "Eval Org", "https://eval.example"
+        )
 
     assert [r["reply"] for r in responses] == [f"reply {n}" for n in range(1, 8)]
     assert [len(s["ledger"]) for s in snapshots] == list(range(8))
     assert ":eval-" in assistant_class.call_args.kwargs["thread_id"]  # fresh history per run
-    assert load_profile("eval-org")["website"] == "https://eval.example"
+    assert (await load_profile("eval-org"))["website"] == "https://eval.example"
+    close_pool.assert_awaited_once()
 
 
 async def test_an_empty_judge_reply_is_asked_again(eval_module):
@@ -219,16 +267,106 @@ async def test_a_judge_that_stays_empty_is_scored_as_a_parse_error(eval_module):
     assert judge.await_count == eval_module.JUDGE_ATTEMPTS
 
 
-def test_report_names_the_assistant_and_the_judge(eval_module, capsys):
-    responses = [{"step": i, "user": "u", "reply": "r"} for i in range(1, 8)]
+def test_the_memory_history_pushes_the_date_out_of_the_window_by_a_summary_batch(eval_module):
+    """Otherwise the live check would never make the summarizer handle the date."""
+    from langchain_core.messages import HumanMessage
+
+    from agent.graph import SUMMARY_BATCH_MESSAGES, _window_start
+
+    history = [*eval_module.memory_history(), HumanMessage(content=eval_module.MEMORY_QUESTION)]
+    assert eval_module.MEMORY_DATE in history[0].content
+    assert _window_start(history) >= SUMMARY_BATCH_MESSAGES
+
+
+async def test_run_memory_check_summarizes_the_old_turns_and_asks_about_the_date(
+    eval_module, database
+):
+    """The filler is stored, not chatted: one summary call and one answer are the only model calls."""
+    from tests.llm_fakes import completion, text_stream
+
+    summary = (
+        "Open requests and dates:\n- Spring Gala on May 3: remind a week before\nSummary:\n- x"
+    )
+    calls: list[dict] = []
+
+    async def model(**kwargs):
+        calls.append(kwargs)
+        return (
+            text_stream("Your Spring Gala is on May 3.")
+            if kwargs.get("stream")
+            else completion(summary)
+        )
+
+    from agent.assistant import Assistant
+
+    with (
+        patch("agent.graph.litellm.acompletion", new=AsyncMock(side_effect=model)),
+        patch("agent.assistant.Assistant", wraps=Assistant) as assistant_class,
+    ):
+        result = await asyncio.to_thread(eval_module.run_memory_check, "Eval Org")
+
+    # A fresh thread, so no conversation a user has with the org is read or changed.
+    assert assistant_class.call_args.kwargs["thread_id"].startswith("eval-org:eval-memory-")
+
+    summary_calls = [call for call in calls if not call.get("stream")]
+    assert len(summary_calls) == 1 and len(calls) == 2
+    assert eval_module.MEMORY_SEED in summary_calls[0]["messages"][0]["content"]
+    assert result == {"summary": summary, "reply": "Your Spring Gala is on May 3."}
+
+
+def test_the_memory_check_reads_the_section_the_summarizer_is_told_to_write(eval_module):
+    """A renamed section would otherwise fail the live check for every summary."""
+    from agent.graph import SUMMARY_INSTRUCTIONS
+
+    assert eval_module.OPEN_ITEMS_HEADING in SUMMARY_INSTRUCTIONS
+    assert "Summary:" in SUMMARY_INSTRUCTIONS.split(eval_module.OPEN_ITEMS_HEADING, 1)[1]
+
+
+MISSING = "missing from the open requests and dates"
+
+
+@pytest.mark.parametrize(
+    ("summary", "reply", "kept", "recalled"),
+    [
+        (
+            "Open requests and dates:\n- Gala May 3\nSummary:\n- x",
+            "It's on May 3.",
+            (True, "in the open requests and dates"),
+            True,
+        ),
+        (
+            "Open requests and dates:\n- none\nSummary:\n- gala on May 3",
+            "On May 3.",
+            (False, MISSING),
+            True,
+        ),
+        ("", "I don't know.", (False, "no summary was written"), False),
+        ("Summary only, no sections: May 3", "No idea.", (False, MISSING), False),
+    ],
+    ids=["kept-and-recalled", "only-in-the-summary-part", "no-summary", "no-sections"],
+)
+def test_check_memory_needs_the_date_among_the_open_items_and_in_the_reply(
+    eval_module, summary, reply, kept, recalled
+):
+    checks = eval_module.check_memory({"summary": summary, "reply": reply})
+    assert checks["date_kept_as_open_item"] == kept
+    assert checks["date_recalled"] == (recalled, f"reply: {reply[:120]!r}")
+
+
+def test_the_report_shows_the_memory_checks_only_when_they_ran(eval_module, capsys):
+    responses = [{"step": n, "user": "u", "reply": "r"} for n in range(1, 8)]
     scores = [
-        [{"rubric": name, "score": 3, "reason": "ok"} for name in eval_module.RUBRICS]
-        for _ in range(7)
+        [{"rubric": rubric, "score": 3, "reason": "ok"} for rubric in eval_module.RUBRICS]
+        for _ in responses
     ]
-    checks = {
+    saved = {
         key: (True, "ok")
         for key in ("preference_saved_by_step3", "step7_posts_new", "suggestions_have_sources")
     }
-    with patch.object(eval_module, "JUDGE_MODEL", "openai/deepseek-v4-pro"):
-        eval_module.print_report(responses, scores, checks)
-    assert "Judge: `openai/deepseek-v4-pro`" in capsys.readouterr().out
+    eval_module.print_report(responses, scores, saved)
+    assert "Memory Checks" not in capsys.readouterr().out
+    memory = {"date_kept_as_open_item": (True, "kept"), "date_recalled": (False, "reply: 'no'")}
+    eval_module.print_report(responses, scores, saved, memory)
+    out = capsys.readouterr().out
+    assert "**PASS** — The summary keeps May 3 as an open date (kept)" in out
+    assert "**FAIL** — Asked much later, Mackie recalls May 3 (reply: 'no')" in out

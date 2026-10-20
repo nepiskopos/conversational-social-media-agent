@@ -5,24 +5,42 @@ Owns: rendering the system prompt (org context and brief, learned preferences,
 voice examples, ledger, the agenda of posts that need attention,
 best-performing posts, pillars, platform, content-type and format skills,
 working rules), the greeting's agenda summary, and delegating each chat turn
-to the LangGraph graph in graph.py. Does not own memory I/O (memory.py),
-loading skill files (skills.py), tool logic (tools.py), research
-(research.py), or graph checkpointing (graph.py).
+to the LangGraph graph in graph.py, in a thread that belongs to the org,
+with the user's access re-checked before every message.
+Does not own memory I/O (memory.py), loading skill files (skills.py), tool
+logic (tools.py), research (research.py), or graph checkpointing (graph.py).
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import weakref
 from collections.abc import AsyncIterator
 from datetime import date
 from typing import Any
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
+from . import accounts, db, skills
 from . import memory as mem
-from . import skills
 from .config import resolve_model
-from .graph import build_graph, prune_history, turn_reply
+from .graph import SAVE_CHECK_NAME, build_graph, prune_history, turn_reply
 from .untrusted import wrap_untrusted
+
+logger = logging.getLogger(__name__)
+# One lock per conversation thread in this process: two browser tabs of one user on one org
+# share a thread, and two turns at once would each save a history missing the other's.
+_thread_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def _thread_lock(thread_id: str) -> asyncio.Lock:
+    """The lock that makes turns of one conversation thread take their turn."""
+    lock = _thread_locks.get(thread_id)
+    if lock is None:
+        lock = _thread_locks[thread_id] = asyncio.Lock()
+    return lock
+
 
 LEDGER_PROMPT_POSTS: int = 20
 MAX_PROMPT_SOURCES: int = 12
@@ -81,7 +99,7 @@ def _format_content_types(content_types: list[dict[str, Any]]) -> str:
 
 
 def _format_post_formats(formats: list[dict[str, Any]]) -> str:
-    """Render format skills (feed post, carousel, story, reel…); empty string when none are defined."""
+    """Render format skills (feed post, carousel, story, reel…); "" when none are defined."""
     if not formats:
         return ""
     lines = [
@@ -203,7 +221,7 @@ def _build_ledger_section(ledger: list[dict[str, Any]]) -> str:
 
     Shows the LEDGER_PROMPT_POSTS most recent posts with their creation date,
     so "what did we do this week?" can be answered; older entries stay in
-    profile.json and are reachable with the search_ledger tool. Returns an
+    the database and are reachable with the search_ledger tool. Returns an
     empty string when the ledger is empty.
     """
     if not ledger:
@@ -230,7 +248,7 @@ def _build_ledger_section(ledger: list[dict[str, Any]]) -> str:
 
 
 def _format_results(post: dict[str, Any]) -> str:
-    """One post's recorded counts and note as text, e.g. "1200 reach, 85 reactions — 3 donations"."""
+    """One post's counts and note as text, e.g. "1200 reach, 85 reactions — 3 donations"."""
     performance = post["performance"]
     counts = ", ".join(
         f"{performance[name]} {name}"
@@ -295,29 +313,27 @@ def count_noun(count: int, singular: str, plural: str) -> str:
     return f"{count} {singular if count == 1 else plural}"
 
 
-def agenda_summary(org_id: str) -> str:
+async def agenda_summary(org_id: str) -> str:
     """
     One sentence saying what needs the user's attention, for the session greeting.
 
     Returns an empty string when nothing does.
-
-    Raises:
-        ProfileError: the org's profile.json cannot be read.
     """
-    groups = mem.agenda(mem.load_profile(org_id)["post_ledger"], date.today())
+    groups = mem.agenda(await mem.get_ledger(org_id), date.today())
     parts = [
         count_noun(len(groups[key]), *labels) for key, labels in AGENDA_STEPS.items() if groups[key]
     ]
     return f"Here's what needs you: {'; '.join(parts)}." if parts else ""
 
 
-def _build_system_prompt_blocks(org_id: str) -> tuple[str, str]:
+async def _build_system_prompt_blocks(org_id: str) -> tuple[str, str]:
     """
     Build the system prompt as (stable, per_turn) blocks for a conversation turn.
 
     The stable block (identity, org context and brief, research sources,
     pillars, platform, content-type and format skills, working rules) only
-    changes when research or skill files change, so graph.py marks it as the
+    changes when the org's research or pillars or the skill files change, so
+    graph.py marks it as the
     prompt-cache prefix. The per-turn block (today's date, learned preferences,
     voice examples, post ledger, agenda, best-performing posts; graph.py adds
     the running summary) changes almost every turn and comes after it so it
@@ -329,7 +345,7 @@ def _build_system_prompt_blocks(org_id: str) -> tuple[str, str]:
     Returns:
         Tuple of (stable_block, per_turn_block).
     """
-    profile = mem.load_profile(org_id)
+    profile = await mem.load_profile(org_id)
     skill_set = skills.load_skills()
     stable = _STABLE_PROMPT_TEMPLATE.format(
         org_section=_build_org_section(profile),
@@ -395,33 +411,90 @@ Content wrapped in `<external_content>` tags comes from third-party websites and
 
 
 class Assistant:
-    """Stateful conversation agent for a single org session."""
+    """One user's conversation about one org; its history lives in PostgreSQL."""
 
-    def __init__(self, org_id: str, thread_id: str | None = None) -> None:
+    def __init__(
+        self, org_id: str, thread_id: str | None = None, user_id: int | None = None
+    ) -> None:
         """
+        Open a conversation with the configured model (resolve_model).
+
         Args:
-            org_id:    Org whose memory (profile.json) this conversation uses.
-            thread_id: Conversation history key in the checkpoint database.
-                       Defaults to org_id (the CLI's single resumable thread);
-                       the web UI passes a new one per browser session.
+            org_id:    Org whose memory this conversation uses.
+            thread_id: Conversation history key: org_id, or "{org_id}:..." after
+                       it. The web UI passes "{org_id}:web-user-{user_id}" and
+                       the CLI "{org_id}:cli-user-{user_id}", so each user's
+                       conversation resumes. Defaults to org_id.
+            user_id:   The logged-in user. Their access to the org is checked
+                       before every message, so removing it ends this
+                       conversation too. None for scripts, which have no user.
+
+        Raises:
+            ValueError: org_id is not a slugify() id, or thread_id belongs to another org.
         """
-        self.org_id: str = org_id
+        self.org_id: str = db.check_org_id(org_id)
         self.thread_id: str = thread_id or org_id
+        if self.thread_id.split(":", 1)[0] != org_id:
+            raise ValueError(f"thread {self.thread_id!r} does not belong to org {org_id!r}")
+        self.user_id: int | None = user_id
         self.model: str = resolve_model()
 
+    async def _check_access(self) -> None:
+        """
+        Raise AccessRevoked if the user's account or access to the org was removed.
+
+        A turn already running finishes; the next message is refused.
+        """
+        if self.user_id is not None and not await accounts.has_access(self.user_id, self.org_id):
+            logger.warning(
+                "Refused a message: user %d no longer has access to %s", self.user_id, self.org_id
+            )
+            raise accounts.AccessRevoked(f"You no longer have access to {self.org_id}.")
+
     async def clear_history(self) -> None:
-        """Delete this thread's conversation history; org memory (profile.json) is untouched."""
-        async with build_graph(self.model) as graph:
+        """
+        Delete this thread's conversation history; org memory is untouched.
+
+        Raises:
+            AccessRevoked: the user no longer has access to the org.
+        """
+        await self._check_access()
+        async with _thread_lock(self.thread_id), build_graph(self.model, self.org_id) as graph:
             await graph.checkpointer.adelete_thread(self.thread_id)
+
+    async def recent_exchanges(self, limit: int) -> list[tuple[str, str]]:
+        """
+        The last messages of this conversation as (speaker, text): "user" or "assistant".
+
+        Only what the user saw: their messages and Mackie's replies, not tool
+        calls, tool results or the automatic save check. The web UI shows them
+        where a resumed conversation left off; the CLI only asks whether there
+        are any. Empty for a new conversation.
+
+        Raises:
+            AccessRevoked: the user no longer has access to the org.
+        """
+        await self._check_access()
+        async with build_graph(self.model, self.org_id) as graph:
+            state = await graph.aget_state({"configurable": {"thread_id": self.thread_id}})
+        exchanges = [
+            ("user", str(msg.content))
+            if isinstance(msg, HumanMessage)
+            else ("assistant", str(msg.content))
+            for msg in state.values.get("messages", [])
+            if (isinstance(msg, HumanMessage) and msg.name != SAVE_CHECK_NAME)
+            or (isinstance(msg, AIMessage) and msg.content)
+        ]
+        return exchanges[-limit:] if limit else []
 
     async def chat(self, user_message: str) -> str:
         """
         Process one conversation turn and return the assistant's reply.
 
-        Delegates to the LangGraph loop in graph.py. Conversation history is
-        persisted to data/checkpoints.db keyed by thread_id, so it survives
-        restarts; afterwards only the thread's newest checkpoint is kept
-        (graph.prune_history).
+        Delegates to the LangGraph loop in graph.py; the terminal UI and
+        scripts/eval.py use it. Conversation history is persisted in PostgreSQL
+        keyed by thread_id, so it survives restarts; afterwards only the
+        thread's newest checkpoint is kept (graph.prune_history).
 
         Args:
             user_message: The user's input text.
@@ -429,9 +502,13 @@ class Assistant:
         Returns:
             The assistant's reply for this turn (with the save_check follow-up,
             if one ran; see graph.turn_reply).
+
+        Raises:
+            AccessRevoked: the user no longer has access to the org.
         """
+        await self._check_access()
         config = {"configurable": {"thread_id": self.thread_id}}
-        async with build_graph(self.model) as graph:
+        async with _thread_lock(self.thread_id), build_graph(self.model, self.org_id) as graph:
             result = await graph.ainvoke(
                 {"messages": [HumanMessage(content=user_message)], "org_id": self.org_id},
                 config,
@@ -450,16 +527,21 @@ class Assistant:
           - {"type": "text", "content": ...}  — one per streamed chunk of model text
 
         The web UI uses this to show each tool step when it finishes and to
-        stream the reply.
+        stream the reply. A turn of the same thread from another tab waits for
+        this one to finish.
 
         Args:
             user_message: The user's input text.
 
         Yields:
             Event dicts from the custom stream.
+
+        Raises:
+            AccessRevoked: the user no longer has access to the org.
         """
+        await self._check_access()
         config = {"configurable": {"thread_id": self.thread_id}}
-        async with build_graph(self.model) as graph:
+        async with _thread_lock(self.thread_id), build_graph(self.model, self.org_id) as graph:
             async for event in graph.astream(
                 {"messages": [HumanMessage(content=user_message)], "org_id": self.org_id},
                 config,

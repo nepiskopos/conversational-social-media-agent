@@ -2,14 +2,18 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Log lines reach `docker compose logs` as they are written, not when a buffer fills (or never,
+# if the process dies first).
+ENV PYTHONUNBUFFERED=1
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# data/ is mounted as a volume at runtime; this makes sure the folder exists
-# for a run without the volume
-RUN mkdir -p data
+# Run as an unprivileged user; Chainlit writes its .files and translations under /app.
+RUN useradd --create-home --uid 10001 mackie && chown -R mackie /app
+USER mackie
 
 EXPOSE 8000
 

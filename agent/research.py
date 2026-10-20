@@ -3,8 +3,9 @@ Website scraping and web search for org research.
 
 Owns: fetching and parsing org websites (homepage plus About/Programs-style
 pages, with an SSRF guard on every request and redirect), searching the web
-via Tavily, and combining results into a structured research dict. All I/O
-runs in parallel via asyncio.gather. Does not own memory, tool dispatch, or
+via Tavily, and combining results into a structured research dict. The
+searches, the website and its subpages are fetched in parallel. Does not own
+storing research (memory.py), the org brief or tool dispatch (tools.py), or
 the conversation loop.
 """
 
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import os
 import re
 import socket
@@ -24,8 +26,12 @@ import httpx
 from bs4 import BeautifulSoup
 from tavily import AsyncTavilyClient
 
+from .logs import describe, safe
+
+logger = logging.getLogger(__name__)
+
 MAX_REDIRECTS: int = 5
-# Seconds to wait for one page; a slow or stalled website must not hold up the reply.
+# Seconds to wait for one page or search; a stalled website must not hold up the reply.
 FETCH_TIMEOUT_S: float = 15.0
 SITE_PAGE_CHARS: int = 4000  # per page when several pages of one site are combined
 MAX_SUBPAGES: int = 3
@@ -257,8 +263,11 @@ async def scrape_site(url: str) -> tuple[str, list[str]]:
     try:
         home_url, html = await _fetch_html(url)
     except BlockedURLError as e:
+        # Worth an operator's eye: a page or a model asked Mackie to fetch an internal address.
+        logger.warning("Refused to fetch %s: %s", safe(url), describe(e))
         return f"Error: {e}", []
     except Exception as e:
+        logger.warning("Could not fetch %s: %s", safe(url), describe(e))
         return f"Could not scrape {url}: {e}", []
 
     subpages = _find_subpages(html, home_url)
@@ -286,13 +295,14 @@ async def search_web(query: str, max_results: int = 5) -> list[dict[str, Any]]:
     try:
         # Read per call, not at import, so it works whenever the caller loads .env.
         client = AsyncTavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
-        response = await client.search(query, max_results=max_results)
+        response = await client.search(query, max_results=max_results, timeout=FETCH_TIMEOUT_S)
         return [
             {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")}
             for r in response.get("results", [])
             if r.get("url")
         ]
     except Exception as e:
+        logger.warning("Web search failed: %s", describe(e))
         return [{"error": str(e)}]
 
 

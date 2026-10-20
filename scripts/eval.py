@@ -2,17 +2,19 @@
 LLM-as-judge evaluator for the end-to-end 7-step acceptance scenario.
 
 Owns: driving the 7-step scenario against a real org (it saves to that org's
-profile under data/, like a normal chat), scoring each response on three
-rubrics in parallel (21 total judge calls), checking what the run saved to
-profile.json (no LLM involved), and printing a markdown report. Does not own
+memory in the database, like a normal chat), scoring each response on three
+rubrics in parallel (21 total judge calls), checking what the run saved (no
+LLM involved), checking that a date mentioned far back in a long conversation
+survives into the summary's open requests and dates and is recalled (one
+summary call and one answer, no judge), and printing a markdown report. Does not own
 the assistant logic — it imports and drives it.
 
 Usage (run from project root):
     python scripts/eval.py
     python scripts/eval.py --org "Myra's Kids" --url https://myraskids.org
 
-Requires at least one configured provider (see agent/config.py and
-.env.example) and TAVILY_API_KEY for the research step.
+Requires MACKIE_DATABASE_URL, at least one configured provider (see
+agent/config.py and .env.example) and TAVILY_API_KEY for the research step.
 The judge model is JUDGE_MODEL (and JUDGE_PROVIDER) if set (recommended: a
 different provider, or at least another model family, than the assistant, to
 avoid self-grading bias), otherwise the assistant's own model.
@@ -39,8 +41,9 @@ from agent.config import (
     resolve_judge_model,
     resolve_model,
 )  # needs the path and .env above
+from agent.graph import OPEN_ITEMS_HEADING  # the summary section the memory check reads
 
-# A judge from a different model family avoids the assistant grading its own work.
+# JUDGE_MODEL if set, else the main model; another model family avoids self-grading.
 JUDGE_MODEL: str = resolve_judge_model()
 
 SCENARIO: list[str] = [
@@ -52,6 +55,20 @@ SCENARIO: list[str] = [
     "Which posts have we worked on so far, and what's the status of each?",
     "Suggest another post for next month.",
 ]
+
+# The memory check: a date mentioned at the start of a conversation, then enough long turns
+# to push it out of the window by more than a summary batch, then a question about it. The
+# filler is stored directly (no API calls); only the summary and the answer are live.
+MEMORY_DATE: str = "May 3"
+MEMORY_SEED: str = (
+    "Before we start: our Spring Gala is on May 3, so remind me to post about it the week before."
+)
+MEMORY_SEED_REPLY: str = "Noted: the Spring Gala is on May 3, and I'll remind you the week before."
+MEMORY_FILLER_TURNS: int = 30
+MEMORY_FILLER_CHARS: int = 1500
+MEMORY_QUESTION: str = (
+    "What did I ask you to remember about upcoming dates? Answer in one sentence."
+)
 
 RUBRICS: dict[str, str] = {
     "source_attribution": (
@@ -212,33 +229,38 @@ def run_scenario(org_name: str, org_url: str) -> tuple[list[dict], list[dict]]:
         snapshots: 8 dicts with keys ledger and preferences — index 0 is the
         profile before the scenario, index i the profile after step i.
     """
+    from agent import db
     from agent.assistant import Assistant
     from agent.memory import fill_org_details, load_profile, slugify
 
     org_id = slugify(org_name)
-    fill_org_details(org_id, org_name, org_url)
 
-    def _snapshot() -> dict:
-        saved = load_profile(org_id)
+    async def _snapshot() -> dict:
+        saved = await load_profile(org_id)
         return {"ledger": saved["post_ledger"], "preferences": saved["preferences"]}
 
     async def _run() -> tuple[list[dict], list[dict]]:
-        # Use a unique thread_id so each eval run starts with a clean
-        # conversation history — no contamination from prior runs stored
-        # in data/checkpoints.db under the same org_id thread.
+        await fill_org_details(org_id, org_name, org_url)
+        # A new thread per run, so no earlier run's conversation leaks into this one.
         thread_id = f"{org_id}:eval-{int(time.time())}"
         assistant = Assistant(org_id, thread_id=thread_id)
         responses: list[dict] = []
-        snapshots = [_snapshot()]
+        snapshots = [await _snapshot()]
         for i, msg in enumerate(SCENARIO, start=1):
             print(f"  [{i}/7] {msg}")
             reply = await assistant.chat(msg)
             print(f"        → {reply[:100].replace(chr(10), ' ')}...\n")
             responses.append({"step": i, "user": msg, "reply": reply})
-            snapshots.append(_snapshot())
+            snapshots.append(await _snapshot())
         return responses, snapshots
 
-    return asyncio.run(_run())
+    async def _run_and_close() -> tuple[list[dict], list[dict]]:
+        try:
+            return await _run()
+        finally:
+            await db.close_pool()
+
+    return asyncio.run(_run_and_close())
 
 
 def _check_invariants(scores: list[list[dict]]) -> dict[str, bool]:
@@ -318,10 +340,82 @@ def check_saved_state(snapshots: list[dict]) -> dict[str, tuple[bool, str]]:
     }
 
 
+def memory_history() -> list:
+    """MEMORY_SEED and its reply, then MEMORY_FILLER_TURNS long filler turns."""
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    filler = "Some background on our programs and audiences. " * (MEMORY_FILLER_CHARS // 48)
+    history = [HumanMessage(content=MEMORY_SEED), AIMessage(content=MEMORY_SEED_REPLY)]
+    for n in range(MEMORY_FILLER_TURNS):
+        history += [
+            HumanMessage(content=f"Note {n}: {filler}"),
+            AIMessage(content=f"Thanks, noted {n}."),
+        ]
+    return history
+
+
+def run_memory_check(org_name: str) -> dict[str, str]:
+    """
+    Ask about a date that left the conversation window long ago, with the configured models.
+
+    Stores memory_history() in a fresh thread without calling a model, then
+    asks MEMORY_QUESTION live: the summarizer folds the old turns (MEMORY_SEED
+    among them) into the summary, and the assistant answers from it.
+
+    Returns:
+        {"summary": the conversation's summary afterwards, "reply": the answer}.
+    """
+    from agent import db
+    from agent.assistant import Assistant
+    from agent.graph import build_graph
+    from agent.memory import slugify
+
+    org_id = slugify(org_name)
+
+    async def _run() -> dict[str, str]:
+        assistant = Assistant(org_id, thread_id=f"{org_id}:eval-memory-{int(time.time())}")
+        config = {"configurable": {"thread_id": assistant.thread_id}}
+        try:
+            async with build_graph(assistant.model, org_id) as graph:
+                await graph.aupdate_state(config, {"messages": memory_history(), "org_id": org_id})
+            reply = await assistant.chat(MEMORY_QUESTION)
+            async with build_graph(assistant.model, org_id) as graph:
+                state = await graph.aget_state(config)
+            return {"summary": state.values.get("summary", ""), "reply": reply}
+        finally:
+            await db.close_pool()
+
+    return asyncio.run(_run())
+
+
+def check_memory(result: dict[str, str]) -> dict[str, tuple[bool, str]]:
+    """
+    Check the memory check's outcome, with no judge.
+
+    Returns:
+        {"date_kept_as_open_item": ..., "date_recalled": ...}, each (passed, detail).
+    """
+    summary, reply = result["summary"], result["reply"]
+    open_items = ""
+    if OPEN_ITEMS_HEADING in summary:
+        open_items = summary.split(OPEN_ITEMS_HEADING, 1)[1].split("Summary:", 1)[0]
+    if MEMORY_DATE in open_items:
+        kept = "in the open requests and dates"
+    elif not summary:
+        kept = "no summary was written"
+    else:
+        kept = "missing from the open requests and dates"
+    return {
+        "date_kept_as_open_item": (MEMORY_DATE in open_items, kept),
+        "date_recalled": (MEMORY_DATE in reply, f"reply: {reply[:120]!r}"),
+    }
+
+
 def print_report(
     responses: list[dict],
     scores: list[list[dict]],
     saved_checks: dict[str, tuple[bool, str]],
+    memory_checks: dict[str, tuple[bool, str]] | None = None,
 ) -> None:
     """Print the full evaluation report as markdown to stdout."""
     lines: list[str] = [
@@ -356,7 +450,7 @@ def print_report(
         result = "PASS" if invariants[key] else "FAIL"
         lines.append(f"- **{result}** — {label}")
 
-    lines.append("\n## Saved-State Checks (profile.json, no judge)\n")
+    lines.append("\n## Saved-State Checks (what was saved, no judge)\n")
     saved_labels = {
         "preference_saved_by_step3": "The voice correction was saved as a preference by step 3",
         "step7_posts_new": "Step 7 saved new posts, not versions or copies of step 1's",
@@ -365,6 +459,16 @@ def print_report(
     for key, label in saved_labels.items():
         passed, detail = saved_checks[key]
         lines.append(f"- **{'PASS' if passed else 'FAIL'}** — {label} ({detail})")
+
+    if memory_checks is not None:
+        lines.append("\n## Memory Checks (a date from far back in the conversation, no judge)\n")
+        memory_labels = {
+            "date_kept_as_open_item": f"The summary keeps {MEMORY_DATE} as an open date",
+            "date_recalled": f"Asked much later, Mackie recalls {MEMORY_DATE}",
+        }
+        for key, label in memory_labels.items():
+            passed, detail = memory_checks[key]
+            lines.append(f"- **{'PASS' if passed else 'FAIL'}** — {label} ({detail})")
 
     print("\n".join(lines))
 
@@ -381,11 +485,17 @@ def main() -> None:
     print(f"Running 7-step scenario for: {args.org}\n")
     responses, snapshots = run_scenario(args.org, args.url)
 
+    print("Checking memory of an early date after a long conversation...")
+    memory = check_memory(run_memory_check(args.org))
+
     print(f"Scoring {len(responses) * len(RUBRICS)} rubric calls in parallel...")
     scores = asyncio.run(score_all(responses))
 
-    print_report(responses, scores, check_saved_state(snapshots))
+    print_report(responses, scores, check_saved_state(snapshots), memory)
 
 
 if __name__ == "__main__":
+    from agent.logs import configure_logging
+
+    configure_logging("WARNING")
     main()

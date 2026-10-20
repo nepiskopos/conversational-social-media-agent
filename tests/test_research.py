@@ -1,4 +1,12 @@
-"""Unit tests for agent/research.py — website scraping and web search."""
+"""
+Unit tests for agent/research.py: website scraping and web search.
+
+Owns: scrape_site (page text, the per-page cap, subpages, redirects, failures),
+the basic SSRF blocklist of _is_safe_url and the DNS check, _resolve_host,
+_find_subpages, search_web and research_org (queries, sources). Does not own the
+disguised-host SSRF bypasses (test_security.py) or the parallelism of research
+(test_performance.py).
+"""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,7 +28,7 @@ def _response(
     return response
 
 
-async def _scrape_with_responses(url: str, responses: list) -> tuple[str, AsyncMock]:
+async def _scrape_with_responses(url: str, responses: list) -> tuple[str, list[str], AsyncMock]:
     """Run scrape_site with httpx returning the given responses (or raising them) in order."""
     from agent.research import scrape_site
 
@@ -29,52 +37,63 @@ async def _scrape_with_responses(url: str, responses: list) -> tuple[str, AsyncM
     with patch("agent.research.httpx.AsyncClient") as mock_class:
         mock_class.return_value.__aenter__ = AsyncMock(return_value=mock_client)
         mock_class.return_value.__aexit__ = AsyncMock(return_value=None)
-        text, _ = await scrape_site(url)
-    return text, mock_client
+        text, urls = await scrape_site(url)
+    return text, urls, mock_client
 
 
-async def test_scrape_site_returns_text_content():
-    result, _ = await _scrape_with_responses(
-        "https://example.com",
-        [
-            _response("<html><body><p>Mission: help kids.</p></body></html>"),
-        ],
-    )
-    assert "Mission: help kids" in result
-
-
-async def test_scrape_site_strips_scripts_and_styles():
-    result, _ = await _scrape_with_responses(
+async def test_scrape_site_keeps_body_text_and_drops_scripts_styles_and_site_chrome():
+    result, urls, _ = await _scrape_with_responses(
         "https://example.com",
         [
             _response(
-                "<html><body><p>Keep this</p>"
-                "<script>remove this</script>"
-                "<style>.remove { color: red; }</style></body></html>"
+                "<html><head><style>.style-rule { color: red; }</style></head><body>"
+                "<header>Header banner</header><nav>Nav menu</nav>"
+                "<p>Mission: help kids.</p>"
+                "<script>script code</script>"
+                "<footer>Footer links</footer></body></html>"
             )
         ],
     )
-    assert "Keep this" in result
-    assert "remove this" not in result
+    assert "Mission: help kids." in result
+    for dropped in ("style-rule", "Header banner", "Nav menu", "script code", "Footer links"):
+        assert dropped not in result
+    assert urls == ["https://example.com"]
+
+
+async def test_scrape_site_caps_the_text_of_each_page():
+    from agent.research import SITE_PAGE_CHARS
+
+    result, _, _ = await _scrape_with_responses(
+        "https://example.com", [_response("<p>" + "a" * 10_000 + "</p>")]
+    )
+    assert result == "[Page: https://example.com]\n" + "a" * SITE_PAGE_CHARS
 
 
 async def test_scrape_site_prepends_https_when_missing():
-    _, client = await _scrape_with_responses("example.com", [_response("<p>Content</p>")])
+    _, _, client = await _scrape_with_responses("example.com", [_response("<p>Content</p>")])
     assert client.get.call_args[0][0] == "https://example.com"
 
 
 async def test_scrape_site_keeps_an_uppercase_scheme():
-    _, client = await _scrape_with_responses("HTTPS://example.com", [_response("<p>Content</p>")])
+    _, _, client = await _scrape_with_responses(
+        "HTTPS://example.com", [_response("<p>Content</p>")]
+    )
     assert client.get.call_args[0][0] == "HTTPS://example.com"
 
 
-async def test_scrape_site_returns_error_message_on_failure():
-    result, _ = await _scrape_with_responses("https://broken.example.com", [Exception("timeout")])
+@pytest.mark.parametrize(
+    "response",
+    [Exception("timeout"), _response("Not Found", error=Exception("404 Not Found"))],
+    ids=["get-raises", "error-status"],
+)
+async def test_scrape_site_reports_a_homepage_it_could_not_fetch(response):
+    result, urls, _ = await _scrape_with_responses("https://broken.example.com", [response])
     assert "Could not scrape" in result
+    assert urls == []
 
 
 async def test_search_web_returns_formatted_results():
-    from agent.research import search_web
+    from agent.research import FETCH_TIMEOUT_S, search_web
 
     mock_response = {
         "results": [
@@ -93,6 +112,10 @@ async def test_search_web_returns_formatted_results():
     assert results[0]["url"] == "https://a.com"
     assert results[0]["snippet"] == "Snippet 1"
     assert results[1] == {"title": "Title 2", "url": "https://b.com", "snippet": ""}
+    # A stalled search must not hold up the reply.
+    mock_instance.search.assert_awaited_once_with(
+        "test query", max_results=2, timeout=FETCH_TIMEOUT_S
+    )
 
 
 async def test_search_web_handles_exception():
@@ -107,10 +130,17 @@ async def test_search_web_handles_exception():
     assert "error" in results[0]
 
 
-async def test_research_org_with_url_returns_structured_result():
+async def test_research_org_with_url_scrapes_once_searches_three_times_and_cites_sources():
+    from datetime import date
+
     from agent.research import research_org
 
-    search_result = [{"title": "T", "url": "https://x.com", "snippet": "S"}]
+    social = [
+        {"title": "FB Page", "url": "https://fb.com/org", "snippet": "Social"},
+        {"error": "x"},  # a failed search is not a source
+    ]
+    news = [{"title": "News Item", "url": "https://news.com/article", "snippet": "News"}]
+    similar = [{"title": "Similar Org", "url": "https://sim.org", "snippet": "Similar"}]
     with (
         patch(
             "agent.research.scrape_site",
@@ -119,25 +149,29 @@ async def test_research_org_with_url_returns_structured_result():
             ),
         ) as mock_scrape,
         patch(
-            "agent.research.search_web", new=AsyncMock(return_value=search_result)
+            "agent.research.search_web", new=AsyncMock(side_effect=[social, news, similar])
         ) as mock_search,
     ):
         result = await research_org("Test Org", "https://test.org")
 
-    for key in (
-        "org_name",
-        "website_content",
-        "social_presence",
-        "news",
-        "similar_orgs",
-        "sources",
-    ):
-        assert key in result
-    assert result["website_content"] == "scraped content"
     mock_scrape.assert_called_once_with("https://test.org")
-    website_sources = [src["url"] for src in result["sources"] if src["type"] == "website"]
-    assert website_sources == ["https://test.org", "https://test.org/programs"]
     assert mock_search.call_count == 3
+    queries = [c.args[0] for c in mock_search.call_args_list]
+    assert str(date.today().year) in queries[1]
+    assert result == {
+        "org_name": "Test Org",
+        "website_content": "scraped content",
+        "social_presence": social,
+        "news": news,
+        "similar_orgs": similar,
+        "sources": [  # similar orgs are context, not citations
+            {"type": "website", "url": "https://test.org"},
+            {"type": "website", "url": "https://test.org/programs"},
+            {"type": "social", "url": "https://fb.com/org", "title": "FB Page"},
+            {"type": "news", "url": "https://news.com/article", "title": "News Item"},
+        ],
+    }
+    assert all(source["url"] for source in result["sources"])
 
 
 async def test_research_org_without_url_skips_scrape():
@@ -164,6 +198,10 @@ async def test_research_org_without_url_skips_scrape():
         "http://example.com",
         # "127.0.0.1@" is userinfo; the host is example.com, which DNS checks later.
         "http://127.0.0.1@example.com/",
+        "https://org.example/about",
+        "https://bücher.example/",  # internationalised domain
+        "http://[64:ff9b::808:808]/",  # NAT64 to a public address (8.8.8.8)
+        "http://[2606:4700:4700::1111]/",  # public IPv6
     ],
 )
 def test_is_safe_url_allows_public_hosts(url):
@@ -216,7 +254,7 @@ def test_is_safe_url_blocks_internal_hosts_and_non_http_schemes(url):
     [
         "169.254.169.254",  # cloud metadata
         "100.100.100.200",  # carrier-grade NAT (Alibaba Cloud metadata)
-        # Regression: DNS64 answers with NAT64 addresses, so these passed before.
+        # Regression: IPv6 forms of internal addresses, as a DNS64 resolver may answer.
         "64:ff9b::a9fe:a9fe",
         "::ffff:10.0.0.1",
         "fd00::1",
@@ -224,7 +262,7 @@ def test_is_safe_url_blocks_internal_hosts_and_non_http_schemes(url):
 )
 async def test_scrape_site_blocks_a_domain_that_resolves_to_an_internal_address(address):
     with patch("agent.research._resolve_host", new=AsyncMock(return_value=[address])):
-        result, client = await _scrape_with_responses("https://innocent-looking.example", [])
+        result, _, client = await _scrape_with_responses("https://innocent-looking.example", [])
     assert "not allowed" in result
     client.get.assert_not_called()
 
@@ -233,7 +271,7 @@ async def test_scrape_site_blocks_a_domain_that_resolves_to_an_internal_address(
     "location", ["file:///etc/passwd", "http://169.254.169.254/latest/meta-data/"]
 )
 async def test_scrape_site_does_not_follow_a_redirect_to_a_blocked_url(location):
-    result, client = await _scrape_with_responses(
+    result, _, client = await _scrape_with_responses(
         "https://example.org", [_response(location=location)]
     )
     assert "not allowed" in result
@@ -242,36 +280,14 @@ async def test_scrape_site_does_not_follow_a_redirect_to_a_blocked_url(location)
 
 @pytest.mark.parametrize("url", ["http://169.254.169.254/", "http://localhost:6379/"])
 async def test_scrape_site_refuses_a_blocked_url_without_fetching(url):
-    result, client = await _scrape_with_responses(url, [])
+    result, urls, client = await _scrape_with_responses(url, [])
     assert "not allowed" in result
+    assert urls == []
     client.get.assert_not_called()
 
 
-async def test_research_org_populates_sources():
-    from agent.research import research_org
-
-    social = [{"title": "FB Page", "url": "https://fb.com/org", "snippet": "Social"}]
-    news = [{"title": "News Item", "url": "https://news.com/article", "snippet": "News"}]
-    similar = [{"title": "Similar Org", "url": "https://sim.org", "snippet": "Similar"}]
-    with (
-        patch(
-            "agent.research.scrape_site",
-            new=AsyncMock(return_value=("content", ["https://test.org"])),
-        ),
-        patch("agent.research.search_web", new=AsyncMock(side_effect=[social, news, similar])),
-    ):
-        result = await research_org("Test Org", "https://test.org")
-
-    source_types = {s["type"] for s in result["sources"]}
-    assert "website" in source_types
-    assert "social" in source_types
-    assert "news" in source_types
-    website_src = next(s for s in result["sources"] if s["type"] == "website")
-    assert website_src["url"] == "https://test.org"
-
-
 async def test_scrape_site_follows_safe_redirect():
-    result, client = await _scrape_with_responses(
+    result, _, client = await _scrape_with_responses(
         "http://example.org",
         [
             _response(location="https://www.example.org/"),
@@ -280,10 +296,12 @@ async def test_scrape_site_follows_safe_redirect():
     )
     assert "Our mission" in result
     assert client.get.call_args_list[1][0][0] == "https://www.example.org/"
+    # httpx must never follow a redirect itself: each hop is checked here first.
+    assert all(c.kwargs["follow_redirects"] is False for c in client.get.call_args_list)
 
 
 async def test_scrape_site_resolves_relative_redirect():
-    _, client = await _scrape_with_responses(
+    _, _, client = await _scrape_with_responses(
         "https://example.org/old",
         [
             _response(location="/new"),
@@ -297,24 +315,14 @@ async def test_scrape_site_stops_after_too_many_redirects():
     from agent.research import MAX_REDIRECTS
 
     loop = [_response(location="https://example.org/loop") for _ in range(MAX_REDIRECTS + 1)]
-    result, _ = await _scrape_with_responses("https://example.org", loop)
+    result, _, _ = await _scrape_with_responses("https://example.org", loop)
     assert "too many redirects" in result
-
-
-async def test_scrape_site_reports_http_error_status():
-    result, _ = await _scrape_with_responses(
-        "https://example.org",
-        [
-            _response("Not Found", error=Exception("404 Not Found")),
-        ],
-    )
-    assert "Could not scrape" in result
 
 
 async def test_scrape_site_blocks_redirect_to_domain_that_resolves_to_loopback():
     resolver = AsyncMock(side_effect=[["93.184.216.34"], ["::ffff:127.0.0.1"]])
     with patch("agent.research._resolve_host", new=resolver):
-        result, client = await _scrape_with_responses(
+        result, _, client = await _scrape_with_responses(
             "https://example.org",
             [
                 _response(location="https://rebound.example/"),
@@ -333,17 +341,6 @@ async def test_resolve_host_returns_addresses_and_empty_on_failure():
         assert await _real_resolve_host("org.example") == ["203.0.113.5"]
         loop.getaddrinfo = AsyncMock(side_effect=socket.gaierror("no such host"))
         assert await _real_resolve_host("missing.example") == []
-
-
-async def test_research_org_news_query_uses_current_year():
-    from datetime import date
-
-    from agent.research import research_org
-
-    with patch("agent.research.search_web", new=AsyncMock(return_value=[])) as mock_search:
-        await research_org("Test Org")
-    queries = [c.args[0] for c in mock_search.call_args_list]
-    assert any(str(date.today().year) in q for q in queries)
 
 
 HOME_HTML = """<html><body>
@@ -405,14 +402,6 @@ async def test_scrape_site_skips_failed_subpages():
         text, urls = await scrape_site("https://test.org")
     assert urls == ["https://test.org"]
     assert "Welcome to Test Org." in text
-
-
-async def test_scrape_site_reports_blocked_homepage():
-    from agent.research import scrape_site
-
-    text, urls = await scrape_site("http://169.254.169.254/")
-    assert "not allowed" in text
-    assert urls == []
 
 
 async def test_research_org_does_not_cite_a_homepage_it_could_not_read():

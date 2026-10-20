@@ -20,6 +20,9 @@ from typing import Any
 import yaml
 
 SKILLS_DIR: Path = Path(__file__).parent.parent / "skills"
+# The skill files are read on every prompt build and tool call; PyYAML's C parser (in its
+# wheels) reads them about 7x faster than the pure-Python one, with the same result.
+_YAML_LOADER: type = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 PILLARS_FILE: str = "content_pillars.yaml"
 
 # Fields each kind of skill must define; everything else is optional.
@@ -43,6 +46,30 @@ LIST_FIELDS: tuple[str, ...] = ("must_include", "avoid", "platforms")
 BOOL_FIELDS: tuple[str, ...] = ("has_caption", "needs_visual")
 
 logger = logging.getLogger(__name__)
+# Skill-file problems already logged by this process.
+_logged_problems: set[str] = set()
+
+
+def _load_yaml(text: str) -> Any:
+    """yaml.safe_load, through the C parser when PyYAML has it."""
+    return yaml.load(text, Loader=_YAML_LOADER)
+
+
+def _read_yaml(path: Path) -> tuple[Any, str]:
+    """
+    A YAML file's contents and "", or None and what is wrong with the file.
+
+    Besides bad YAML, a file saved in another encoding than UTF-8 (Windows
+    editors do) or a folder named *.yaml is a problem to report, not a crash.
+    """
+    try:
+        return _load_yaml(path.read_text(encoding="utf-8")), ""
+    except yaml.YAMLError as e:
+        return None, f"{path.name}: not valid YAML ({e})"
+    except UnicodeDecodeError:
+        return None, f"{path.name}: not saved as UTF-8 text; save it again as UTF-8"
+    except OSError as e:
+        return None, f"{path.name}: can't be read ({e.strerror})"
 
 
 @dataclass
@@ -90,10 +117,9 @@ def _pillars_problem() -> str | None:
     path = SKILLS_DIR / PILLARS_FILE
     if not path.exists():
         return None
-    try:
-        data = yaml.safe_load(path.read_text())
-    except yaml.YAMLError as e:
-        return f"{PILLARS_FILE}: not valid YAML ({e})"
+    data, problem = _read_yaml(path)
+    if problem:
+        return problem
     pillars = data.get("pillars") if isinstance(data, dict) else None
     if not isinstance(pillars, list):
         return f"{PILLARS_FILE}: expected a 'pillars:' list of '- name: ...' entries"
@@ -123,10 +149,9 @@ def load_skills() -> SkillSet:
     for path in sorted(SKILLS_DIR.glob("*.yaml")):
         if path.name == PILLARS_FILE:
             continue
-        try:
-            skill = yaml.safe_load(path.read_text())
-        except yaml.YAMLError as e:
-            skills.problems.append(f"{path.name}: not valid YAML ({e})")
+        skill, problem = _read_yaml(path)
+        if problem:
+            skills.problems.append(problem)
             continue
         problem = _skill_problem(skill, path.name)
         if problem is None and skill["id"] in seen_ids:
@@ -139,7 +164,10 @@ def load_skills() -> SkillSet:
     if pillars_problem := _pillars_problem():
         skills.problems.append(pillars_problem)
     for problem in skills.problems:
-        logger.warning("Skipped skill file — %s", problem)
+        # Skills load on every model call: each problem is logged once, not per call.
+        if problem not in _logged_problems:
+            _logged_problems.add(problem)
+            logger.warning("Skipped skill file — %s", problem)
     return skills
 
 
@@ -147,7 +175,7 @@ def load_content_pillars(profile: dict[str, Any]) -> list[dict[str, Any]]:
     """
     Return the content pillars for an org.
 
-    A per-org "content_pillars" list in profile.json replaces the defaults in
+    A per-org "content_pillars" list in the profile replaces the defaults in
     skills/content_pillars.yaml. Entries without a name are dropped; an
     unreadable pillars file yields no pillars rather than an error.
 
@@ -161,8 +189,8 @@ def load_content_pillars(profile: dict[str, Any]) -> list[dict[str, Any]]:
     if not pillars:
         path = SKILLS_DIR / PILLARS_FILE
         try:
-            pillars = (yaml.safe_load(path.read_text()) or {}).get("pillars", [])
-        except (OSError, yaml.YAMLError, AttributeError) as e:
+            pillars = (_load_yaml(path.read_text(encoding="utf-8")) or {}).get("pillars", [])
+        except (OSError, UnicodeDecodeError, yaml.YAMLError, AttributeError) as e:
             logger.warning("Could not read %s — %s", PILLARS_FILE, e)
             return []
     return [

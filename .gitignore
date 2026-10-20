@@ -3,9 +3,8 @@
 .env.*
 !.env.example
 
-# Runtime data: org profiles (+ .bak), per-org .lock files and write temp files, traces,
-# the SQLite conversation database.
-# Keep the empty folder so `docker compose` mounts a user-owned ./data, not one Docker creates as root.
+# Org data from before PostgreSQL (profiles, traces, the SQLite conversation database),
+# kept until scripts/import_profiles.py has moved it.
 data/*
 !data/.gitkeep
 

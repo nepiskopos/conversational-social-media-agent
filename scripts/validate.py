@@ -1,12 +1,14 @@
 """
-Check the files a non-engineer edits: skills/*.yaml and data/*/profile.json.
+Check the files a non-engineer edits: skills/*.yaml and exported org profiles.
 
 Owns: a plain-English report of every problem that would make Mackie skip a
-skill file or fail to read an org's memory. Changes nothing on disk. Does not
-own the loading logic itself (agent/skills.py, agent/memory.py).
+skill file, or refuse to import a profile file given on the command line.
+Changes nothing. Does not own the loading logic itself (agent/skills.py,
+agent/memory.py).
 
 Usage (from the project root):
-    python scripts/validate.py
+    python scripts/validate.py                    # skill files
+    python scripts/validate.py brca-strong.json   # skill files and an edited export
 Exit code is 0 when everything is valid, 1 otherwise.
 """
 
@@ -21,33 +23,32 @@ from agent import memory as mem  # needs the path set above
 from agent import skills
 
 
-def profile_problems() -> list[str]:
-    """Return one message per data/*/profile.json that Mackie cannot read."""
+def profile_problems(paths: list[Path]) -> list[str]:
+    """
+    Return one message per profile file whose contents scripts/import_profiles.py would refuse.
+
+    The org id is checked only at import, since it can come from the file's folder.
+    """
     problems: list[str] = []
-    for profile_path in sorted(mem.DATA_DIR.glob("*/profile.json")):
-        org_id = profile_path.parent.name
-        if not mem.ORG_ID_PATTERN.fullmatch(org_id):
-            problems.append(
-                f"{profile_path}: folder name {org_id!r} is not an org id "
-                "(lowercase letters, digits and dashes only), so Mackie never opens it"
-            )
-            continue
+    for path in paths:
         try:
-            mem.load_profile(org_id)
+            mem.read_profile_file(path)
+        except OSError as e:
+            problems.append(f"{path}: can't be read ({e.strerror})")
         except mem.ProfileError as e:
             problems.append(str(e))
     return problems
 
 
-def main() -> int:
+def main(argv: list[str]) -> int:
     """Print a report and return the process exit code."""
     skill_set = skills.load_skills()
     print(f"Platforms:     {', '.join(s['id'] for s in skill_set.platforms) or '(none)'}")
     print(f"Content types: {', '.join(s['id'] for s in skill_set.content_types) or '(none)'}")
     print(f"Formats:       {', '.join(s['id'] for s in skill_set.formats) or '(none)'}")
-    problems = skill_set.problems + profile_problems()
+    problems = skill_set.problems + profile_problems([Path(arg) for arg in argv])
     if not problems:
-        print("All skill files and org profiles are valid.")
+        print("All files are valid.")
         return 0
     print(f"\n{len(problems)} problem(s):")
     for problem in problems:
@@ -56,4 +57,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

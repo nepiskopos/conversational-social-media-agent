@@ -6,7 +6,7 @@ user_env = []
 session_timeout = 3600
 
 # Duration (in seconds) of the user session expiry
-user_session_timeout = 1296000  # 15 days
+user_session_timeout = 86400  # 1 day: a stolen login cookie stops working by tomorrow
 
 # Enable third parties caching (e.g., LangChain cache)
 cache = false
@@ -19,8 +19,9 @@ persist_user_env = false
 # Set to true to show API keys as ***, false to show them as plain text
 mask_user_env = false
 
-# Authorized origins
-allow_origins = ["*"]
+# Authorized origins. Empty: only the page Mackie serves itself can make requests with a
+# user's login cookie; ["*"] would let any site make them, credentials included.
+allow_origins = []
 
 [features]
 # Process and display HTML in messages. This can be a security risk (see https://stackoverflow.com/questions/19603097/why-is-it-dangerous-to-render-user-generated-html-or-javascript)

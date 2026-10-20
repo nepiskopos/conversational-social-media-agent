@@ -1,4 +1,10 @@
-"""Unit tests for agent/untrusted.py — trust-boundary tags around third-party text."""
+"""
+Unit tests for agent/untrusted.py: trust-boundary tags around third-party text.
+
+Owns: wrap_untrusted's output, the escaping of its closing tag in any case or
+spacing, and of quotes in attributes. Does not own where wrapping is applied
+end to end (test_security.py).
+"""
 
 from agent.untrusted import wrap_untrusted
 

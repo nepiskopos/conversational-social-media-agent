@@ -3,9 +3,9 @@
 # Mackie sees each pillar's name and description; the examples are notes for people.
 #
 # Safe to edit: add, rename, or remove pillars here without any code changes.
-# To override these for a specific org, add a "content_pillars" key to
-# data/{org-id}/profile.json with the same list structure (name + description).
-# When a per-org override is present it replaces this file entirely.
+# To override these for a specific org, set "content_pillars" in its exported profile
+# (scripts/export_profile.py, then scripts/import_profiles.py) to a list with the same
+# structure (name + description). A per-org list replaces this file entirely for that org.
 # Run `python scripts/validate.py` after editing (a broken file means no pillars, not a crash).
 
 pillars:

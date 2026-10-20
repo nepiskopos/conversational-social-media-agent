@@ -2,7 +2,7 @@
 # context unless it starts with **/ — so anything that can appear in a
 # subfolder (secrets, bytecode caches) uses **/.
 
-# Secrets and runtime data: provided at run time (env_file, ./data volume)
+# Secrets, and the old file-based data (moved into PostgreSQL by scripts/import_profiles.py)
 **/.env
 **/.env.*
 data/
@@ -13,6 +13,7 @@ data/
 .dockerignore
 Dockerfile
 docker-compose.yml
+docker/
 .github/
 .claude/
 CLAUDE.md

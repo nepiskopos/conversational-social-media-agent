@@ -2,14 +2,14 @@
 Tool definitions and handlers for Mackie's agentic loop.
 
 Owns: the TOOL_DEFINITIONS list (OpenAI function-calling format consumed by
-LiteLLM), handle_tool_call dispatch, per-tool trace logging to
-data/{org_id}/trace.jsonl, checks on the model's arguments (required ones,
-statuses, dates, reported counts), the checks save_post applies (platform and
-format rules from skills/, versions, cited sources) and their re-check before
-a post goes live, the org brief written after research, and the content
-calendar.
-Does not own the conversation loop (assistant.py) or low-level memory I/O
-(memory.py).
+LiteLLM), handle_tool_call dispatch, the per-call trace entry
+(memory.append_trace), checks on the model's arguments (required ones,
+statuses, dates, reported counts, preference sizes), the checks save_post
+applies (platform and format rules from skills/, versions, cited sources) and
+their re-check before a post goes live, the org brief written after research,
+and the content calendar.
+Does not own the conversation loop (graph.py), the prompt (assistant.py),
+fetching research (research.py) or storage (memory.py).
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import calendar
 import json
+import logging
 import re
 import time
 from datetime import date, datetime
@@ -28,7 +29,10 @@ from . import memory as mem
 from . import research as res
 from . import skills
 from .config import background_kwargs, resolve_fast_model
+from .logs import describe, safe, stack
 from .untrusted import wrap_untrusted
+
+logger = logging.getLogger(__name__)
 
 # Optional save_post fields copied into the ledger entry when provided.
 OPTIONAL_POST_FIELDS: tuple[str, ...] = (
@@ -395,15 +399,13 @@ def _format_research_summary(
     """
     Format a research result dict into a readable summary string for the LLM.
 
-    All third-party content (website text, search snippets) is wrapped in
-    <external_content> tags. This creates an explicit trust boundary so the model
-    can distinguish legitimate instructions (system prompt + user messages) from
-    untrusted third-party data, mitigating indirect prompt injection via malicious
-    org websites or crafted search snippets.
+    Website text and search snippets are wrapped in <external_content> tags,
+    which the system prompt marks as data, so a malicious page or snippet can't
+    pass itself off as instructions.
 
     Args:
         org_name:      Display name of the org, shown in the header line.
-        result:        Dict returned by research_org(), with keys website_content,
+        result:        Dict returned by research.research_org(), with keys website_content,
                        social_presence, news, similar_orgs, sources.
         website_chars: How much website text to include (the org brief uses more).
 
@@ -457,9 +459,10 @@ async def handle_tool_call(tool_name: str, tool_input: dict[str, Any], org_id: s
         org_id:     The active org identifier for memory operations.
 
     Never raises: unparseable arguments, a missing required argument or a
-    failing tool return an "Error: ..." string instead. The model's tool-call message is already
-    checkpointed when tools run, so an exception here would leave the thread
-    with an unanswered tool call that every provider rejects on all later turns.
+    failing tool return an "Error: ..." string instead. The model's tool-call
+    message is already checkpointed when tools run, so an exception here would
+    leave the thread with an unanswered tool call that every provider rejects
+    on all later turns.
 
     Returns:
         A plain-text result string to be sent back to the LLM as a tool result.
@@ -473,11 +476,16 @@ async def handle_tool_call(tool_name: str, tool_input: dict[str, Any], org_id: s
                 tool_name, _without_blanks(tool_input), org_id
             )
     except Exception as e:
+        # The arguments stay out of the log (they hold what users wrote); the trace has them.
+        logger.error(
+            "Tool %s failed for %s: %s\n%s", safe(tool_name), org_id, describe(e), stack(e)
+        )
         result = f"Error: {tool_name} failed — {type(e).__name__}: {e}"
     try:
-        _append_trace(org_id, tool_name, tool_input, result, round((time.time() - t0) * 1000))
-    except (OSError, ValueError):
-        pass  # the trace is a log; failing to write it must not fail the tool
+        await _append_trace(org_id, tool_name, tool_input, result, round((time.time() - t0) * 1000))
+    except Exception as e:
+        # The trace is a record; failing to write it must not fail the tool.
+        logger.warning("Could not trace %s for %s: %s", safe(tool_name), org_id, describe(e))
     return result
 
 
@@ -504,25 +512,25 @@ async def _write_org_brief(org_name: str, result: dict[str, Any]) -> str:
             **background_kwargs(model),
         )
         return (response.choices[0].message.content or "").strip()
-    except Exception:
+    except Exception as e:
+        logger.warning("Could not write the org brief for %s: %s", safe(org_name), describe(e))
         return ""
 
 
 async def _run_research(
-    org_name: str, org_url: str, org_id: str, extra: dict[str, str] | None = None
+    org_name: str, org_url: str, org_id: str, updated_at: str = ""
 ) -> dict[str, Any]:
     """
-    Run org research, then save it, the brief and any extra fields; return the research.
+    Run org research, then save it and the brief; return the research.
 
-    The profile is loaded only after the slow research and brief calls, under
-    the org lock, so posts another session saved meanwhile are kept.
+    updated_at, for a refresh, is when it ran.
+
+    Only the research and the brief are saved, after the slow calls, so
+    posts another session saved meanwhile are kept.
     """
     result = await res.research_org(org_name=org_name, org_url=org_url)
     brief = await _write_org_brief(org_name, result)
-    with mem.locked(org_id):
-        profile = mem.load_profile(org_id)
-        profile.update(extra or {}, research=result, org_brief=brief)
-        mem.save_profile(org_id, profile)
+    await mem.save_research(org_id, result, brief, updated_at)
     return result
 
 
@@ -533,7 +541,7 @@ def _known_source_urls(profile: dict[str, Any]) -> set[str]:
 
 
 def _source_entries(sources: list[Any]) -> list[dict[str, Any]]:
-    """The sources that are {...} entries; a URL typed into profile.json as plain text is skipped."""
+    """The sources that are {...} entries; a URL typed into an imported profile as plain text is skipped."""
     return [source for source in sources if isinstance(source, dict)]
 
 
@@ -653,19 +661,23 @@ def _check_post(
     return None, warnings
 
 
-def _remember_search_sources(org_id: str, results: list[dict[str, Any]]) -> None:
+async def _remember_search_sources(org_id: str, results: list[dict[str, Any]]) -> None:
     """Add web_search result URLs to the research sources so they can be cited and checked."""
-    with mem.locked(org_id):
-        profile = mem.load_profile(org_id)
-        if not profile.get("research"):
-            return
-        sources = profile["research"].setdefault("sources", [])
+
+    def add_new(research: dict[str, Any]) -> bool:
+        sources = research.setdefault("sources", [])
+        if not isinstance(sources, list):
+            return False
         known = {_normalise_url(s.get("url", "")) for s in _source_entries(sources)}
+        added = False
         for r in results:
             if r.get("url") and _normalise_url(r["url"]) not in known:
                 sources.append({"type": "web", "url": r["url"], "title": r.get("title", "")})
                 known.add(_normalise_url(r["url"]))
-        mem.save_profile(org_id, profile)
+                added = True
+        return added
+
+    await mem.update_research(org_id, add_new)
 
 
 def _format_ledger_results(posts: list[dict[str, Any]]) -> str:
@@ -765,7 +777,7 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
         return error
     if tool_name == "research_org":
         result = await _run_research(tool_input["org_name"], tool_input.get("org_url", ""), org_id)
-        mem.fill_org_details(org_id, tool_input["org_name"], tool_input.get("org_url", ""))
+        await mem.fill_org_details(org_id, tool_input["org_name"], tool_input.get("org_url", ""))
         return f"{_format_research_summary(tool_input['org_name'], result)}\n\n{RESEARCH_NEXT_STEP}"
 
     elif tool_name == "refresh_research":
@@ -773,7 +785,7 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
             tool_input["org_name"],
             tool_input.get("org_url", ""),
             org_id,
-            {"research_updated_at": time.strftime("%Y-%m-%dT%H:%M:%S")},
+            time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
         return (
             f"Research refreshed for {tool_input['org_name']}. "
@@ -785,13 +797,13 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
         max_results = max(1, min(int(tool_input.get("max_results", 5)), MAX_WEB_RESULTS))
         results = await res.search_web(tool_input["query"], max_results)
         found = [r for r in results if "error" not in r]
-        _remember_search_sources(org_id, found)
+        await _remember_search_sources(org_id, found)
         # Same trust boundary as research results: snippets are third-party text.
         lines = [_wrap_search_result(r, WEB_SEARCH_SNIPPET_CHARS) for r in found]
         return "\n".join(lines) if lines else "No results found."
 
     elif tool_name == "save_post":
-        blocking, warnings = _check_post(tool_input, mem.load_profile(org_id))
+        blocking, warnings = _check_post(tool_input, await mem.load_profile(org_id))
         if blocking:
             return blocking
         status = tool_input.get("status", "suggested")
@@ -803,31 +815,31 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
             "source_summary": tool_input.get("source_summary", ""),
         }
         post.update({k: tool_input[k] for k in OPTIONAL_POST_FIELDS if tool_input.get(k)})
-        post_id = mem.add_post(org_id, post)
+        post_id = await mem.add_post(org_id, post)
         reply = f"Saved to ledger as {post_id} (status: {status})"
         return reply + "".join(f"\nWarning: {w}" for w in warnings)
 
     elif tool_name == "update_post_status":
         post_id, status = tool_input["post_id"], tool_input["status"]
-        post = next((p for p in mem.get_ledger(org_id) if p.get("id") == post_id), None)
+        post = await mem.get_post(org_id, post_id)
         if post and status in LIVE_STATUSES and (problem := _live_post_problem(post)):
             return (
                 f"Not updated: {post_id} can't be {status} yet: {problem}. Save the finished "
                 f'version with save_post (status "draft", parent_id {post_id}), then {status} that one.'
             )
-        if not mem.update_post_status(org_id, post_id, status):
+        if not await mem.update_post_status(org_id, post_id, status):
             return f"Post {post_id} not found in ledger"
         # post is the version from before the update, so approving it again adds no duplicate.
         if status == "approved" and post.get("status") != "approved" and post.get("content"):
-            mem.add_voice_example(org_id, post["content"], f"approved {post_id}")
+            await mem.add_voice_example(org_id, post["content"], f"approved {post_id}")
         return f"Updated {post_id} → {status}"
 
     elif tool_name == "save_preference":
-        if problem := _preference_size_problem(tool_input) or _preference_growth_problem(
+        if problem := _preference_size_problem(tool_input) or await _preference_growth_problem(
             org_id, tool_input
         ):
             return f"Not saved: {problem}"
-        mem.save_preference(
+        await mem.save_preference(
             org_id,
             tool_input["key"],
             tool_input["value"],
@@ -837,14 +849,14 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
         return f"Preference saved: {tool_input['key']} = {tool_input['value']}"
 
     elif tool_name == "forget_preference":
-        if mem.forget_preference(org_id, tool_input["key"], tool_input.get("value")):
+        if await mem.forget_preference(org_id, tool_input["key"], tool_input.get("value")):
             return f"Forgot preference: {tool_input['key']}" + (
                 f" (removed {tool_input['value']!r})" if tool_input.get("value") else ""
             )
         return f"No saved preference matches {tool_input['key']!r}"
 
     elif tool_name == "save_voice_example":
-        mem.add_voice_example(org_id, tool_input["content"], tool_input["note"])
+        await mem.add_voice_example(org_id, tool_input["content"], tool_input["note"])
         return "Saved as a voice example."
 
     elif tool_name == "record_performance":
@@ -852,14 +864,14 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
         if error:
             return error
         post_id = tool_input["post_id"]
-        if not mem.record_performance(org_id, post_id, metrics, tool_input.get("note", "")):
+        if not await mem.record_performance(org_id, post_id, metrics, tool_input.get("note", "")):
             return f"Post {post_id} not found in ledger"
         reported = ", ".join(f"{value} {name}" for name, value in metrics.items())
         return f"Recorded results for {post_id} ({reported or tool_input['note']}); status → posted"
 
     elif tool_name == "search_ledger":
         filters = {k: tool_input.get(k) for k in ("status", "platform", "since", "until", "text")}
-        return _format_ledger_results(mem.search_ledger(org_id, **filters))
+        return _format_ledger_results(await mem.search_ledger(org_id, **filters))
 
     elif tool_name == "generate_calendar":
         posts_per_week = int(tool_input.get("posts_per_week", DEFAULT_POSTS_PER_WEEK))
@@ -955,15 +967,15 @@ def _quote_chars(note: Any) -> int:
     return len(str(note.get("quote") or "")) if isinstance(note, dict) else 0
 
 
-def _preference_growth_problem(org_id: str, tool_input: dict[str, Any]) -> str:
+async def _preference_growth_problem(org_id: str, tool_input: dict[str, Any]) -> str:
     """
     Say if the save would take a list or all preferences over their caps, or return "".
 
     The total counts each preference's quote too, as the prompt shows both.
     Only a save that adds length is refused, so shortening or replacing a
-    preference always works, even in a profile.json edited past the caps.
+    preference always works, even in an imported profile past the caps.
     """
-    profile = mem.load_profile(org_id)
+    profile = await mem.load_profile(org_id)
     prefs, notes = profile["preferences"], profile["preference_notes"]
     key, value = tool_input["key"], tool_input["value"]
     before = prefs.get(key, [])
@@ -1041,10 +1053,9 @@ async def _generate_calendar_async(
     serve the campaign focus if one is given, and build on the org's
     best-performing posts. Platforms, formats and pillars come from
     skills/*.yaml and the org's pillars, so a new skill file is used by the
-    calendar too. The four plan_week() coroutines run concurrently via
-    asyncio.gather with return_exceptions=True so a single week failure does
-    not abort the whole calendar. Failed weeks appear as error rows in the
-    table; planned posts are saved to the ledger with status 'planned' and a
+    calendar too. The weeks are planned in parallel, and a week that fails
+    becomes an error row in the table instead of aborting the calendar.
+    Planned posts are saved to the ledger with status 'planned' and a
     scheduled_for date.
 
     Args:
@@ -1062,7 +1073,7 @@ async def _generate_calendar_async(
     if first_day is None:
         return f"Error: month_year {month_year!r} is not a month and year like 'July 2026'."
     month_label = f"{first_day:%B %Y}"
-    profile = mem.load_profile(org_id)
+    profile = await mem.load_profile(org_id)
     org_name = profile["name"] or "this organization"
     model = resolve_fast_model()
     skill_set = skills.load_skills()
@@ -1154,6 +1165,13 @@ async def _generate_calendar_async(
     saved = 0
     for n, week_posts in enumerate(results, 1):
         if isinstance(week_posts, Exception):
+            logger.warning(
+                "Could not plan week %d of %s for %s: %s",
+                n,
+                month_label,
+                org_id,
+                describe(week_posts),
+            )
             lines.append(f"| Week {n} | — | — | — | Error generating plan | — | — |")
             continue
         for item in week_posts:
@@ -1167,7 +1185,7 @@ async def _generate_calendar_async(
                 "scheduled_for": item["date"].isoformat(),
                 "source_summary": str(item.get("rationale", "")),
             }
-            mem.add_post(org_id, post | optional)
+            await mem.add_post(org_id, post | optional)
             saved += 1
             lines.append(
                 f"| {item['week']} | {item['date']:%a %b} {item['date'].day} "
@@ -1183,10 +1201,10 @@ async def _generate_calendar_async(
     return "\n".join(lines)
 
 
-def _append_trace(
+async def _append_trace(
     org_id: str, tool_name: str, tool_input: dict[str, Any], result: str, latency_ms: int
 ) -> None:
-    """Append one JSONL entry to data/{org_id}/trace.jsonl."""
+    """Record one tool call in the org's trace."""
     entry = {
         "ts": time.time(),
         "tool": tool_name,
@@ -1194,6 +1212,4 @@ def _append_trace(
         "result_preview": result[:300],
         "latency_ms": latency_ms,
     }
-    path = mem.trace_path(org_id)
-    with open(path, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    await mem.append_trace(org_id, entry)

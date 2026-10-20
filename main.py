@@ -1,17 +1,21 @@
 """
 CLI entry point for Mackie.
 
-Owns: asking for the org, the greeting with the agenda of what needs the user,
-the conversation loop with its commands (reset clears the conversation and
-keeps org memory; quit exits), and rich terminal output. Does not own LLM
-interaction (assistant.py) or persistence (memory.py).
+Owns: the login, asking for the org and opening it only if the user may
+(ending the session if that access is removed), the agenda of what needs the
+user, the conversation loop with its commands (reset clears the conversation
+and keeps org memory; quit exits), and rich terminal output. Each user has
+one resumable conversation per org. Does not own LLM interaction
+(assistant.py), accounts (accounts.py) or persistence (memory.py).
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
+import psycopg
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.markdown import Markdown
@@ -19,38 +23,87 @@ from rich.prompt import Prompt
 
 load_dotenv(Path(__file__).parent / ".env")
 
-from agent import memory as mem  # after load_dotenv, which config reads
+from agent import accounts, db  # after load_dotenv, which config reads
+from agent import memory as mem
 from agent.assistant import Assistant, agenda_summary
+from agent.errors import user_message
+from agent.logs import configure_logging, describe, stack
+
+# Warnings and errors only, so log lines don't interrupt the conversation on screen.
+configure_logging("WARNING")
+logger = logging.getLogger("agent.main")
 
 console = Console()
+LOGIN_ATTEMPTS: int = 3
+
+
+async def _login() -> accounts.User | None:
+    """Ask for a username and password, up to LOGIN_ATTEMPTS times; None if every try fails."""
+    for _ in range(LOGIN_ATTEMPTS):
+        username = Prompt.ask("[bold]Username[/bold]")
+        password = Prompt.ask("[bold]Password[/bold]", password=True)
+        if user := await accounts.authenticate(username, password):
+            return user
+        console.print("[red]Wrong username or password, or the account is locked.[/red]")
+    return None
 
 
 async def main() -> None:
-    """Run the interactive CLI conversation loop."""
+    """Run the interactive CLI conversation loop, closing the database pool at the end."""
+    try:
+        await _converse()
+    except (db.DatabaseError, psycopg.Error) as e:
+        logger.error("The terminal session stopped: %s", describe(e))
+        console.print(f"[red]{user_message(e)}[/red]")
+    finally:
+        await db.close_pool()
+
+
+async def _converse() -> None:
+    """Log in, open an org and hold the conversation."""
     console.print("\n[bold cyan]Mackie[/bold cyan] — AI Social Media Manager for Nonprofits\n")
+    user = await _login()
+    if user is None:
+        return
+    if orgs := await accounts.user_orgs(user.user_id):
+        console.print(f"[dim]Your organizations: {', '.join(orgs)}[/dim]")
 
     org_name = Prompt.ask("[bold]Organization name[/bold]")
     while not mem.slugify(org_name):
         org_name = Prompt.ask("[bold]Organization name[/bold] [dim](required)[/dim]")
+    org_id = mem.slugify(org_name)
+    if not await accounts.open_org(user.user_id, org_id):
+        console.print(f"[red]You don't have access to {org_name}.[/red] Ask an admin to add you.")
+        return
     org_url = Prompt.ask("Organization website [dim](press Enter to skip)[/dim]", default="")
 
-    org_id = mem.slugify(org_name)
-    try:
-        profile = mem.load_profile(org_id)
-    except mem.ProfileError as e:
-        console.print(f"[red]Can't read this organization's memory file.[/red] {e}")
-        return
+    profile = await mem.load_profile(org_id)
     if not profile.get("name"):
-        mem.fill_org_details(org_id, org_name, org_url)
+        await mem.fill_org_details(org_id, org_name, org_url)
 
-    assistant = Assistant(org_id)
+    # One resumable thread per user and org, so two users of an org never share a conversation.
+    assistant = Assistant(
+        org_id, thread_id=f"{org_id}:cli-user-{user.user_id}", user_id=user.user_id
+    )
 
     console.print(f"\n[dim]Working with [bold]{org_name}[/bold] (id: {org_id})[/dim]")
     console.print(
         "[dim]Commands: 'quit' to exit · 'reset' to clear conversation (memory kept)[/dim]\n"
     )
-    if summary := agenda_summary(org_id):
+    if summary := await agenda_summary(org_id):
         console.print(f"{summary}\n")
+    try:
+        resumed = bool(await assistant.recent_exchanges(1))
+    except accounts.AccessRevoked as e:  # removed in the moment since the org was opened
+        console.print(f"[red]{e}[/red] The session has ended.")
+        return
+    except Exception as e:
+        logger.error("Couldn't check for a conversation to resume for %s: %s", org_id, describe(e))
+        resumed = False  # the hint is a courtesy; the session works without it
+    if resumed:
+        console.print(
+            "[dim]Carrying on from your last conversation; 'reset' starts a new one.[/dim]\n"
+        )
 
     while True:
         try:
@@ -67,7 +120,15 @@ async def main() -> None:
             console.print("[dim]Goodbye![/dim]")
             break
         if cmd == "reset":
-            await assistant.clear_history()
+            try:
+                await assistant.clear_history()
+            except accounts.AccessRevoked as e:
+                console.print(f"[red]{e}[/red] The session has ended.")
+                break
+            except Exception as e:
+                logger.error("Reset failed for %s: %s", org_id, describe(e))
+                console.print(f"[red]Error:[/red] {user_message(e)}")
+                continue
             console.print(
                 "[dim]Conversation history cleared. Org memory and ledger are preserved.[/dim]\n"
             )
@@ -76,8 +137,12 @@ async def main() -> None:
         with console.status("[dim]Mackie is thinking…[/dim]", spinner="dots"):
             try:
                 response = await assistant.chat(user_input)
+            except accounts.AccessRevoked as e:
+                console.print(f"[red]{e}[/red] The session has ended.")
+                break
             except Exception as e:
-                console.print(f"[red]Error:[/red] {e}")
+                logger.error("A turn failed for %s: %s\n%s", org_id, describe(e), stack(e))
+                console.print(f"[red]Error:[/red] {user_message(e)}")
                 continue
 
         console.print()

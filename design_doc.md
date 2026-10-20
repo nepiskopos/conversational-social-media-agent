@@ -33,19 +33,19 @@ Corrections ("too corporate, we're more grassroots") are saved with `save_prefer
 ## Architecture
 
 ```
-User ──► app.py (Chainlit web UI)  or  main.py (terminal)
-              │
+User ──► login ──► app.py (Chainlit web UI)  or  main.py (terminal)
+              │  accounts.open_org: only orgs the user belongs to (agent/accounts.py)
               ▼
          Assistant (agent/assistant.py)
-              │  system prompt rebuilt every turn from profile.json and skills/:
+              │  system prompt rebuilt every turn from the org's memory and skills/:
               │    stable block   — identity, org brief, sources, pillars, platforms, content types, formats, rules
               │    per-turn block — date, preferences, voice examples, recent ledger, agenda, best-performing posts, summary
               ▼
-         LangGraph (agent/graph.py) — AgentState checkpointed in SQLite per thread_id
+         LangGraph (agent/graph.py) — AgentState checkpointed in PostgreSQL per thread_id
               │  summarize → agent ⇄ tools   (tools → summarize → agent)
               │  agent → save_check → summarize → agent   (at most once per turn)
-              │  model sees the last 40 messages, starting at a user turn;
-              │  older messages are folded into a running summary
+              │  model sees at most 40 messages / ~12,000 tokens, starting at a user turn,
+              │  old tool results shortened; older messages are summarized in batches of 10
               ▼
          LiteLLM ──► main provider, then fallbacks (agent/config.py)
               │
@@ -56,10 +56,12 @@ User ──► app.py (Chainlit web UI)  or  main.py (terminal)
                    forget_preference, save_voice_example           → agent/memory.py
                    generate_calendar                               → 4 parallel LLM calls
 
-Storage:  data/{org-id}/profile.json  (+ .bak)  org memory: research, brief, preferences, voice, ledger
-          data/{org-id}/.lock                  held while a profile is loaded, changed and saved
-          data/{org-id}/trace.jsonl            one line per tool call
-          data/checkpoints.db                  conversation history, keyed by thread_id
+Storage:  PostgreSQL (agent/db.py, migrations/), row-level security per org on every org table:
+            orgs, posts, preferences, voice_examples   org memory: research, brief, preferences, voice, ledger
+            tool_calls                                 one row per tool call
+            checkpoints, checkpoint_blobs/_writes      conversation history, keyed by thread_id
+            users, memberships                         accounts and which orgs each may open
+Errors:   agent/errors.py (what users are told), agent/logs.py (log setup, redaction)
 Config:   skills/*.yaml                         platforms, content types, formats, content pillars
 ```
 
@@ -88,7 +90,7 @@ Token limits on those calls are ceilings, not targets. User-facing replies keep 
 
 ### Timeouts
 
-**What.** `connection_kwargs()` adds `timeout=LLM_TIMEOUT_S` (120 s) to every LLM call, so `background_kwargs()` callers get it too. For a streamed reply it bounds the wait for each chunk, not the whole answer. Website fetches use `FETCH_TIMEOUT_S` (15 s) per page.
+**What.** `connection_kwargs()` adds `timeout=LLM_TIMEOUT_S` (120 s) to every LLM call, so `background_kwargs()` callers get it too. For a streamed reply it bounds the wait for each chunk, not the whole answer. Website fetches and Tavily searches use `FETCH_TIMEOUT_S` (15 s) each.
 
 **Why.** Without it, a provider that accepted a request and then stalled left the chat on "thinking" forever, and fallback never started, since fallback only runs when a request fails. Putting the timeout in the shared kwargs covers every current and future call site.
 
@@ -100,33 +102,33 @@ Token limits on those calls are ceilings, not targets. User-facing replies keep 
 
 **Why.** A second API key is enough to survive one provider's outage. LiteLLM's `Router` was the alternative, but it would send Anthropic-format system blocks to other providers. `_system_content()` builds the system message per model instead.
 
-### Agent loop: LangGraph with SQLite checkpoints
+### Agent loop: LangGraph with PostgreSQL checkpoints
 
-**What.** A four-node `StateGraph` (`summarize`, `agent`, `tools`, `save_check`), checkpointed by `AsyncSqliteSaver` in `data/checkpoints.db`.
+**What.** A four-node `StateGraph` (`summarize`, `agent`, `tools`, `save_check`), checkpointed by `OrgCheckpointer`, LangGraph's `AsyncPostgresSaver` limited to one org's threads.
 
 **Why.** History survives restarts, and typed state with an explicit router (`should_continue`) stays easy to debug. LangChain's AgentExecutor was rejected because it hides its retries and callbacks.
 
 **Session isolation.**
 
-- **Web UI:** each browser session gets the thread `{org_id}:{uuid}`. A `:` can't occur in an org id, so a session thread can never equal another org's default thread.
-- **CLI:** resumes the thread `{org_id}`. Its `reset` command deletes that thread's checkpoints (`Assistant.clear_history()`); org memory is kept.
+- **Web UI:** each user has one resumable conversation per org, the thread `{org_id}:web-user-{user_id}`, named on the server; the browser never names a thread. A returning user sees the last six messages again, each cut to 1,500 characters, with a note if the last one never got a reply, and a **Start a new conversation** action (`Assistant.recent_exchanges`, `clear_history`). A turn that fails because the conversation is too long for the model gets the same action right under the error, since every later turn would fail too. If the recap can't be loaded, the session starts with the plain greeting. A thread per browser tab would lose the conversation on every refresh, although it was still stored. Two tabs on one thread take turns (`_thread_lock`, per process). A `:` can't occur in an org id, so a user's thread can never equal another org's default thread (the bare org id, used when no thread is given).
+- **CLI:** resumes the thread `{org_id}:cli-user-{user_id}`, one per user and org, so two people using the terminal for one org don't share a conversation. Its `reset` command deletes that thread's checkpoints (`Assistant.clear_history()`); org memory is kept.
+- **Ownership:** `Assistant` refuses a thread that doesn't start with its org id, and row-level security on the checkpoint tables compares the org part of every thread id with the connection's org. `OrgCheckpointer` sets its org on every cursor it opens, by overriding the saver's `_cursor()`. It never assumes a connection still has an org from earlier: an audit found that remembering it let a failed checkpoint write (whose transaction rolled the setting back) leave the connection on the previous org, so the next org's cursor could read that org's thread. In pipeline mode the setting costs no extra round trip. `_cursor()` is a private method, so a LangGraph upgrade could change it; the failure would be closed, not open (no org set, no rows), and `test_graph.py` and `test_security.py` check both directions.
 
-**Concurrency.** Each turn opens its own connection (`aiosqlite`, 30-second busy wait), and the database runs in WAL mode with `synchronous=NORMAL`, so readers never wait for a writer and a commit doesn't wait for the disk. NORMAL can lose the last turns on a power cut but never corrupts the file. LangGraph runs its schema setup (`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS …`) on every new connection; with about 100 sessions starting at once those statements failed immediately with "database is locked", without waiting. `_ready_checkpointer()` runs the setup once per database and event loop, and later turns skip it; a failed setup is retried by the next turn. Measured with a mocked model: 400 simultaneous sessions, no errors, each reply in its own session, in under 8 seconds.
-
-**Limitation.** SQLite is single-process, so several replicas would need `langgraph-checkpoint-postgres`.
+**Concurrency.** Turns share one connection pool per process and hold a connection only for each query, not while the model is answering, so a pool of 10 serves many simultaneous chats. Mackie can run as many processes and servers as needed: PostgreSQL is the only shared state for org memory (the per-thread turn lock is per process; see the README's Known Limitations). Measured with a mocked model: 400 simultaneous sessions, no errors, each reply in its own session.
 
 ### Context management
 
 **What.**
 
 - **Ledger:** the prompt lists the 20 most recent posts. Older ones are reachable with `search_ledger`.
-- **Messages:** the model sees the last 40, starting at the first user message in that slice (`_window_start()`). A plain slice can start on a tool result whose tool call was cut off, and providers reject that. If one turn is longer than 40 messages, the whole turn is kept.
-- **Running summary:** messages that leave the window are folded into a summary of 300 words or less, one incremental LLM call each time the window moves (`summarize` node). It goes into the per-turn prompt block. If the call fails, the turn continues and the same messages are retried next time.
+- **Messages:** the model sees at most the last 40 messages and about 12,000 tokens of them (estimated at 4 characters a token, since no one tokenizer fits every provider), starting at a user message (`_window_start()`). A plain slice can start on a tool result whose tool call was cut off, and providers reject that. If the current turn alone is bigger, it is kept whole. Counting only messages let forty messages carrying research results cost several times what forty chat messages did.
+- **Old tool results:** results from before the last two user turns are cut to 600 characters with a note that the full result is earlier (`_shorten_old_tool_results`); the stored history keeps them whole. A research result from twenty turns ago was re-sent in full every turn, and was most of a long conversation's tokens.
+- **Running summary:** messages that leave the window are folded into the summary in batches of ten (`summarize` node), one LLM call per batch instead of one per turn; until a batch is complete they stay in the model's view (`_view_start()`), so nothing falls between the summary and the window. The summary has two parts: **Open requests and dates** (what the user asked for that isn't done, follow-ups Mackie promised, deadlines and events, carried forward until done) and a **Summary** of 300 words or less. A separate section keeps a date mentioned once from being squeezed out as later rewrites shorten the summary. It goes into the per-turn prompt block. If the call fails, the turn continues and the same messages are retried next time.
 - **Full history:** stays in the checkpoint; no message is deleted. Each checkpoint is a full snapshot of the conversation and a turn writes several, so keeping them all grew a thread quadratically (431 MB after 400 turns, measured). After each turn `prune_history()` keeps only the thread's newest checkpoint: 2.7 MB after 400 turns. The cost is LangGraph's time travel (replaying from an earlier step), which Mackie doesn't use.
 
-**Why.** Without the summary, anything that lived only in old messages was lost, such as the scraped research, which exists only in tool results. Durable facts don't depend on the window at all: the org brief, preferences and ledger are in `profile.json` and rebuilt into every prompt.
+**Why.** Without the summary, anything that lived only in old messages was lost, such as the scraped research, which exists only in tool results. Durable facts don't depend on the window at all: the org brief, preferences and ledger are in the database and rebuilt into every prompt.
 
-**Trade-offs.** The summary is lossy and costs an extra call per turn once a conversation is long. A vector store for retrieving old turns is the next step if that matters.
+**Trade-offs.** The summary is still lossy, and the token count is an estimate: measured with a real tokenizer, 4 characters a token is close for English and research text (3.9–4.5) but undercounts JSON tool arguments (about 2.9), emoji- and hashtag-heavy posts (about 2.3) and non-Latin text such as Greek (2.9, or worse on some tokenizers), so the window can hold up to about twice as many real tokens. That costs more, not correctness, on models with large contexts; a test bounds a realistic mix at 1.5 times the budget. Up to ten messages beyond the window can be in view while a batch fills. A vector store (pgvector, in the same database) for retrieving old turns word for word is the next step if that matters.
 
 ### Prompt caching (Anthropic only)
 
@@ -191,9 +193,9 @@ The wrapper escapes any copy of its own tag inside the text, so a page containin
 
 **Limitation.** It still depends on the model obeying its system prompt. `save_preference` accepts any key, so an injected preference that the model obeys would persist. Each preference must come with the user's quote, which helps spot one. The key is capped at 60 characters and the value and quote at 500 each (the longest real one so far is 145), since every preference is in every prompt: an injected essay or a pasted document is refused with a message asking for a sentence or two. A list built with `append` is capped at 1,000 characters in all, since a live run saved a refused 641-character style guide in two appended parts. All preferences together, with the quotes the prompt shows beside them, are capped at 4,000 characters (about 1,000 tokens), since another live run split the text across `style_guide` and `style_guide_2`. Only a save that adds length is refused, so shortening or replacing a preference always works. A key allowlist and a check on the model's output are the next steps.
 
-### Memory: JSON on disk
+### Memory: PostgreSQL
 
-**What.** One `data/{org-id}/profile.json` per org:
+**What.** Each org's memory is rows in PostgreSQL (`migrations/001_initial.sql`): `orgs` (name, website, research, brief, pillars, the post-number counter), `posts` (status, platform, content, `created_at`, performance, and the optional fields that vary by format in a `details` JSON column), `preferences` (value, the user's quote, when it was learned), `voice_examples` and `tool_calls`. `memory.load_profile()` assembles them into one profile dict, from one read-only snapshot; the prompt, the tools and the export/import scripts all use it:
 
 ```json
 {
@@ -209,20 +211,40 @@ The wrapper escapes any copy of its own tag inside the text, so a page containin
 }
 ```
 
-**Why.** A non-engineer must be able to read and fix what Mackie learned. A JSON file in a text editor does that with no setup and no migrations. SQLite and Redis were the alternatives.
+**Why.** JSON files on disk worked on one machine only: the `flock` lock didn't reach other servers or native Windows, and SQLite history allowed one process. PostgreSQL gives transactions, row locks and row-level security, and LangGraph has an official saver for it. A document store would have meant giving up joins and multi-row transactions. The driver is psycopg 3 (async, with a pool), with no ORM: the queries are few and plain, and SQLAlchemy plus Alembic would add more than they save. Migrations are numbered SQL files applied in order by `db.migrate()` and recorded in `schema_migrations`.
 
-**Hand-edit safety.**
+**Org isolation, in the database.**
 
-- **Saving:** writes go to a temp file (named per process) that is swapped in atomically, and the previous version is kept as `profile.json.bak`.
-- **Loading:** `ProfileError` describes the mistake in plain words: invalid JSON (with line and column), a top level that isn't an object, or a section of the wrong type (e.g. `"preferences": null`, or a `post_ledger` that isn't a list of objects). Keys missing from an older or hand-edited file get their defaults.
-- **Hand-written posts:** a post with missing fields doesn't break the prompt or the ledger tools.
-- **Post IDs:** `_next_post_id()` assigns one above the highest existing number, so deleting a post never causes an ID to be reused.
+- **Row-level security:** every org table, the checkpoint tables included, has a policy that shows and accepts only rows whose org matches the transaction's `app.org_id` setting. It is `FORCE`d, so it applies to the tables' owner too. `db.org_transaction(org_id)` sets the org for one transaction, so a query that forgot its `WHERE org_id` still can't reach another org. With no org set, no org rows are visible. A test lists every table and fails if a new one has org rows but no forced policy.
+- **Two roles:** migrations run as the schema's owner (`MACKIE_MIGRATION_URL`); Mackie connects as a role that may only read and write rows (`MACKIE_DATABASE_URL`). It can't change tables or policies, switch row-level security off, or rewrite the migration records. Mackie refuses to start as a superuser or a role with `BYPASSRLS`, and `scripts/migrate.py` refuses one role for both.
+- **Org ids** are still `slugify()` ids, `[a-z0-9-]` only; `db.check_org_id()` refuses any other before a query runs, and a CHECK constraint does the same in the table. A name with no Latin letters or digits (Greek, Japanese) gets a stable `org-<hash>` id. A name with no letters or digits in any script ("!!!") gets no id, so the UIs ask again.
+- **Queries** are parameterized throughout; the user's search text is matched with `strpos`, not `LIKE`, so `%` and `_` are literal.
 
-**Org ids.** `slugify()` keeps only `[a-z0-9-]`, and `_org_dir()` refuses any id that isn't in that form, so no id can reach outside `data/`. A name with no Latin letters or digits (Greek, Japanese) gets a stable `org-<hash>` id instead of an empty one. A name with no letters or digits in any script ("!!!") gets no id, so the UIs ask again instead of creating an org.
+**Concurrent writers.** Every read-change-write locks the org's row first (`SELECT … FOR UPDATE`), so sessions, the CLI and scripts on any number of servers take turns per org and never overwrite each other. Post ids come from a per-org counter under that lock, so a deleted post's id is never reused. Research saves only the research and brief after its slow calls, so posts saved meanwhile survive. No transaction waits on the model.
 
-**Concurrent writers.** Every load, change and save holds the org's lock file (`memory.locked()`, an exclusive `flock` on `data/{org-id}/.lock`), and the temp file is named per process. Within one server process the sections never await, so web sessions never wait on each other; the lock makes separate processes (the web UI, the CLI, `scripts/eval.py`) take turns. Before it, two processes adding 50 posts each to one org kept 50 of 100, and one crashed because the other had already renamed their shared temp file. Research loads the profile only after its slow calls, so posts saved meanwhile survive. The lock is reentrant within a thread, so a locked caller can call `add_post`; other threads still wait.
+**Nothing waits forever.** Every connection has a connect timeout (10 s), `statement_timeout` (30 s), `lock_timeout` (10 s) and `idle_in_transaction_session_timeout` (60 s); waiting for a free pooled connection gives up after 30 s.
 
-**Limitation.** `flock` is Unix-only, so Mackie runs on Linux, macOS, WSL or Docker but not on native Windows, and it works within one machine: several servers sharing `data/` need a database with row-level locking.
+**Failures.** After a database restart or failover every pooled connection is dead. The first request that hits one fails, and the pool then checks all its idle connections and replaces the dead ones, so one request fails rather than one per pooled connection; checking on every checkout would cost a round trip per transaction. Users see "Mackie can't reach its database right now": the driver's own message names the host and port, so it goes to the log. The same holds for every error that ends a turn (`agent/errors.py`): a provider failure gets a sentence saying what happened and what to do (too slow, too many requests, the key was refused, the conversation is too long, the model is unknown), and anything else a generic one pointing to the log. An audit found a refused API key reaching the screen as the provider's raw JSON, class name and all, with "Please try again" as the only advice. A database that is down when someone logs in refuses the login instead of breaking the page. Pruning history is housekeeping, so its failure is logged, not shown.
+
+**Editing by hand.** A non-engineer edits an export: `scripts/export_profile.py` writes the profile dict above as JSON, and `scripts/import_profiles.py` replaces the org's memory with it in one transaction. `memory.profile_problem()` checks it first in plain words: invalid JSON (with line and column), `NaN` or `Infinity`, wrong section types, sources that aren't a list, a `parent_id` that isn't a post id, a post id that isn't `post_N` or is too large, duplicate ids, an unknown status, a date that isn't a date. A refused file changes nothing; in a batch, the other files are still imported. A post added without an id gets the next one. Exported times carry their UTC offset, so an export imported on a machine in another time zone keeps the same moments; the old `data/` files have no offset and are read in the importing machine's zone (run that import with `TZ` set to where Mackie ran). "Today", for the agenda and date searches, is the server's local date, set with `TZ`. The same import moves the old `data/{org-id}/profile.json` files over; conversation history isn't moved.
+
+**Text the database can't hold.** PostgreSQL text can't contain NUL, which models occasionally send; it is stripped on save rather than failing the save.
+
+**Trade-offs.** A database server is now required, and the tests need one too (a disposable container). Editing what Mackie learned takes an export and an import instead of opening a file.
+
+### Accounts and access
+
+**What.** `agent/accounts.py` keeps users and their org memberships. The web UI uses Chainlit's password login (`CHAINLIT_AUTH_SECRET` signs the session); the terminal asks for the same username and password. A user sees and opens only orgs they belong to; starting a new org makes them its member, and `scripts/users.py grant` adds people to an existing one.
+
+- **Passwords:** scrypt from the standard library (N=2¹⁴, r=8, p=1, a 16-byte random salt per password), compared in constant time, at least 12 characters. Hashing runs in a worker thread so a login doesn't stall other sessions.
+- **Guessing:** five wrong passwords in a row lock the account for 15 minutes. Each wrong password is counted in one atomic update, so parallel guesses are all counted, and the password check runs with no database connection held, so a flood of guesses doesn't tie up the pool. An unknown username and a locked account each cost the same hash check as a wrong password, and every refusal looks the same, so neither the answer nor its timing tells which usernames exist (an audit found a locked account answering 25 times faster).
+- **Sessions:** the login cookie lasts a day (`user_session_timeout`), and `allow_origins` is empty, so only Mackie's own page can make requests with it.
+- **Revocation:** `Assistant` checks the user's membership before every message (one indexed query), so revoking access or removing the account stops chats that are already open: the next message is refused and the session ends, in the web UI and the terminal. A reply already being written finishes; checking inside every tool call would close that last gap at the cost of a query per call.
+- **Default account:** `scripts/migrate.py`, which every deploy runs, makes sure `MACKIE_DEFAULT_USERNAME` (`admin`) exists, so a fresh install always has someone who can log in and add others. The password comes from `MACKIE_DEFAULT_PASSWORD` (required by Docker Compose, and kept out of the app container); a local run without one gets a random password printed once. An existing account is never changed, so a later `passwd` isn't undone by the next deploy.
+
+**Why.** Without accounts, anyone who reached the web UI could open any org. Password login needs no outside service; OAuth would need an app registered per deployment, and Chainlit supports it when that's wanted. scrypt is in Python's standard library, so there is no new dependency.
+
+**Trade-offs.** No password reset by email and no single sign-on; an admin runs the script. Login traffic must be served over HTTPS (a reverse proxy), which Mackie doesn't do itself.
 
 ### Learning from feedback
 
@@ -256,7 +278,7 @@ The wrapper escapes any copy of its own tag inside the text, so a page containin
 | A suggestion with no `source_url` while research sources exist | Not saved: every idea must cite its source. |
 | `source_url` that isn't a known research source | Saved, with a warning. |
 
-Tools that take a status or a date (`save_post`, `update_post_status`, `search_ledger`) reject a status outside `POST_STATUSES` and a date that isn't `YYYY-MM-DD`, with a message the model can act on. Platforms not defined in `skills/` (e.g. `general`) skip the platform checks. The platform is stored in lowercase, as skill ids are, so "LinkedIn" and "linkedin" are one platform. Research sources typed into `profile.json` as plain URLs instead of `{...}` entries are skipped rather than breaking `save_post` and `web_search`.
+Tools that take a status or a date (`save_post`, `update_post_status`, `search_ledger`) reject a status outside `POST_STATUSES` and a date that isn't `YYYY-MM-DD`, with a message the model can act on. Platforms not defined in `skills/` (e.g. `general`) skip the platform checks. The platform is stored in lowercase, as skill ids are, so "LinkedIn" and "linkedin" are one platform. Research sources typed into an imported profile as plain URLs instead of `{...}` entries are skipped rather than breaking `save_post` and `web_search`.
 
 **Found live.** Applying the rules to ideas made a live run add hashtags to rough suggestions, retry four rejected saves, take 67 seconds over one answer and tell the user "three posts need hashtag fixes". The same run showed a *Visual:* line in every Instagram reply but never saved one, so the visual is now required in code rather than asked for in the prompt.
 
@@ -305,7 +327,7 @@ A *wrong* source only gets a warning, because whether a source is good enough is
 - **`kind: content_type`**: `id`, `name`, `purpose` and `structure` are required; `must_include` and `avoid` are optional.
 - **`kind: format`**: `id`, `name`, `purpose` and `structure` are required; `platforms` (a list) and `has_caption` (true or false) are optional.
 
-`skills/content_pillars.yaml` holds the default pillars, and a `content_pillars` list in `profile.json` overrides them for one org. Everything is loaded on every turn by `agent/skills.py`, so no restart is needed.
+`skills/content_pillars.yaml` holds the default pillars, and a `content_pillars` list in an org's profile (set through an export and import) overrides them for one org. Everything is loaded on every turn by `agent/skills.py`, so no restart is needed.
 
 **Why.** Platforms and editorial policy are data, not code. One directory and one file format mean there is only one thing to learn.
 
@@ -331,20 +353,25 @@ A broken pillars file (invalid YAML, no `pillars:` list) means no pillars, not a
 
 **Why.** The tool-call message is checkpointed before the tool runs. A raised exception left that call unanswered, and providers reject every later request in that thread. Returning the error keeps the thread valid and lets the model recover.
 
+**Lost results.** A turn can still stop between the tool call and its saved result, for example when the database drops its connections at that moment. The thread is then left with an unanswered call, which every provider rejects. Before each model call, `_answer_lost_tool_calls()` gives such a call the result "interrupted; it may or may not have run; check with search_ledger before doing it again", so the conversation carries on and the model doesn't save the post twice.
+
 ### Testing
 
-**What.** Every test is offline: autouse fixtures fail any unmocked LLM call or HTTP request and stub DNS. Besides the per-module tests, these cover concerns that cut across modules:
+**What.** Every test is offline apart from a local PostgreSQL server: autouse fixtures fail any unmocked LLM call or HTTP request and stub DNS. Each run creates its own database on the server at `TEST_DATABASE_URL`, migrates it as an owner role and runs the tests as an app role, as in production, so row-level security is exercised by every test; the `database` fixture empties it before each test, and a test that reaches the database without that fixture fails. Besides the per-module tests, these cover concerns that cut across modules:
 
-- **Security** (`test_security.py`): SSRF bypass forms, every tool in `TOOL_DEFINITIONS` called with malformed arguments (nulls, wrong types, 100 KB strings), bad org ids through every entry point, one org's memory never reaching another's prompt, injected text staying inside its tag through the agent loop, and the trace's fields.
+- **Security** (`test_security.py`): SSRF bypass forms, every tool in `TOOL_DEFINITIONS` called with malformed arguments (nulls, wrong types, 100 KB strings, NUL), bad org ids through every entry point, one org's memory never reaching another's prompt, injected text staying inside its tag through the agent loop, the trace's fields, and the database as SQL slipped into the app's connection would meet it: forced row-level security on every org table, no reading or changing another org's rows or conversations, an app role that can't alter tables, drop policies, switch row-level security off or become the owner, and hostile text stored and never run.
 - **Performance** (`test_performance.py`): the parallel I/O; responsiveness (tokens streamed as produced, tool steps shown before the next model call, a slow session not stalling another, a timeout on every LLM call and page fetch, fallback after a timeout); scale (the prompt's size as memory grows to 2,000 posts, ledger operations at 20,000 posts); and linear-time parsing of hostile input.
-- **UIs and UX** (`test_ui.py`): onboarding, greetings (most urgent work first), broken memory files, tokens shown as they arrive, what a tool step shows, plain-language errors and the welcome copy, in `app.py` and `main.py`, with Chainlit and the terminal prompt faked.
-- **Sessions** (`test_sessions.py`): concurrent sessions whose tool writes must land in their own org, the schema set up once, two people on one org (shared memory, separate conversations), the CLI and web histories kept apart, interleaved streams, a model that names another org in its tool arguments, and separate processes writing to one org (every profile writer must wait for another process's lock).
-- **Browser** (`tests/browser/`, opt-in with `pytest -m browser`): the real Chainlit server and frontend in headless Chromium, with a scripted model (`serve.py`): onboarding, a reply visible while it is still streaming, a tool step and the ledger after a reload, the layout at phone width (390 px, no sideways scrolling), and two browsers on one org keeping their conversations apart. About 15 seconds, so it is a separate CI job outside the time budget.
-- **Deployment** (`test_deploy.py`): secrets kept out of git and the Docker image, Chainlit settings, and one unmocked LiteLLM tool call (`mock_response`, so still offline) that catches a release that breaks tool calls, as 1.106.0 did.
+- **UIs and UX** (`test_ui.py`): the login, onboarding (an org the user may not open is refused), greetings (most urgent work first), a database that can't be reached, tokens shown as they arrive, what a tool step shows, plain-language errors and the welcome copy, in `app.py` and `main.py`, with Chainlit and the terminal prompt faked.
+- **Sessions** (`test_sessions.py`): concurrent sessions whose tool writes must land in their own org, two people on one org (shared memory, separate conversations), the CLI and web histories kept apart, interleaved streams, a model that names another org in its tool arguments, and concurrent writers, in one process and in separate ones, losing nothing.
+- **Browser** (`tests/browser/`, opt-in with `pytest -m browser`): the real Chainlit server and frontend in headless Chromium, with a scripted model (`serve.py`) and the run's test database: the login (a wrong password refused), onboarding, an org belonging to another user refused, a reply visible while it is still streaming, a tool step and the ledger after a reload, the layout at phone width (390 px, no sideways scrolling), and two users on one org keeping their conversations apart. About 30 seconds, so it is a separate CI job outside the time budget.
+- **Deployment** (`tests/deployed/`, opt-in with `pytest -m deployed`, and its own CI job): CI builds and starts the Docker Compose stack from `.env.example` with throwaway secrets, checks that the migration exited cleanly and created the default account, that the app isn't root, that the database isn't published and that the app's role can't bypass row-level security, then logs in with the default account in a browser and onboards an org. No model is called. The Compose file, the init script and the migrate service are checked nowhere else. The job runs under its own Compose project name (`mackie-ci`) and always removes its containers and database volume, even after a failure, so a local run with `act` can't leave a stack behind or reuse a real deployment's volume.
+- **Errors and logging** (`test_errors.py`, `test_logging.py`, `test_logs.py`): what users are told for each kind of failure, with no error text on screen; what every module logs and never logs (secrets, what users write), redaction and forged lines.
+- **Database, accounts and admin scripts** (`test_db.py`, `test_accounts.py`, `test_admin_scripts.py`): the pool (one per event loop, timeouts, refusing a superuser or an old schema), migrations run twice, password hashing, the lockout, memberships, and the migrate, users, export and import commands.
+- **Deployment settings** (`test_deploy.py`): the CI workflow's time budget and clean-up, secrets kept out of git and the Docker image, Chainlit settings, and one unmocked LiteLLM tool call (`mock_response`, so still offline) that catches a release that breaks tool calls, as 1.106.0 did.
 
-`conftest.py` fails a run that takes more than 10 seconds (not under coverage or for the browser tests). CI also requires 95% branch coverage.
+`conftest.py` fails a run that takes more than 30 seconds (not under coverage or for the opt-in tests); CI allows 60 through `MACKIE_TEST_BUDGET_S`, since a shared runner took 28 seconds for a run that takes 19 to 25 locally. It was 10 seconds until the move to PostgreSQL: every test now runs against a real database with row-level security, about 0.3 ms per query through Docker, which took the suite from 8.5 to about 15 seconds; tests added since for stability, isolation, logging and scale brought it to about 23. The objects LiteLLM, Chainlit and LangGraph create at import are frozen out of the garbage collector after collection (`gc.freeze()`), which saved over a second. Mocking the database in most tests would have kept the old budget, at the cost of tests that no longer exercise the real policies. CI also requires 95% branch coverage.
 
-**Why.** Parallelism is proven with `ConcurrencyProbe`, a stand-in that returns only once N calls are in flight together. A sequential loop times out instead, so a lost `asyncio.gather` fails a test, and no wall-clock timing is involved that could flake on a slow runner. Fuzzing every tool from its schema means a new tool is covered without a new test. Writing these tests found real problems, each now with a regression test: NAT64, IPv4-compatible, percent-encoded and fullwidth hosts passed the SSRF guard; the agenda section had no size limit; `slugify("!!!")` created an org; LLM calls had no timeout; about 100 concurrent sessions hit "database is locked" (see Agent loop); checkpoint storage grew quadratically with conversation length (see Context management); and separate processes overwrote each other's posts (see Memory).
+**Why.** Parallelism is proven with `ConcurrencyProbe`, a stand-in that returns only once N calls are in flight together. A sequential loop times out instead, so a lost `asyncio.gather` fails a test, and no wall-clock timing is involved that could flake on a slow runner. Fuzzing every tool from its schema means a new tool is covered without a new test. Writing these tests found real problems, each now with a regression test: NAT64, IPv4-compatible, percent-encoded and fullwidth hosts passed the SSRF guard; the agenda section had no size limit; `slugify("!!!")` created an org; LLM calls had no timeout; about 100 concurrent sessions hit "database is locked" in SQLite; checkpoint storage grew quadratically with conversation length (see Context management); separate processes overwrote each other's posts before the org lock; and, in the move to PostgreSQL, an import with two posts lacking an id was refused as "duplicate ids", and Chainlit took Mackie's `DATABASE_URL` as its own chat-history database (hence the `MACKIE_` names).
 
 Streaming and isolation tests use gated streams: a mock model that only produces its next token after an event the test sets. A UI that buffered, or a session that blocked the event loop, deadlocks and fails at a 5-second bound instead of passing slowly. Each new test was checked by breaking the code it guards: setting up the schema on every turn, buffering tokens in the web UI, removing the timeout, skipping the org lock, and making the lock non-reentrant each made the intended test fail. The browser tests were checked the same way: buffered tokens, one shared thread per org and a page wider than a phone each failed theirs.
 
@@ -354,11 +381,20 @@ Streaming and isolation tests use gated streams: a mock model that only produces
 
 ### Observability
 
-**What.** Every tool call appends `ts`, `tool`, `input`, `result_preview` and `latency_ms` to `data/{org-id}/trace.jsonl`. The web UI shows each tool call as a step.
+**What.** Every tool call adds a row with its time, `tool`, `input`, `result_preview` and `latency_ms` to `tool_calls`, under the same row-level security as the rest of the org's data. The web UI shows each tool call as a step.
 
 **Why.** It needs no extra service. Langfuse or Helicone would add cost tracking and dashboards.
 
-**Note.** The trace records tool inputs, including quotes and pasted posts, but never API keys.
+**Note.** The trace records tool inputs, including quotes and pasted posts, but never API keys or passwords. It is kept indefinitely; a retention period is a next step if it grows.
+
+**Logs.** Separate from the trace, Mackie writes log lines (`agent/logs.py`) that Docker collects (`docker compose logs mackie`; `PYTHONUNBUFFERED` so none wait in a buffer). Under `chainlit run`, Chainlit already sends the root logger to stdout, so Mackie's lines go there too, once; elsewhere they go to stderr. The web UI logs from INFO, the terminal and the scripts from WARNING (`users.py` and `migrate.py` from INFO), and `MACKIE_LOG_LEVEL` overrides it. httpx and LiteLLM, which log every request at INFO (URLs, model calls), are kept to warnings. Each failure is logged once, where it is handled, not again at every layer it passes.
+
+- **What is logged:** logins, refused logins with the reason, lockouts, a refused org, access revoked during a session, account and membership changes; and every failure that is otherwise absorbed so the user can carry on: a tool, a model (and the fallback taken), a summary, the org brief, a calendar week, a page fetch (a refused internal address included), a search, the trace, the database, pruning, a failed turn (with its traceback).
+- **What never is:** passwords, API keys, tokens, and what users write. Messages, posts and tool arguments stay in the database. An error is logged as its type and a short message (`describe()`), plus the code frames it passed (`stack()`), never its full text: PostgreSQL's detail and context lines quote the values that failed, which an audit found putting post text in the log. A username that isn't valid isn't logged at all; it may be a password typed in the wrong field. As a second line, `RedactSecrets`, on every handler that writes, masks the value of every environment variable named `*_KEY`, `*_PASSWORD`, `*_SECRET` or `*_TOKEN`, and any connection-string password, in every line and traceback from any library. A log call that is itself wrong is still written rather than raising.
+- **Forged lines:** a value a user typed (a username at login, a URL) goes through `safe()`, which escapes newlines and control characters and shortens it, so a username can't write a fake log line.
+- **Floods:** a skill-file problem is logged once per process, not on every model call.
+
+**Why.** The failures Mackie absorbs on purpose, so a turn carries on, would otherwise leave no trace for whoever runs it, and who logged in, or was refused, would have no record.
 
 ### Evaluation (`scripts/eval.py`)
 
@@ -372,10 +408,11 @@ Streaming and isolation tests use gated streams: a mock model that only produces
 6. Ask which posts we've worked on and their status.
 7. Suggest a post for next month.
 
-It then reports two kinds of checks:
+It then reports three kinds of checks:
 
 - **LLM judge.** Each reply is scored 0–3 on source attribution, voice consistency, and step 7 not repeating step 1: 21 judge calls in parallel. For the repeat check the judge is also shown step 1's reply; without it, the judge was guessing. A failed judge call scores -1 and the others still count. The report totals the scores out of 63; 70% or more (`PASS_PERCENT`) is a pass.
 - **Saved data, no LLM.** From snapshots of the profile taken after each step: a preference saved by step 3, step 7 saving posts that aren't copies or versions of step 1's, and a `source_url` on every suggestion.
+- **Memory, no judge.** A separate conversation opens with "our Spring Gala is on May 3, remind me the week before", followed by 30 long filler turns stored directly (no API calls), enough to push it out of the window by more than a summary batch. One question then runs live: the summarizer must keep May 3 under the summary's open requests and dates, and the answer must recall it. The unit tests prove what reaches the model; only a real model shows that it uses it.
 
 **Why both.** The judge reads only the replies. In one run it contradicted itself, and nothing showed that the voice correction was never saved. The saved-data checks are exact about what the system learned, but they can't catch a paraphrased repeat; that is the judge's job.
 
@@ -387,9 +424,9 @@ It then reports two kinds of checks:
 
 | Gap | Today | Next step |
 |---|---|---|
-| Several servers | `profile.json` writes are locked per machine (`flock`), SQLite history is single-process | PostgreSQL for org memory; `langgraph-checkpoint-postgres` for history |
-| Authentication | Anyone who can reach the UI can open any org | Chainlit OAuth or a reverse proxy; per-org access rules |
-| Rate limiting | None | Per-org, per-tool counters in Redis or Postgres |
+| Single sign-on | Password logins and per-org memberships, managed with `scripts/users.py` | Chainlit OAuth (Google, Microsoft) mapped to the same accounts; password reset by email |
+| Rate limiting | Login lockout only | Per-org, per-tool counters in PostgreSQL |
+| Trace retention | `tool_calls` rows are kept indefinitely | Delete rows older than a set period on a schedule |
 | DNS rebinding | Names are checked, then resolved again by httpx | Connect to the checked address |
 | Injected preferences | Any key is accepted; a user quote is required, and keys, values, quotes, appended lists and all preferences together are capped in length | Key allowlist; a check on the model's output |
 | Runtime quality check | The judge runs only in `scripts/eval.py` | A cheap judge call after `save_post` for voice, and a check for near-duplicate ideas |
@@ -403,7 +440,6 @@ It then reports two kinds of checks:
 | Approval in the UI | Status changes through chat only | Approve and reject buttons on each post |
 | Images | A *Visual:* description per Instagram and Facebook draft, saved as `visual` | `litellm.image_generation` from that description, with moderation |
 | JavaScript-rendered sites | Little text is extracted | A headless browser as a fallback |
-| Native Windows | The org lock uses `fcntl.flock`, so Linux, macOS, WSL or Docker only | `msvcrt.locking` behind the same `locked()` |
-| Long conversations | Older turns survive only as a lossy running summary | A vector store to retrieve old turns |
+| Long conversations | Older turns survive as a batched summary with its open requests and dates; old tool results are shortened in the window | Retrieve old turns word for word with pgvector |
 | Parallel tool calls | Calls in one model reply run one after another, so post ids come out in order | Run read-only tools (search, ledger) together with `asyncio.gather` |
 | Role models | A `FAST_MODEL` or `JUDGE_MODEL` identical to a provider's own main model goes to that provider, whatever `*_PROVIDER` says | Pass the provider with each call instead of finding it from the model string |

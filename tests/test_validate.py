@@ -1,4 +1,11 @@
-"""Unit tests for scripts/validate.py — the plain-English check of hand-edited files."""
+"""
+Unit tests for scripts/validate.py: the plain-English check of hand-edited files.
+
+Owns: the report for valid files (and that the check changes nothing), every
+kind of broken skill, pillars or profile file in one report, and a profile
+file that can't be read. Does not own the individual checks (test_skills.py,
+test_memory.py for profile_problem).
+"""
 
 import importlib.util
 import sys
@@ -9,6 +16,7 @@ import pytest
 
 VALIDATE_PATH = Path(__file__).parent.parent / "scripts" / "validate.py"
 PLATFORM_YAML = "name: Test\nid: test\nmax_length: 500\n"
+GOOD_PROFILE = '{"name": "Org", "post_ledger": [{"id": "post_001", "title": "Hello"}]}'
 
 
 @pytest.fixture(scope="module")
@@ -30,41 +38,45 @@ def skills_dir(tmp_path):
         yield folder
 
 
-def test_validate_passes_valid_files(validate_module, tmp_data_dir, skills_dir, capsys):
-    (tmp_data_dir / "org").mkdir()
-    (tmp_data_dir / "org" / "profile.json").write_text('{"name": "Org"}')
-    assert validate_module.main() == 0
+def test_validate_passes_valid_files_and_changes_nothing(
+    validate_module, skills_dir, tmp_path, capsys
+):
+    """Nothing on disk changes, and without the database fixture any database use would fail."""
+    profile = tmp_path / "org.json"
+    profile.write_text(GOOD_PROFILE)
+    before = sorted(tmp_path.rglob("*"))
+    assert validate_module.main([str(profile)]) == 0
     out = capsys.readouterr().out
     assert "Platforms:     test" in out
-    assert "All skill files and org profiles are valid." in out
+    assert "All files are valid." in out
+    assert sorted(tmp_path.rglob("*")) == before
+    assert profile.read_text() == GOOD_PROFILE
+    assert (skills_dir / "test.yaml").read_text() == PLATFORM_YAML
 
 
-def test_validate_reports_every_broken_file(validate_module, tmp_data_dir, skills_dir, capsys):
+def test_validate_reports_every_broken_file(validate_module, skills_dir, tmp_path, capsys):
     (skills_dir / "broken.yaml").write_text("id: x\nname: X\nmax_length: lots\n")
     (skills_dir / "content_pillars.yaml").write_text("pillars:\n  - description: no name\n")
-    (tmp_data_dir / "org").mkdir()
-    (tmp_data_dir / "org" / "profile.json").write_text('{"name": "Org",}')
-    assert validate_module.main() == 1
+    profiles = {
+        "comma.json": '{"name": "Org",}',
+        "list.json": "[]",
+        "status.json": '{"post_ledger": [{"status": "maybe"}]}',
+    }
+    for name, text in profiles.items():
+        (tmp_path / name).write_text(text)
+    assert validate_module.main([str(tmp_path / name) for name in profiles]) == 1
     out = capsys.readouterr().out
-    assert "3 problem(s):" in out
+    assert "5 problem(s):" in out
     assert "broken.yaml: max_length must be a whole number" in out
     assert "content_pillars.yaml: every pillar needs a name" in out
-    assert "formatting error at line 1" in out
+    assert "comma.json has a formatting error at line 1" in out
+    assert "list.json must be a JSON object" in out
+    assert "status.json: post 1 has status 'maybe'" in out
 
 
-def test_validate_reports_a_folder_mackie_never_opens(validate_module, tmp_data_dir, skills_dir):
-    """A hand-made folder like "My Org" is not an org id, so its profile would silently be ignored."""
-    (tmp_data_dir / "My Org").mkdir()
-    (tmp_data_dir / "My Org" / "profile.json").write_text("{}")
-    problems = validate_module.profile_problems()
-    assert len(problems) == 1
-    assert "is not an org id" in problems[0]
-
-
-def test_validate_changes_nothing_on_disk(validate_module, tmp_data_dir, skills_dir):
-    (tmp_data_dir / "org").mkdir()
-    profile = tmp_data_dir / "org" / "profile.json"
-    profile.write_text('{"name": "Org"}')
-    validate_module.main()
-    assert sorted(p.name for p in (tmp_data_dir / "org").iterdir()) == ["profile.json"]
-    assert profile.read_text() == '{"name": "Org"}'
+def test_validate_reports_a_profile_file_it_cant_read(validate_module, skills_dir, tmp_path):
+    missing = tmp_path / "missing.json"
+    problems = validate_module.profile_problems([missing, tmp_path])
+    assert problems[0] == f"{missing}: can't be read (No such file or directory)"
+    assert problems[1].startswith(f"{tmp_path}: can't be read")
+    assert len(problems) == 2

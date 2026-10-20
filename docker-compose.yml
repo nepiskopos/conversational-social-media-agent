@@ -1,14 +1,60 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      # The superuser, used only by docker/postgres-init.sh on first start.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      MACKIE_OWNER_PASSWORD: ${MACKIE_OWNER_PASSWORD:?set MACKIE_OWNER_PASSWORD in .env}
+      MACKIE_APP_PASSWORD: ${MACKIE_APP_PASSWORD:?set MACKIE_APP_PASSWORD in .env}
+    volumes:
+      # Org memory, accounts and conversation history
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init.sh:/docker-entrypoint-initdb.d/10-mackie.sh:ro
+    # No ports: only the services below can reach the database.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mackie"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  # Creates or updates the schema as the owner role, then exits.
+  migrate:
+    build: .
+    command: ["python", "scripts/migrate.py"]
+    environment:
+      MACKIE_MIGRATION_URL: postgresql://mackie_owner:${MACKIE_OWNER_PASSWORD}@postgres:5432/mackie
+      MACKIE_DATABASE_URL: postgresql://mackie_app:${MACKIE_APP_PASSWORD}@postgres:5432/mackie
+      # The account that can always log in; created once, never changed after.
+      MACKIE_DEFAULT_USERNAME: ${MACKIE_DEFAULT_USERNAME:-admin}
+      MACKIE_DEFAULT_PASSWORD: ${MACKIE_DEFAULT_PASSWORD:?set MACKIE_DEFAULT_PASSWORD in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   mackie:
     build: .
     ports:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      MACKIE_DATABASE_URL: postgresql://mackie_app:${MACKIE_APP_PASSWORD}@postgres:5432/mackie
+      # env_file passes all of .env; these stay out of the app, so a compromised app
+      # can't log in as the superuser or the schema owner.
+      MACKIE_MIGRATION_URL: ""
+      MACKIE_DEFAULT_PASSWORD: ""
+      POSTGRES_PASSWORD: ""
+      MACKIE_OWNER_PASSWORD: ""
+      MACKIE_APP_PASSWORD: ""
     volumes:
-      # Persist org memory (profiles, ledgers, preferences) and conversation history
-      - ./data:/app/data
       # Skills are mounted so a non-engineer can add or edit a platform, content type
       # or format YAML without rebuilding the image
       - ./skills:/app/skills
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -16,10 +16,12 @@ JUDGE_MODEL, for a model string more than one provider accepts.
 from __future__ import annotations
 
 import functools
+import logging
 import os
-import sys
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Each background model's variable, and the variable naming its provider.
 _ROLE_VARIABLES: tuple[tuple[str, str], ...] = (
@@ -225,12 +227,14 @@ def _named_provider(variable: str, configured: list[_Provider]) -> _Provider | N
 
 @functools.cache
 def _report_unusable_provider(variable: str, name: str) -> None:
-    """Print, once per variable and value, that it names no configured provider."""
+    """Log, once per variable and value, that it names no configured provider."""
     known = ", ".join(p.id for p in PROVIDERS)
-    print(
-        f"ERROR: {variable}={name!r} is not a configured provider "
-        f"(known: {known}; its key variables must be set). Ignoring it.",
-        file=sys.stderr,
+    logger.error(
+        "%s=%r is not a configured provider (known: %s; its key variables must be set). "
+        "Ignoring it.",
+        variable,
+        name,
+        known,
     )
 
 
@@ -239,7 +243,7 @@ def _configured_providers() -> list[_Provider]:
     Configured providers, highest priority first.
 
     LLM_PROVIDER (a provider id) moves that provider to the front; an unknown
-    or unconfigured id prints an error and the registry order is used instead.
+    or unconfigured id is logged once and the registry order is used instead.
     """
     configured = [p for p in PROVIDERS if _is_configured(p)]
     chosen = _named_provider("LLM_PROVIDER", configured)
@@ -253,8 +257,8 @@ def resolve_model() -> str:
     Resolve the LLM model to use from environment variables.
 
     Returns the model of the highest-priority configured provider (see
-    _configured_providers). Prints an error to stderr if the configured model
-    doesn't match its provider (e.g. ANTHROPIC_API_KEY set but
+    _configured_providers). Logs an error if the configured model doesn't
+    match its provider (e.g. ANTHROPIC_API_KEY set but
     ANTHROPIC_MODEL=gpt-4o-mini).
 
     When no provider is configured (e.g. during tests), falls back to the
@@ -272,11 +276,13 @@ def resolve_model() -> str:
     model = _provider_model(selected)
 
     if selected.model_prefixes and not model_matches_provider(model, selected):
-        print(
-            f"ERROR: {selected.model_env}={model!r} does not match provider "
-            f"'{selected.id}' (expected prefix in {selected.model_prefixes}). "
-            f"Check your .env configuration.",
-            file=sys.stderr,
+        logger.error(
+            "%s=%r does not match provider '%s' (expected prefix in %s). "
+            "Check your .env configuration.",
+            selected.model_env,
+            model,
+            selected.id,
+            selected.model_prefixes,
         )
 
     return model
@@ -341,11 +347,13 @@ def _provider_for(model: str) -> _Provider | None:
 
 @functools.cache
 def _warn_ambiguous_model(model: str, provider_ids: tuple[str, ...]) -> None:
-    """Print, once per model, that several configured providers could serve it."""
-    print(
-        f"WARNING: {model!r} could belong to {' or '.join(provider_ids)}; using "
-        f"{provider_ids[0]}. To choose, set FAST_PROVIDER or JUDGE_PROVIDER to the provider's id.",
-        file=sys.stderr,
+    """Log, once per model, that several configured providers could serve it."""
+    logger.warning(
+        "%r could belong to %s; using %s. To choose, set FAST_PROVIDER or JUDGE_PROVIDER "
+        "to the provider's id.",
+        model,
+        " or ".join(provider_ids),
+        provider_ids[0],
     )
 
 
@@ -370,8 +378,9 @@ def connection_kwargs(model: str) -> dict[str, Any]:
     Every call gets LLM_TIMEOUT_S, so a provider that hangs ends in an error
     (and the next provider, for chat replies) instead of a UI that waits forever.
 
-    The provider is the configured one whose model is exactly `model`, else the
-    first configured one whose prefixes match it. Native providers need nothing
+    The provider is the one _provider_for() picks: the configured one whose
+    model is exactly `model`, the one FAST_PROVIDER or JUDGE_PROVIDER names for
+    that role's model, else the first whose prefixes match. Native providers need nothing
     here when their key uses LiteLLM's own variable name, but passing it is
     harmless; OpenAI-compatible endpoints (OpenCode Zen, vLLM, LLM_API_BASE)
     need both values, since LiteLLM cannot guess them. Unknown models get {}

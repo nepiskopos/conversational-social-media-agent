@@ -2,40 +2,37 @@
 Isolation and concurrency between sessions, users and orgs.
 
 Owns: what happens when several people use Mackie at once — many sessions
-sharing the SQLite checkpoint store, two people on the same org, the CLI and
-the web UI on the same org (also as separate processes writing at once),
-streams interleaving, and a model that names another org in its tool
-arguments. The model is mocked with scripts that answer each session by the
-content of its own messages, so a reply or a tool write routed to the wrong
-session fails the test. Does not own
-single-session behavior (test_assistant.py) or org-memory isolation without
+starting at once on one connection pool (also more sessions than connections),
+two people on the same org (also the CLI and the web UI), two tabs of one user
+taking turns on one conversation (also a new conversation started during a
+turn), a profile read while another session writes it, every kind of org write
+at once (also from separate processes, through the database, and research that
+finishes after another session saved), and streams interleaving. The model is
+mocked with scripts that answer each session by the content of its own messages,
+so a reply or a tool write routed to the wrong session fails the test. Does not
+own single-session behavior (test_assistant.py) or org isolation without
 concurrency (test_security.py).
 """
 
 import asyncio
-import fcntl
 import json
-import subprocess
+import os
 import sys
-import threading
-import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
-import pytest
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from tests.llm_fakes import gated_stream, text_stream, tool_call_stream
 
-from tests.test_assistant import _text_stream, _tool_call_stream
-
-# Enough sessions at once to overlap many SQLite writes, small enough for the time budget.
-CONCURRENT_SESSIONS: int = 8
-SIMULTANEOUS_WRITES: int = 30
+# Enough sessions at once to overlap many database writes, small enough for the time budget.
+CONCURRENT_SESSIONS: int = 4
+# Fewer connections than sessions, so every connection serves several orgs in turn.
+SMALL_POOL_SIZE: int = 2
 # Upper bound for any single wait in these tests; a routing or locking bug hangs instead.
 WAIT_S: float = 5.0
-# How long a writer must stay blocked on another process's lock. A writer that skips the
-# lock finishes in milliseconds and fails; a slow machine can only make it pass wrongly.
-STILL_BLOCKED_S: float = 0.3
-WRITER_PROCESSES: int = 3
+WRITER_PROCESSES: int = 2
+# Separate processes start a Python interpreter each; a lost lock or a deadlock hangs instead.
+PROCESS_WAIT_S: float = 30.0
 POSTS_PER_PROCESS: int = 25
 REPO_ROOT: Path = Path(__file__).parent.parent
 
@@ -44,74 +41,74 @@ def _last_user_message(messages: list[dict]) -> str:
     return next(m["content"] for m in reversed(messages) if m["role"] == "user")
 
 
-def _text_chunk(text: str | None, finish_reason: str | None = None) -> MagicMock:
-    """One stream chunk carrying text, or the closing chunk when finish_reason is set."""
-    chunk = MagicMock()
-    chunk.choices = [
-        MagicMock(delta=MagicMock(content=text, tool_calls=None), finish_reason=finish_reason)
-    ]
-    return chunk
-
-
-async def _gated_stream(tokens: list[str], gates: dict[int, asyncio.Event]):
-    """Stream tokens; before token i, wait for gates[i] if there is one."""
-    for i, token in enumerate(tokens):
-        if i in gates:
-            await asyncio.wait_for(gates[i].wait(), WAIT_S)
-        yield _text_chunk(token)
-    yield _text_chunk(None, "stop")
-
-
 # --- Many sessions at once ------------------------------------------------------------
 
 
-async def test_concurrent_sessions_each_get_their_own_reply_and_their_own_writes(tmp_data_dir):
-    """Every session saves a post through a tool and replies; nothing crosses over."""
+async def test_concurrent_sessions_each_get_their_own_reply_writes_and_history(
+    fresh_pool, monkeypatch
+):
+    """
+    Many orgs, fewer connections, two rounds; every turn saves a post through a tool.
+    Nothing may cross over: a connection still set to the org it served last would show
+    as a reply, a post or a message in the wrong org, or as round 1 missing from round 2.
+    """
+    from agent import db
     from agent.assistant import Assistant
     from agent.memory import get_ledger
 
+    monkeypatch.setenv("MACKIE_DATABASE_POOL_SIZE", str(SMALL_POOL_SIZE))
+    history_seen: dict[tuple[str, str], list[str]] = {}
+
     async def model(**kwargs):
         messages = kwargs["messages"]
-        session = _last_user_message(messages).removeprefix("session ")
+        org, turn = _last_user_message(messages).split(" round ")
         if messages[-1]["role"] == "tool":
-            return _text_stream(f"saved for {session}")
-        args = {"platform": "general", "content": f"post {session}", "title": f"Post {session}"}
-        return _tool_call_stream(f"tc-{session}", "save_post", json.dumps(args))
+            return text_stream(f"saved {org} round {turn}")
+        history_seen[(org, turn)] = [m["content"] for m in messages if m["role"] == "user"]
+        args = {"platform": "general", "content": "x", "title": f"{org} round {turn}"}
+        return tool_call_stream(f"tc-{org}-{turn}", "save_post", json.dumps(args))
 
-    with patch("agent.graph.litellm.acompletion", new=AsyncMock(side_effect=model)):
-        replies = await asyncio.gather(
-            *(
-                Assistant(f"org-{n}", thread_id=f"org-{n}:web").chat(f"session {n}")
-                for n in range(CONCURRENT_SESSIONS)
+    orgs = [f"org-{n}" for n in range(CONCURRENT_SESSIONS)]
+    with (
+        patch("agent.graph.litellm.acompletion", new=AsyncMock(side_effect=model)),
+    ):
+        for turn in ("1", "2"):
+            replies = await asyncio.wait_for(
+                asyncio.gather(
+                    *(
+                        Assistant(org, thread_id=f"{org}:web").chat(f"{org} round {turn}")
+                        for org in orgs
+                    )
+                ),
+                WAIT_S,
             )
-        )
+            assert replies == [f"saved {org} round {turn}" for org in orgs]
 
-    assert replies == [f"saved for {n}" for n in range(CONCURRENT_SESSIONS)]
-    for n in range(CONCURRENT_SESSIONS):
-        assert [p["title"] for p in get_ledger(f"org-{n}")] == [f"Post {n}"]
+    assert (await db.get_pool()).max_size == SMALL_POOL_SIZE
+    for org in orgs:
+        assert history_seen[(org, "2")] == [f"{org} round 1", f"{org} round 2"]
+        titles = [post["title"] for post in await get_ledger(org)]
+        assert titles == [f"{org} round 1", f"{org} round 2"]
 
 
-async def test_checkpoint_schema_is_set_up_once_however_many_sessions_start(tmp_data_dir):
-    """
-    Regression: every turn re-ran the schema setup on its own connection, and with
-    ~100 sessions starting at once SQLite failed some with "database is locked".
-    """
+async def test_the_connection_pool_is_opened_once_however_many_sessions_start(fresh_pool):
+    """Sessions starting together share one pool opening instead of each opening their own."""
+    from agent import db
     from agent.assistant import Assistant
 
-    setups = 0
-    original_setup = AsyncSqliteSaver.setup
+    openings = 0
+    original_open = db._open_pool
 
-    async def counting_setup(self):
-        nonlocal setups
-        if not self.is_setup:
-            setups += 1
-        await original_setup(self)
+    async def counting_open():
+        nonlocal openings
+        openings += 1
+        return await original_open()
 
     with (
-        patch.object(AsyncSqliteSaver, "setup", counting_setup),
+        patch.object(db, "_open_pool", counting_open),
         patch(
             "agent.graph.litellm.acompletion",
-            new=AsyncMock(side_effect=lambda **_: _text_stream("ok")),
+            new=AsyncMock(side_effect=lambda **_: text_stream("ok")),
         ),
     ):
         await asyncio.gather(
@@ -119,113 +116,151 @@ async def test_checkpoint_schema_is_set_up_once_however_many_sessions_start(tmp_
         )
         await Assistant("org", thread_id="org:later").chat("hi")
 
-    assert setups == 1
-
-
-async def test_a_failed_schema_setup_is_retried_by_the_next_turn(tmp_data_dir):
-    import sqlite3
-
-    from agent.assistant import Assistant
-
-    original_setup = AsyncSqliteSaver.setup
-    attempts = []
-
-    async def flaky_setup(self):
-        if not self.is_setup:
-            attempts.append(1)
-            if len(attempts) == 1:
-                raise sqlite3.OperationalError("disk I/O error")
-        await original_setup(self)
-
-    with (
-        patch.object(AsyncSqliteSaver, "setup", flaky_setup),
-        patch(
-            "agent.graph.litellm.acompletion",
-            new=AsyncMock(side_effect=lambda **_: _text_stream("ok")),
-        ),
-    ):
-        with pytest.raises(sqlite3.OperationalError):
-            await Assistant("org").chat("first")
-        assert await Assistant("org").chat("second") == "ok"
+    assert openings == 1
 
 
 # --- Two people, one org --------------------------------------------------------------
 
 
-async def test_two_browser_sessions_on_one_org_share_memory_but_not_conversation(tmp_data_dir):
-    """Org memory (the ledger) is shared by design; what each person typed is not."""
+async def test_sessions_on_one_org_share_its_memory_but_not_their_conversations(database):
+    """
+    A web session and a CLI session on one org (thread ids as app.py and main.py name them):
+    the post the web session saved is org memory and reaches the CLI's prompt; what either
+    person typed reaches only their own session's later turns.
+    """
     from agent.assistant import Assistant
 
-    alice = Assistant("food-bank", thread_id="food-bank:alice")
-    bob = Assistant("food-bank", thread_id="food-bank:bob")
+    web = Assistant("food-bank", thread_id="food-bank:web-user-1")
+    cli = Assistant("food-bank", thread_id="food-bank:cli-user-2")
     args = json.dumps({"platform": "general", "content": "x", "title": "Shared gala post"})
     first = AsyncMock(
-        side_effect=[_tool_call_stream("tc1", "save_post", args), _text_stream("Saved")]
+        side_effect=[tool_call_stream("tc1", "save_post", args), text_stream("Saved")]
     )
     with patch("agent.graph.litellm.acompletion", new=first):
-        await alice.chat("Alice's private draft idea about the board")
+        await web.chat("A private draft idea typed in the browser")
 
-    second = AsyncMock(return_value=_text_stream("Hi Bob"))
-    with patch("agent.graph.litellm.acompletion", new=second):
-        await bob.chat("What's new?")
-
-    sent = second.call_args.kwargs["messages"]
-    system, conversation = sent[0], sent[1:]
+    cli_model = AsyncMock(return_value=text_stream("Reply in the terminal"))
+    with patch("agent.graph.litellm.acompletion", new=cli_model):
+        await cli.chat("Typed in the terminal")
+    system, *conversation = cli_model.call_args.kwargs["messages"]
     assert "Shared gala post" in json.dumps(system)  # the ledger is org memory
-    assert [m["content"] for m in conversation] == ["What's new?"]  # nothing of Alice's
+    assert [m["content"] for m in conversation] == ["Typed in the terminal"]
+
+    web_model = AsyncMock(return_value=text_stream("ok"))
+    with patch("agent.graph.litellm.acompletion", new=web_model):
+        await web.chat("Back in the browser")
+    conversation = web_model.call_args.kwargs["messages"][1:]
+    assert [m["content"] for m in conversation if m["role"] == "user"] == [
+        "A private draft idea typed in the browser",
+        "Back in the browser",
+    ]
+    assert "terminal" not in json.dumps(conversation)
 
 
-async def test_the_cli_and_web_sessions_on_one_org_keep_separate_histories(tmp_data_dir):
-    """Neither direction leaks: the web model sees nothing typed in the terminal, and back."""
+async def test_turns_on_one_thread_take_turns_while_other_threads_run(database):
+    """
+    Two tabs on one conversation: the second turn reaches the model only after the
+    first has finished, and sees it, so neither saves a history missing the other.
+    A turn on another thread is not held up meanwhile.
+    """
+    from agent.assistant import Assistant
+    from agent.graph import build_graph
+
+    release_first, first_streaming = asyncio.Event(), asyncio.Event()
+    order: list[str] = []
+    seen_by_second: list[str] = []
+
+    async def model(**kwargs):
+        message = kwargs["messages"][-1]["content"]
+        order.append(f"model: {message}")
+        if message == "one":
+            first_streaming.set()
+            return gated_stream(["reply one"], {0: release_first})
+        if message == "two":
+            seen_by_second.extend(m["content"] for m in kwargs["messages"][1:])
+        return text_stream(f"reply {message}")
+
+    async def first_turn() -> None:
+        async for _event in Assistant("org", thread_id="org:tab").achat_stream("one"):
+            pass
+        order.append("first turn done")
+
+    with patch("agent.graph.litellm.acompletion", new=AsyncMock(side_effect=model)):
+        first = asyncio.create_task(first_turn())
+        await asyncio.wait_for(first_streaming.wait(), WAIT_S)
+        second = asyncio.create_task(Assistant("org", thread_id="org:tab").chat("two"))
+        other = Assistant("org", thread_id="org:other").chat("three")
+        assert await asyncio.wait_for(other, WAIT_S) == "reply three"
+        assert not second.done()
+        release_first.set()
+        assert await asyncio.wait_for(second, WAIT_S) == "reply two"
+        await first
+
+    assert order == ["model: one", "model: three", "first turn done", "model: two"]
+    assert seen_by_second == ["one", "reply one", "two"]
+    async with build_graph("gpt-4o-mini", "org") as graph:
+        state = await graph.aget_state({"configurable": {"thread_id": "org:tab"}})
+    assert [m.content for m in state.values["messages"]] == ["one", "reply one", "two", "reply two"]
+
+
+async def test_a_new_conversation_started_during_a_turn_waits_for_it_and_stays_new(database):
+    """
+    "Start a new conversation" in one tab while a turn runs in another: the clear waits
+    for the turn to finish, so the finished turn can't save its messages back into the
+    cleared thread.
+    """
+    from agent import assistant as assistant_module
     from agent.assistant import Assistant
 
-    cli, web = Assistant("org"), Assistant("org", thread_id="org:browser")
-    with patch("agent.graph.litellm.acompletion", new=AsyncMock(return_value=_text_stream("ok"))):
-        await cli.chat("typed in the terminal")
+    thread_id = "org:web-user-1"
+    release, streaming, clear_waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    order: list[str] = []
+    real_thread_lock = assistant_module._thread_lock
 
-    web_model = AsyncMock(return_value=_text_stream("ok"))
-    with patch("agent.graph.litellm.acompletion", new=web_model):
-        await web.chat("typed in the browser")
-    assert [m["content"] for m in web_model.call_args.kwargs["messages"][1:]] == [
-        "typed in the browser"
-    ]
+    def thread_lock(thread: str) -> asyncio.Lock:
+        lock = real_thread_lock(thread)
+        if lock.locked():  # the clear arrives while the turn holds the thread
+            clear_waiting.set()
+        return lock
 
-    cli_model = AsyncMock(return_value=_text_stream("ok"))
-    with patch("agent.graph.litellm.acompletion", new=cli_model):
-        await cli.chat("back in the terminal")
-    sent = [m["content"] for m in cli_model.call_args.kwargs["messages"][1:]]
-    assert sent == ["typed in the terminal", "ok", "back in the terminal"]
+    async def model(**kwargs):
+        streaming.set()
+        return gated_stream(["reply"], {0: release})
+
+    async def turn() -> None:
+        assert await Assistant("org", thread_id=thread_id).chat("one") == "reply"
+        order.append("turn done")
+
+    async def new_conversation() -> None:
+        await Assistant("org", thread_id=thread_id).clear_history()
+        order.append("cleared")
+
+    with (
+        patch.object(assistant_module, "_thread_lock", thread_lock),
+        patch("agent.graph.litellm.acompletion", new=AsyncMock(side_effect=model)),
+    ):
+        running = asyncio.create_task(turn())
+        await asyncio.wait_for(streaming.wait(), WAIT_S)
+        clearing = asyncio.create_task(new_conversation())
+        await asyncio.wait_for(clear_waiting.wait(), WAIT_S)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(running, clearing), WAIT_S)
+
+    assert order == ["turn done", "cleared"]
+    assert await Assistant("org", thread_id=thread_id).recent_exchanges(10) == []
 
 
-async def test_simultaneous_writes_to_one_org_lose_nothing(tmp_data_dir):
-    """Two people saving at the same moment in one process: every post kept, ids unique."""
-    from agent.memory import get_ledger
-    from agent.tools import handle_tool_call
-
-    await asyncio.gather(
-        *(
-            handle_tool_call(
-                "save_post", {"platform": "general", "content": "x", "title": f"T{n}"}, "food-bank"
-            )
-            for n in range(SIMULTANEOUS_WRITES)
-        )
-    )
-    ledger = get_ledger("food-bank")
-    assert len(ledger) == SIMULTANEOUS_WRITES
-    assert len({p["id"] for p in ledger}) == SIMULTANEOUS_WRITES
-
-
-async def test_interleaved_streams_reach_only_their_own_session(tmp_data_dir):
-    """Alice's reply pauses mid-stream while Bob's streams in full; neither gets the other's tokens."""
+async def test_interleaved_streams_reach_only_their_own_session(database):
+    """Alice's reply pauses mid-stream while Bob's streams in full; neither gets the other's."""
     from agent.assistant import Assistant
 
     alice_started, bob_finished = asyncio.Event(), asyncio.Event()
 
     async def model(**kwargs):
         if _last_user_message(kwargs["messages"]) == "from Alice":
-            stream = _gated_stream(["A1", "A2"], {1: bob_finished})
+            stream = gated_stream(["A1", "A2"], {1: bob_finished})
         else:
-            stream = _gated_stream(["B1", "B2"], {0: alice_started})
+            stream = gated_stream(["B1", "B2"], {0: alice_started})
         return stream
 
     async def collect(assistant: Assistant, message: str) -> list[str]:
@@ -247,130 +282,175 @@ async def test_interleaved_streams_reach_only_their_own_session(tmp_data_dir):
     assert bob == ["B1", "B2"]
 
 
-# --- A session can only touch its own org ---------------------------------------------
-
-
-async def test_a_model_naming_another_org_in_tool_arguments_still_writes_to_its_own(tmp_data_dir):
-    """The org comes from the session, never from the model's arguments."""
-    from agent.assistant import Assistant
-    from agent.memory import get_ledger
-
-    args = json.dumps(
-        {"platform": "general", "content": "x", "title": "Injected", "org_id": "victim-org"}
-    )
-    model = AsyncMock(side_effect=[_tool_call_stream("tc1", "save_post", args), _text_stream("ok")])
-    with patch("agent.graph.litellm.acompletion", new=model):
-        await Assistant("attacker-org").chat("save it")
-
-    assert [p["title"] for p in get_ledger("attacker-org")] == ["Injected"]
-    assert not (tmp_data_dir / "victim-org").exists()
-
-
-# --- Separate processes on one org (web UI, CLI, scripts) ------------------------------
-
-
-def test_separate_processes_writing_to_one_org_lose_nothing(tmp_data_dir):
-    """
-    Regression: the web UI and the CLI on one org overwrote each other's posts
-    (50 of 100 lost), and a shared temporary file name crashed one of them.
-    """
-    from agent.memory import get_ledger
-
-    writer = (
-        "import sys; from pathlib import Path; import agent.memory as mem\n"
-        "mem.DATA_DIR = Path(sys.argv[1])\n"
-        f"for n in range({POSTS_PER_PROCESS}):\n"
-        "    mem.add_post('org', {'platform': 'general', 'content': 'x', 'title': sys.argv[2] + str(n)})"
-    )
-    processes = [
-        subprocess.Popen(
-            [sys.executable, "-c", writer, str(tmp_data_dir), f"P{n}-"],
-            cwd=REPO_ROOT,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        for n in range(WRITER_PROCESSES)
-    ]
-    errors = [process.communicate(timeout=30)[1] for process in processes]
-
-    assert [process.returncode for process in processes] == [0] * WRITER_PROCESSES, errors
-    ledger = get_ledger("org")
-    assert len(ledger) == WRITER_PROCESSES * POSTS_PER_PROCESS
-    assert len({post["id"] for post in ledger}) == len(ledger)
-
-
-def _seed_org_for_writers() -> None:
-    from agent.memory import add_post, load_profile, save_preference, save_profile
-
-    add_post("org", {"platform": "linkedin", "content": "x", "title": "Existing"})
-    save_preference("org", "voice", "warm")
-    save_profile("org", load_profile("org") | {"research": {"sources": []}})
-
-
-def _run_tool(tool_name: str, arguments: dict) -> None:
-    from agent.tools import handle_tool_call
-
-    asyncio.run(handle_tool_call(tool_name, arguments, "org"))
+# --- Every kind of write at once, in one process and across processes -------------
 
 
 RESEARCH = {"website_content": "", "social_presence": [], "news": [], "similar_orgs": []}
-WRITERS = {
-    "add_post": lambda mem: mem.add_post("org", {"platform": "general", "content": "x"}),
-    "update_post_status": lambda mem: mem.update_post_status("org", "post_001", "draft"),
-    "record_performance": lambda mem: mem.record_performance("org", "post_001", {"reach": 1}),
-    "save_preference": lambda mem: mem.save_preference("org", "tone", "plain"),
-    "forget_preference": lambda mem: mem.forget_preference("org", "voice"),
-    "add_voice_example": lambda mem: mem.add_voice_example("org", "x", "pasted"),
-    "fill_org_details": lambda mem: mem.fill_org_details("org", "Org", "https://org.example"),
-    "research_org tool": lambda _: _run_tool("research_org", {"org_name": "Org"}),
-    "web_search tool": lambda _: _run_tool("web_search", {"query": "q"}),
-}
 
 
-def test_every_profile_writer_waits_for_another_processs_lock(tmp_data_dir):
+async def _seed_org_for_writers() -> None:
+    from agent.memory import add_post, save_preference, save_research
+
+    await add_post("org", {"platform": "linkedin", "content": "x", "title": "Existing"})
+    await save_preference("org", "voice", "warm")
+    await save_research("org", {"sources": []}, "")
+
+
+async def test_every_kind_of_org_write_at_once_loses_no_update(database):
     """
-    Hold the org's lock as another process would; every writer must wait for it.
-
-    All writers start together in their own threads, so one wait covers them
-    all, and once released, every write must land: none may overwrite another.
+    Regression: a writer that loads, changes and saves without locking the org's row
+    overwrites the others. Every kind of writer runs at once; every write must land.
     """
     import agent.memory as mem
+    from agent.tools import handle_tool_call
 
-    _seed_org_for_writers()
-    profile_path = tmp_data_dir / "org" / "profile.json"
+    await _seed_org_for_writers()
     search = [{"title": "t", "snippet": "s", "url": "https://news.example/a"}]
-    brief = AsyncMock(side_effect=RuntimeError("no brief"))
+    writers = [
+        *(
+            mem.save_preference("org", "banned_topics", f"topic {n}", append=True)
+            for n in range(10)
+        ),
+        *(
+            handle_tool_call(
+                "save_post", {"platform": "general", "content": "x", "title": f"T{n}"}, "org"
+            )
+            for n in range(10)
+        ),
+        mem.update_post_status("org", "post_001", "draft"),
+        mem.record_performance("org", "post_001", {"reach": 1}),
+        mem.save_preference("org", "tone", "plain"),
+        mem.forget_preference("org", "voice"),
+        mem.add_voice_example("org", "x", "pasted"),
+        mem.fill_org_details("org", "Org", "https://org.example"),
+        handle_tool_call("research_org", {"org_name": "Org"}, "org"),
+        handle_tool_call("web_search", {"query": "q"}, "org"),
+    ]
     with (
         patch("agent.tools.res.research_org", new=AsyncMock(return_value=dict(RESEARCH))),
         patch("agent.tools.res.search_web", new=AsyncMock(return_value=search)),
-        patch("agent.tools.litellm.acompletion", new=brief),
-        open(tmp_data_dir / "org" / mem.LOCK_FILE_NAME, "w") as other_process,
+        patch("agent.tools.litellm.acompletion", new=AsyncMock(side_effect=RuntimeError)),
     ):
-        fcntl.flock(other_process, fcntl.LOCK_EX)  # a separate open file, as another process has
-        before = profile_path.read_text()
-        workers = {
-            name: threading.Thread(target=write, args=(mem,), daemon=True)
-            for name, write in WRITERS.items()
-        }
-        for worker in workers.values():
-            worker.start()
-        time.sleep(STILL_BLOCKED_S)
-        assert [name for name, worker in workers.items() if not worker.is_alive()] == []
-        assert profile_path.read_text() == before
-        fcntl.flock(other_process, fcntl.LOCK_UN)
-        for worker in workers.values():
-            worker.join(WAIT_S)
-    assert [name for name, worker in workers.items() if worker.is_alive()] == []
+        await asyncio.wait_for(asyncio.gather(*writers), WAIT_S)
 
-    profile = mem.load_profile("org")
-    assert len(profile["post_ledger"]) == 2 and "performance" in profile["post_ledger"][0]
-    assert profile["preferences"] == {"tone": "plain"}
+    profile = await mem.load_profile("org")
+    ledger = profile["post_ledger"]
+    assert len(ledger) == 11 and len({post["id"] for post in ledger}) == 11
+    assert "performance" in ledger[0]
+    assert sorted(profile["preferences"]["banned_topics"]) == sorted(
+        f"topic {n}" for n in range(10)
+    )
+    assert profile["preferences"]["tone"] == "plain" and "voice" not in profile["preferences"]
     assert len(profile["voice_examples"]) == 1
     assert profile["website"] == "https://org.example"
     assert profile["research"] is not None and "org_brief" in profile  # research saved too
 
 
-async def test_research_finishing_late_keeps_posts_saved_while_it_ran(tmp_data_dir):
+async def test_a_profile_read_is_one_snapshot_while_another_session_replaces_it(database):
+    """
+    load_profile reads four tables one after another. A whole-profile write that commits
+    between those reads (here, after the first) must not show: the result is all the old
+    profile, none of the new.
+    """
+    from agent import db
+    from agent.memory import load_profile, save_profile
+
+    def profile(tag: str) -> dict:
+        return {
+            "name": f"Org {tag}",
+            "post_ledger": [
+                {"id": f"post_00{n}", "platform": "general", "content": f"{tag} {n}"}
+                for n in (1, 2)
+            ],
+            "preferences": {"tone": f"tone {tag}"},
+            "voice_examples": [{"content": f"voice {tag}", "source": "pasted"}],
+        }
+
+    await save_profile("org", profile("A"))
+    before = await load_profile("org")
+    first_query_done, other_write_done = asyncio.Event(), asyncio.Event()
+    real_transaction = db.org_transaction
+
+    class PausingConnection:
+        """Passes everything through, but holds the second table's read until the write commits."""
+
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+        async def execute(self, query, params=None):
+            if "FROM preferences" in query:
+                first_query_done.set()
+                await asyncio.wait_for(other_write_done.wait(), WAIT_S)
+            return await self.conn.execute(query, params)
+
+    @asynccontextmanager
+    async def pausing_reads(org_id: str, *, read_only: bool = False):
+        async with real_transaction(org_id, read_only=read_only) as conn:
+            yield PausingConnection(conn) if read_only else conn
+
+    with patch.object(db, "org_transaction", pausing_reads):
+        read = asyncio.create_task(load_profile("org"))
+        await asyncio.wait_for(first_query_done.wait(), WAIT_S)
+        await asyncio.wait_for(save_profile("org", profile("B")), WAIT_S)
+        other_write_done.set()
+        during = await asyncio.wait_for(read, WAIT_S)
+
+    assert during == before
+    after = await load_profile("org")
+    assert after["name"] == "Org B" and after["preferences"] == {"tone": "tone B"}
+
+
+async def test_separate_processes_writing_to_one_org_lose_nothing(database):
+    """
+    Regression: the web UI and the CLI on one org are separate processes, so only the
+    database's lock keeps them from overwriting each other's posts. Each process saves
+    posts and appends to one list preference.
+    """
+    from agent.memory import load_profile
+
+    writer = (
+        "import asyncio, sys; import agent.memory as mem; from agent import db\n"
+        "async def write():\n"
+        f"    for n in range({POSTS_PER_PROCESS}):\n"
+        "        title = sys.argv[1] + str(n)\n"
+        "        await mem.add_post('org', {'platform': 'general', 'content': 'x', 'title': title})\n"
+        "        await mem.save_preference('org', 'topics', title, append=True)\n"
+        "    await db.close_pool()\n"
+        "asyncio.run(write())"
+    )
+    environment = {**os.environ, "MACKIE_DATABASE_URL": database["app"]}
+    processes = [
+        await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            writer,
+            f"P{n}-",
+            cwd=REPO_ROOT,
+            env=environment,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        for n in range(WRITER_PROCESSES)
+    ]
+    outputs = await asyncio.wait_for(
+        asyncio.gather(*(process.communicate() for process in processes)), PROCESS_WAIT_S
+    )
+    errors = [stderr.decode() for _, stderr in outputs]
+
+    assert [process.returncode for process in processes] == [0] * WRITER_PROCESSES, errors
+    profile = await load_profile("org")
+    expected = sorted(
+        f"P{p}-{n}" for p in range(WRITER_PROCESSES) for n in range(POSTS_PER_PROCESS)
+    )
+    ledger = profile["post_ledger"]
+    assert sorted(post["title"] for post in ledger) == expected
+    assert len({post["id"] for post in ledger}) == len(ledger)
+    assert sorted(profile["preferences"]["topics"]) == expected
+
+
+async def test_research_finishing_late_keeps_posts_saved_while_it_ran(database):
     """Research takes seconds; it must not save a profile it loaded before another session wrote."""
     from agent.memory import get_ledger, load_profile
     from agent.tools import handle_tool_call
@@ -393,5 +473,5 @@ async def test_research_finishing_late_keeps_posts_saved_while_it_ran(tmp_data_d
         other_session_saved.set()
         await asyncio.wait_for(research, WAIT_S)
 
-    assert [post["title"] for post in get_ledger("org")] == ["Saved meanwhile"]
-    assert load_profile("org")["research"] is not None
+    assert [post["title"] for post in await get_ledger("org")] == ["Saved meanwhile"]
+    assert (await load_profile("org"))["research"] is not None
