@@ -1076,12 +1076,17 @@ async def test_a_turn_interrupted_after_its_tool_ran_leaves_a_working_thread(dat
 
     def tool_call_is_stored() -> bool:
         # LangGraph saves the step that made the tool call in the background, so the outage
-        # waits for that save; otherwise there is no unanswered call to answer (a race the
-        # slower coverage run lost).
+        # waits for that save; otherwise there is no unanswered call to answer. The step's
+        # writes (checkpoint_writes) land first, but the next turn reads only a checkpoint
+        # whose messages hold the call, which CI runners sometimes hadn't saved yet.
         row = (
             database["cleaner"]
             .execute(
-                "SELECT count(*) FROM checkpoint_writes WHERE position('tc_lost'::bytea IN blob) > 0"
+                "SELECT count(*) FROM checkpoints c"
+                " JOIN checkpoint_blobs b ON b.thread_id = c.thread_id"
+                " AND b.checkpoint_ns = c.checkpoint_ns AND b.channel = 'messages'"
+                " AND b.version = c.checkpoint -> 'channel_versions' ->> 'messages'"
+                " WHERE position('tc_lost'::bytea IN b.blob) > 0"
             )
             .fetchone()
         )
