@@ -89,7 +89,7 @@ docker compose up --build
   - a docstring on every public function;
   - inline comments only for a non-obvious *why*.
 - **Parallelism:** run independent I/O with `asyncio.gather`. Research, subpages, judge calls and calendar weeks already do.
-- **Dependencies:** must be actively maintained and widely used; pin a minimum version (`pkg>=x.y`) that has what the code uses and no known vulnerability. Exclude a known-broken release with `!=` and say why in `design_doc.md` (LiteLLM 1.106.0 breaks tool calls). ruff is the one exact pin.
+- **Dependencies:** must be actively maintained and widely used; pin a minimum version (`pkg>=x.y`) that has what the code uses and no known vulnerability. Exclude a known-broken release with `!=` and say why in `design_doc.md` (LiteLLM 1.106 breaks tool calls). ruff is the one exact pin.
 - **Tests:**
   - every change ships with tests;
   - every public function in `agent/` gets a happy-path test and an error or edge-case test;

@@ -81,7 +81,7 @@ def test_chainlit_settings_protect_the_server_and_sessions(path, allowed):
 
 async def test_installed_litellm_accepts_tool_calls():
     """
-    LiteLLM 1.106.0 imports mcp>=2.2 on every call with tools, but Chainlit pins
+    LiteLLM 1.106.0 and 1.106.1 import mcp>=2.2 on every call with tools, but Chainlit pins
     mcp<2, so every chat turn failed with any provider. mock_response stays offline.
     """
     tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}

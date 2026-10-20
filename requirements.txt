@@ -5,7 +5,7 @@ tavily-python>=0.5.2
 pyyaml>=6.0.0
 rich>=13.0.0
 chainlit>=2.11.1
-litellm>=1.105.0,!=1.106.0  # older releases have published CVEs; 1.106.0 breaks tool calls (design_doc.md)
+litellm>=1.105.0,!=1.106.*  # older releases have published CVEs; 1.106 breaks tool calls (design_doc.md)
 langgraph>=1.0.0
 langchain-core>=1.0.0
 langgraph-checkpoint-postgres>=3.2.0
