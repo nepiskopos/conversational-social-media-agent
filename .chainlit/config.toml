@@ -19,8 +19,9 @@ persist_user_env = false
 # Set to true to show API keys as ***, false to show them as plain text
 mask_user_env = false
 
-# Authorized origins. Empty: only the page Mackie serves itself can make requests with a
-# user's login cookie; ["*"] would let any site make them, credentials included.
+# Authorized origins for HTTP requests (CORS). Empty: only the page Mackie serves itself can
+# make them with a user's login cookie; ["*"] would let any site, credentials included. The
+# websocket doesn't check origins; the cookie's SameSite=Lax keeps other sites' pages out.
 allow_origins = []
 
 [features]
@@ -42,8 +43,9 @@ assistant_message_autoscroll = true
 # Automatically tag threads with the current chat profile (if a chat profile is used)
 auto_tag_thread = true
 
-# Allow users to edit their own messages
-edit_message = true
+# Off: an edited message reruns the turn, but Mackie's stored conversation keeps the
+# original and its reply, so the model would see both and the screen would disagree with it.
+edit_message = false
 
 # Allow users to share threads (backend + UI). Requires an app-defined on_shared_thread_view callback.
 allow_thread_sharing = false

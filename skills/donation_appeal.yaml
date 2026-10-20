@@ -11,7 +11,7 @@
 #
 # Fields:
 #   kind:         Must be "content_type" (this is what makes it a content type)
-#   id:           Machine-readable identifier — unique, lowercase, no spaces   (required)
+#   id:           Unique identifier: lowercase letters, digits and _ only    (required)
 #   name:         Display name                                                  (required)
 #   purpose:      One line: what this kind of post should achieve               (required)
 #   structure:    The order of the post's parts, one per line                   (required)

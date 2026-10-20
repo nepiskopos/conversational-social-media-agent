@@ -4,7 +4,9 @@ Tool definitions and handlers for Mackie's agentic loop.
 Owns: the TOOL_DEFINITIONS list (OpenAI function-calling format consumed by
 LiteLLM), handle_tool_call dispatch, the per-call trace entry
 (memory.append_trace), checks on the model's arguments (required ones,
-statuses, dates, reported counts, preference sizes), the checks save_post
+statuses, dates, text fields and their lengths, reported counts, preference
+sizes), the Turn checks that what outlasts a turn (preferences, voice
+examples, approvals, results) traces back to the user, the checks save_post
 applies (platform and format rules from skills/, versions, cited sources) and
 their re-check before a post goes live, the org brief written after research,
 and the content calendar.
@@ -20,15 +22,19 @@ import json
 import logging
 import re
 import time
+import unicodedata
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import litellm
 
 from . import memory as mem
 from . import research as res
 from . import skills
-from .config import background_kwargs, resolve_fast_model
+from .config import BACKGROUND_RETRIES, background_kwargs, resolve_fast_model
 from .logs import describe, safe, stack
 from .untrusted import wrap_untrusted
 
@@ -47,14 +53,27 @@ OPTIONAL_POST_FIELDS: tuple[str, ...] = (
 )
 # Statuses of a finished post, which must meet the platform's rules. Ideas (suggested,
 # planned) are exempt: a live run spent extra rounds adding hashtags to rough ideas and
-# told the user "three posts need hashtag fixes". Going live re-checks the stored text.
+# told the user "three posts need hashtag fixes". Approval re-checks the stored text; a post
+# saved or marked as posted already went out as it was.
 FULL_POST_STATUSES: tuple[str, ...] = ("draft", "approved", "posted")
 LIVE_STATUSES: tuple[str, ...] = ("approved", "posted")
+# The details show_post gives before a post's copy, as (label, post field).
+POST_DETAIL_LABELS: tuple[tuple[str, str], ...] = (
+    ("Post", "id"),
+    ("Title", "title"),
+    ("Status", "status"),
+    ("Platform", "platform"),
+    ("Format", "format"),
+    ("Planned for", "scheduled_for"),
+    ("Version of", "parent_id"),
+)
 # Search snippet lengths: research summaries list many results, a web_search only a few.
 SNIPPET_CHARS: int = 200
 WEB_SEARCH_SNIPPET_CHARS: int = 300
 # Upper bound on web_search's max_results; each result is added to the research sources.
 MAX_WEB_RESULTS: int = 10
+# Research sources kept per org; web_search stops adding them there.
+MAX_RESEARCH_SOURCES: int = 100
 # Appended to research_org's result. Research comes right before the first suggestions, and
 # after a long result models (Claude Haiku, OpenCode Zen) answered without saving them.
 RESEARCH_NEXT_STEP: str = (
@@ -75,6 +94,130 @@ MAX_POSTS_PER_WEEK: int = 3
 # Preferences are shown in every prompt; real ones are a sentence or two (the longest seen: 145).
 MAX_PREFERENCE_KEY_CHARS: int = 60
 MAX_PREFERENCE_TEXT_CHARS: int = 500
+# A preference key is a label like "linkedin_voice": it is in every prompt, so it can't
+# carry a sentence or a web address.
+PREFERENCE_KEY_PATTERN: re.Pattern[str] = re.compile(r"[a-z0-9_]+")
+# Longest text the model may store in these fields; each is in the prompt or the agenda.
+FIELD_CHARS: dict[str, int] = {"title": 120, "pillar": 80, "note": 500, "platform": 40}
+# Words a preference key may use besides the user's own: the usual labels, and platforms.
+PREFERENCE_KEY_WORDS: frozenset[str] = frozenset(
+    "voice tone style banned avoid topics topic words word phrases emoji emojis hashtags "
+    "hashtag length format formats audience language cta call action rules rule notes "
+    "spelling names terms values brand linkedin instagram facebook email general".split()
+)
+# Words a preference value may add to the user's own when rephrasing them: they join
+# words but can't carry an instruction or an address.
+FUNCTION_WORDS: frozenset[str] = frozenset(
+    "a an and or but nor the of to in on at for with by from as is are be no not it its "
+    "do does don t per than instead".split()
+)
+# A voice example is a post, not a word or two of the user's ("thanks") passed off as one.
+MIN_VOICE_EXAMPLE_WORDS: int = 5
+MIN_UNSPACED_POST_CHARS: int = 15  # the same in Chinese, Japanese or Thai, written without spaces
+PASTED_SOURCE: str = "pasted by user"
+# Scripts written without spaces between words, by the start of their characters' names.
+UNSPACED_SCRIPTS: tuple[str, ...] = (
+    "CJK",
+    "HIRAGANA",
+    "KATAKANA",
+    "THAI",
+    "LAO",
+    "KHMER",
+    "MYANMAR",
+)
+# ASCII punctuation: each is shown as typed when escaped with a backslash (see post_display).
+MARKDOWN_PUNCTUATION: re.Pattern[str] = re.compile(r"([!-/:-@\[-`{-~])")
+# Characters a reader can't see, so post text may not hold them (see _hidden_character):
+# controls, format characters (bidi, tags), line separators, unassigned code points, and the
+# other default-ignorable ones: variation selectors, Hangul fillers, the grapheme joiner.
+HIDDEN_CATEGORIES: frozenset[str] = frozenset({"Cc", "Cf", "Cn", "Co", "Cs", "Zl", "Zp"})
+HIDDEN_CHARACTER_RANGES: tuple[tuple[int, int], ...] = (
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFFA0, 0xFFA0),
+    (0xE0000, 0xE0FFF),
+)
+VISIBLE_WHITESPACE: frozenset[str] = frozenset({"\n", "\t"})
+# Joiners shape emoji and some scripts, so they are allowed between non-ASCII characters; an
+# emoji's text or emoji style selector is allowed right after a symbol. Anywhere else they
+# could carry hidden bits of text.
+JOINERS: frozenset[str] = frozenset({"\u200c", "\u200d"})
+EMOJI_STYLE_SELECTORS: frozenset[str] = frozenset({"\ufe0e", "\ufe0f"})
+SHOWN_POST_PATTERN: re.Pattern[str] = re.compile(r"^Post: (post_[0-9]+)\n")
+STATUS_LINE: re.Pattern[str] = re.compile(r"^Status: [a-z]+\n", re.MULTILINE)
+SHOW_DRAFT_NEXT: str = (
+    "\nNext: call show_post for {post_id}. Mackie displays it to the user exactly as saved, "
+    "and only a post shown that way can be approved; don't write the copy out yourself."
+)
+SAVED_POST_PATTERN: re.Pattern[str] = re.compile(
+    r"^Saved to ledger as (post_[0-9]+) \(status: ([a-z]+)\)"
+)
+
+
+@dataclass(frozen=True)
+class Turn:
+    """
+    What the user has done in the conversation, for the checks only the user can satisfy.
+
+    A page that fooled the model can make it call any tool, so whatever outlasts
+    the turn as an instruction or an example (a preference, a voice example, an
+    approved post) must trace back to the user: to text they typed, or to a post
+    Mackie itself displayed to them (show_post) before their latest message.
+    """
+
+    user_text: str = ""  # every message the user typed in this conversation
+    shown_posts: tuple[str, ...] = ()  # show_post results displayed before their latest message
+    new_post_ids: frozenset[str] = frozenset()  # posts saved since the user's latest message
+
+    @classmethod
+    def from_messages(cls, messages: list[Any], is_user_turn: Callable[[Any], bool]) -> Turn:
+        """The Turn for a conversation's messages (LangChain messages, oldest first)."""
+        last_user = max((i for i, msg in enumerate(messages) if is_user_turn(msg)), default=-1)
+        saved = (
+            SAVED_POST_PATTERN.match(str(msg.content))
+            for msg in messages[last_user + 1 :]
+            if getattr(msg, "name", None) == "save_post"
+        )
+        return cls(
+            user_text="\n".join(str(msg.content) for msg in messages if is_user_turn(msg)),
+            shown_posts=tuple(
+                str(msg.content)
+                for msg in messages[:last_user]
+                if getattr(msg, "name", None) == "show_post"
+                and SHOWN_POST_PATTERN.match(str(msg.content))
+            ),
+            # Not a post saved as already live: that is the user's own text (see save_post).
+            new_post_ids=frozenset(
+                match[1] for match in saved if match and match[2] not in LIVE_STATUSES
+            ),
+        )
+
+    def has_seen(self, post: dict[str, Any]) -> bool:
+        """
+        Whether the user has read a post as it is stored now: Mackie displayed it, or they typed it.
+
+        Displayed by show_post, not shown in a reply: Markdown can hide text a reply
+        seems to show, and reviews found a new way each time a check tried to tell.
+        A post with no text (a hand-edited import) has nothing to read.
+        """
+        text = str(post.get("content") or "")
+        if not _words(text):
+            return True
+        # Its status aside: "we posted it" comes after the approval that changed it.
+        unchanged = _without_status(_format_post(post))
+        return any(_without_status(shown) == unchanged for shown in self.shown_posts) or (
+            _typed_by_user(text, self.user_text)
+        )
+
+
+# A call outside a conversation (scripts, tests): nothing typed, nothing shown.
+NO_TURN: Turn = Turn()
+
+
 # A list built with append, in total, so a long text can't be saved in parts.
 MAX_PREFERENCE_LIST_CHARS: int = 1000
 # All preferences and their quotes (about 1,000 tokens), so a long text can't be split across keys.
@@ -113,7 +256,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "org_name": {"type": "string"},
                     "org_url": {
                         "type": "string",
-                        "description": "Organization website URL (optional)",
+                        "description": (
+                            "A page on the organization's own website to start from (optional; "
+                            "the stored website by default). Other sites are refused."
+                        ),
                     },
                 },
                 "required": ["org_name"],
@@ -135,7 +281,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "org_name": {"type": "string"},
                     "org_url": {
                         "type": "string",
-                        "description": "Organization website URL (optional)",
+                        "description": (
+                            "A page on the organization's own website to start from (optional; "
+                            "the stored website by default). Other sites are refused."
+                        ),
                     },
                 },
                 "required": ["org_name"],
@@ -226,7 +375,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "description": (
                 "Update the status of an existing post in the ledger. Use 'rejected' when the user "
                 "turns an idea down. Approving a post also saves it as an example of the org's voice. "
-                "A post becomes 'approved' or 'posted' only if it meets its platform's rules."
+                "A post is approved only if it meets its platform's rules and a reply of yours "
+                "has shown the user its text. 'posted' records that it went out, as it was."
             ),
             "parameters": {
                 "type": "object",
@@ -327,19 +477,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "save_voice_example",
             "description": (
-                "Remember a post written in the org's own voice: one the user pasted, or their edited "
-                "version of a draft you wrote. Recent examples are shown to you as the style to imitate."
+                "Remember a post written in the org's own voice that the user pasted or typed in "
+                "this conversation, copied exactly. Recent examples are shown to you as the style "
+                "to imitate. Approved posts are added on their own."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "content": {"type": "string"},
-                    "note": {
-                        "type": "string",
-                        "description": "Where it came from, e.g. 'pasted by user'",
-                    },
-                },
-                "required": ["content", "note"],
+                "properties": {"content": {"type": "string"}},
+                "required": ["content"],
             },
         },
     },
@@ -390,6 +535,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "show_post",
+            "description": (
+                "Display one saved post to the user exactly as stored (copy, visual, source and "
+                "status), and return it to you. Call it after saving a draft, instead of writing "
+                "the copy out, and before asking for approval: a post is approved only once this "
+                "has shown it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"post_id": {"type": "string", "description": "e.g. post_003"}},
+                "required": ["post_id"],
+            },
+        },
+    },
 ]
 
 
@@ -411,8 +573,8 @@ def _format_research_summary(
 
     Returns:
         Multi-line summary with website content truncated to website_chars, a
-        few results per search (3 social, 4 news, 2 similar orgs), error
-        entries filtered out, and all third-party text in <external_content> tags.
+        few results per search (3 social, 4 news, 2 similar orgs), and all
+        third-party text in <external_content> tags.
     """
     lines = [
         f"Research complete for {org_name}.",
@@ -427,12 +589,14 @@ def _format_research_summary(
             ),
             "",
         ]
+    else:
+        lines += ["No website text: none was given, or the site couldn't be read.", ""]
     for key, heading, limit in (
         ("social_presence", "Social presence:", 3),
         ("news", "\nRecent news:", 4),
         ("similar_orgs", "\nSimilar orgs on social:", 2),
     ):
-        results = [r for r in result.get(key, [])[:limit] if "error" not in r]
+        results = result.get(key, [])[:limit]
         if results:
             lines.append(heading)
             lines += [_wrap_search_result(r, SNIPPET_CHARS) for r in results]
@@ -449,7 +613,9 @@ def _wrap_search_result(result: dict[str, Any], snippet_chars: int) -> str:
     )
 
 
-async def handle_tool_call(tool_name: str, tool_input: dict[str, Any], org_id: str) -> str:
+async def handle_tool_call(
+    tool_name: str, tool_input: dict[str, Any], org_id: str, turn: Turn = NO_TURN
+) -> str:
     """
     Dispatch a tool call by name, write a trace entry, and return the result.
 
@@ -457,6 +623,8 @@ async def handle_tool_call(tool_name: str, tool_input: dict[str, Any], org_id: s
         tool_name:  Name matching one of the entries in TOOL_DEFINITIONS.
         tool_input: Parsed arguments dict from the LLM's tool call.
         org_id:     The active org identifier for memory operations.
+        turn:       What the user typed and has been shown (Turn); without it,
+                    nothing can be saved as the user's words or approved.
 
     Never raises: unparseable arguments, a missing required argument or a
     failing tool return an "Error: ..." string instead. The model's tool-call
@@ -473,14 +641,16 @@ async def handle_tool_call(tool_name: str, tool_input: dict[str, Any], org_id: s
             result = UNPARSED_ARGUMENTS_ERROR.format(tool=tool_name)
         else:
             result = _missing_arguments(tool_name, tool_input) or await _dispatch(
-                tool_name, _without_blanks(tool_input), org_id
+                tool_name, _without_blanks(tool_input), org_id, turn
             )
     except Exception as e:
         # The arguments stay out of the log (they hold what users wrote); the trace has them.
         logger.error(
             "Tool %s failed for %s: %s\n%s", safe(tool_name), org_id, describe(e), stack(e)
         )
-        result = f"Error: {tool_name} failed — {type(e).__name__}: {e}"
+        # Only the type: the web UI shows tool results, and an error's text can name a
+        # database host or quote a provider's raw reply. The log has the rest.
+        result = f"Error: {tool_name} failed ({type(e).__name__}); it may work if tried again."
     try:
         await _append_trace(org_id, tool_name, tool_input, result, round((time.time() - t0) * 1000))
     except Exception as e:
@@ -508,7 +678,7 @@ async def _write_org_brief(org_name: str, result: dict[str, Any]) -> str:
             model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=ORG_BRIEF_MAX_TOKENS,
-            num_retries=3,
+            num_retries=BACKGROUND_RETRIES,
             **background_kwargs(model),
         )
         return (response.choices[0].message.content or "").strip()
@@ -517,32 +687,72 @@ async def _write_org_brief(org_name: str, result: dict[str, Any]) -> str:
         return ""
 
 
-async def _run_research(
-    org_name: str, org_url: str, org_id: str, updated_at: str = ""
-) -> dict[str, Any]:
+def _site(url: str) -> str:
+    """
+    A URL's host without "www.", as research would fetch it, for telling whether two URLs are one website.
+
+    Read through the same res.with_scheme as the fetch: "evil.example://org.example" is a
+    URL on org.example to urlparse alone, but research fetches https://evil.example://….
+    """
+    return (urlparse(res.with_scheme(url)).hostname or "").removeprefix("www.")
+
+
+async def _research_url(org_id: str, requested: str) -> tuple[str, str]:
+    """
+    The URL research may read ("" for none) and "", or "" and an error result saying why not.
+
+    Research reads only the website stored for the org, which only the user
+    sets (typed at onboarding, or in an imported profile): a URL the model
+    picks itself may be one an injected page asked for, with the org's data
+    in its query string.
+    """
+    website = (await mem.load_profile(org_id)).get("website") or ""
+    if not requested:
+        return website, ""
+    if website and _site(requested) == _site(website):
+        # Only the page: a query string could carry the org's data out through a redirect.
+        return urlparse(res.with_scheme(requested))._replace(query="", fragment="").geturl(), ""
+    if not website:
+        return "", (
+            "Error: no website is stored for this organization, so research can't read one. "
+            "Call it again without org_url to research from web searches. If the user gave a "
+            "website, tell them to enter it with the organization's name when they next open "
+            "Mackie (the web page asks for both)."
+        )
+    return "", (
+        f"Error: research reads only the organization's website, {website}. Leave org_url "
+        "out, or use web_search for other sites. If the website itself changed, tell the "
+        "user an admin can change it in an exported profile (scripts/export_profile.py)."
+    )
+
+
+async def _run_research(org_name: str, org_url: str, org_id: str) -> dict[str, Any]:
     """
     Run org research, then save it and the brief; return the research.
-
-    updated_at, for a refresh, is when it ran.
 
     Only the research and the brief are saved, after the slow calls, so
     posts another session saved meanwhile are kept.
     """
     result = await res.research_org(org_name=org_name, org_url=org_url)
     brief = await _write_org_brief(org_name, result)
-    await mem.save_research(org_id, result, brief, updated_at)
+    await mem.save_research(org_id, result, brief)
     return result
 
 
 def _known_source_urls(profile: dict[str, Any]) -> set[str]:
     """URLs the assistant has actually seen via research or web_search, normalised."""
     sources = (profile.get("research") or {}).get("sources", [])
-    return {_normalise_url(s["url"]) for s in _source_entries(sources) if s.get("url")}
+    return {_normalise_url(s["url"]) for s in _source_entries(sources) if s["url"]}
 
 
 def _source_entries(sources: list[Any]) -> list[dict[str, Any]]:
-    """The sources that are {...} entries; a URL typed into an imported profile as plain text is skipped."""
-    return [source for source in sources if isinstance(source, dict)]
+    """
+    The sources that are {...} entries with a text url.
+
+    A URL typed into an imported profile as plain text, or an entry whose url
+    isn't text, is skipped rather than breaking every later save_post and web_search.
+    """
+    return [s for s in sources if isinstance(s, dict) and isinstance(s.get("url"), str)]
 
 
 def _normalise_url(url: str) -> str:
@@ -578,21 +788,33 @@ def _platform_problem(
     return None
 
 
+def _platform_skill(skill_set: skills.SkillSet, platform_id: str) -> dict[str, Any] | None:
+    """The platform skill with this id, ignoring case; None for a platform not in skills/."""
+    return next((p for p in skill_set.platforms if p["id"] == platform_id.lower()), None)
+
+
+def _format_skill(skill_set: skills.SkillSet, format_id: Any) -> dict[str, Any]:
+    """The format skill with this id; {} for none or one not in skills/."""
+    return next((f for f in skill_set.formats if f["id"] == format_id), {})
+
+
 def _live_post_problem(post: dict[str, Any]) -> str | None:
-    """What stops a stored post being approved or published, or None (also for unknown platforms)."""
+    """What stops a stored post being approved, or None (also for unknown platforms)."""
+    # An imported post skipped save_post's check; approving it would approve text unseen.
+    if hidden := _hidden_character(str(post.get("content") or "")):
+        return f"its text has a character readers can't see (U+{ord(hidden):04X})"
     skill_set = skills.load_skills()
-    platform_id = str(post.get("platform", "")).lower()
-    platform = next((p for p in skill_set.platforms if p["id"] == platform_id), None)
+    platform = _platform_skill(skill_set, str(post.get("platform", "")))
     if platform is None:
         return None
-    post_format = next((f for f in skill_set.formats if f["id"] == post.get("format")), {})
+    post_format = _format_skill(skill_set, post.get("format"))
     return _platform_problem(
         str(post.get("content", "")), platform, post_format, post.get("visual")
     )
 
 
 def _check_post(
-    tool_input: dict[str, Any], profile: dict[str, Any]
+    tool_input: dict[str, Any], profile: dict[str, Any], already_out: bool = False
 ) -> tuple[str | None, list[str]]:
     """
     Check a post against its platform and format skills and the known sources.
@@ -623,10 +845,10 @@ def _check_post(
         )
     skill_set = skills.load_skills()
     platform_id = tool_input["platform"].lower()
-    platform = next((p for p in skill_set.platforms if p["id"] == platform_id), None)
+    platform = _platform_skill(skill_set, platform_id)
     post_format: dict[str, Any] = {}
     if format_id := tool_input.get("format"):
-        post_format = next((f for f in skill_set.formats if f["id"] == format_id), {})
+        post_format = _format_skill(skill_set, format_id)
         if not post_format:
             known_formats = ", ".join(f["id"] for f in skill_set.formats) or "none defined"
             return (
@@ -642,7 +864,7 @@ def _check_post(
                 [],
             )
     status = tool_input.get("status", "suggested")
-    if platform and status in FULL_POST_STATUSES:
+    if platform and status in FULL_POST_STATUSES and not already_out:
         if problem := _platform_problem(content, platform, post_format, tool_input.get("visual")):
             return f"Not saved: {problem}, then call save_post again.", []
     source_url = tool_input.get("source_url")
@@ -662,15 +884,21 @@ def _check_post(
 
 
 async def _remember_search_sources(org_id: str, results: list[dict[str, Any]]) -> None:
-    """Add web_search result URLs to the research sources so they can be cited and checked."""
+    """
+    Add web_search result URLs to the research sources so they can be cited and checked.
+
+    At most MAX_RESEARCH_SOURCES are kept, so the research can't grow with
+    every search; later results can still be cited, with a warning.
+    """
 
     def add_new(research: dict[str, Any]) -> bool:
+        # A list: research_org writes one, and profile_problem refuses an import without one.
         sources = research.setdefault("sources", [])
-        if not isinstance(sources, list):
-            return False
-        known = {_normalise_url(s.get("url", "")) for s in _source_entries(sources)}
+        known = {_normalise_url(s["url"]) for s in _source_entries(sources)}
         added = False
         for r in results:
+            if len(sources) >= MAX_RESEARCH_SOURCES:
+                break
             if r.get("url") and _normalise_url(r["url"]) not in known:
                 sources.append({"type": "web", "url": r["url"], "title": r.get("title", "")})
                 known.add(_normalise_url(r["url"]))
@@ -693,6 +921,132 @@ def _format_ledger_results(posts: list[dict[str, Any]]) -> str:
             f"{post.get('status', '?')}{scheduled} | {title}"
         )
     return "\n".join(lines)
+
+
+def _format_post(post: dict[str, Any]) -> str:
+    """One post in full, for show_post: its details, then the copy, visual and source."""
+    details = [
+        f"{label}: {post[key]}"
+        for label, key in POST_DETAIL_LABELS
+        if post.get(key) not in (None, "")
+    ]
+    source = " — ".join(str(post[k]) for k in ("source_summary", "source_url") if post.get(k))
+    parts = ["\n".join(details), f"Copy:\n{post.get('content', '')}"]
+    parts += [f"Visual: {post['visual']}"] if post.get("visual") else []
+    parts += [f"Source: {source}"] if source else []
+    return "\n\n".join(parts)
+
+
+def _without_status(shown_post: str) -> str:
+    """A show_post result without its Status line, the one field approval itself changes."""
+    return STATUS_LINE.sub("", shown_post, count=1)
+
+
+def _hidden_character(text: str) -> str | None:
+    """
+    The first character of post text a reader couldn't see, or None.
+
+    The user approves a post as Mackie displays it, so text it can't show (a
+    control code, a tag character, variation selectors after an emoji, which
+    can spell out a hidden instruction) would be approved unread.
+    """
+    for i, char in enumerate(text):
+        if char in VISIBLE_WHITESPACE:
+            continue
+        before, after = text[i - 1 : i], text[i + 1 : i + 2]
+        if char in JOINERS and before and after and not (before + after).isascii():
+            continue
+        if char in EMOJI_STYLE_SELECTORS and before and unicodedata.category(before) == "So":
+            continue
+        code = ord(char)
+        if unicodedata.category(char) in HIDDEN_CATEGORIES or any(
+            low <= code <= high for low, high in HIDDEN_CHARACTER_RANGES
+        ):
+            return char
+    return None
+
+
+def post_display(shown_post: str) -> str:
+    """
+    How the UIs display a show_post result: as Markdown that shows every character as stored.
+
+    Each punctuation mark is escaped, so no link, comment, HTML or other Markdown
+    can hide part of it, and each line break is kept; it is quoted, to stand
+    apart from the reply around it.
+    """
+    # splitlines: Markdown also ends a line at "\r" and other separators.
+    lines = (MARKDOWN_PUNCTUATION.sub(r"\\\1", line) for line in shown_post.splitlines())
+    return "> " + "  \n> ".join(lines)
+
+
+def _words(text: str) -> str:
+    """
+    The words of a text, lowercased and single-spaced; punctuation, emoji, markup and "_" go.
+
+    A word's combining marks stay in it: Hindi or Thai vowel signs, and accents
+    typed as separate characters (NFC first, so both ways of typing "é" match).
+    """
+    chars = (
+        char if char.isalnum() or unicodedata.category(char).startswith("M") else " "
+        for char in unicodedata.normalize("NFC", text).casefold()
+    )
+    return " ".join("".join(chars).split())
+
+
+def _typed_by_user(text: Any, user_text: str) -> bool:
+    """
+    Whether text is words the user typed, whatever the punctuation, case or spacing.
+
+    A model copying a quote or a pasted post may change those, but not the words.
+    In scripts written without spaces (Chinese, Japanese, Thai) a "word" is a
+    whole clause, so there the characters are compared instead.
+    """
+    words = _words(str(text))
+    if not words:
+        return False
+    if f" {words} " in f" {_words(user_text)} ":
+        return True
+    return _unspaced(words) and words.replace(" ", "") in _words(user_text).replace(" ", "")
+
+
+def _unspaced(text: str) -> bool:
+    """Whether text is in a script written without spaces between words."""
+    return any(unicodedata.name(char, "").startswith(UNSPACED_SCRIPTS) for char in text)
+
+
+def _too_short_for_a_post(text: str) -> bool:
+    """Whether text is shorter than a post: in words, or in characters for a script without spaces."""
+    words = _words(text)
+    if _unspaced(words):
+        return len(words.replace(" ", "")) < MIN_UNSPACED_POST_CHARS
+    return len(words.split()) < MIN_VOICE_EXAMPLE_WORDS
+
+
+def _names_any(text: str, user_text: str) -> bool:
+    """Whether the user typed at least one of the text's words, not counting FUNCTION_WORDS."""
+    words = set(_words(text).split()) - FUNCTION_WORDS
+    return len(_untyped_words(" ".join(words), user_text)) < len(words)
+
+
+def _untyped_words(value: Any, user_text: str) -> list[str]:
+    """
+    The words of a preference value that the user never typed, in order; [] if there are none.
+
+    A value is in every later prompt, so it may only rephrase what the user
+    said with their own words: an injected "link to evil.example" has words
+    the user never used.
+    """
+    typed = set(_words(user_text).split()) | FUNCTION_WORDS
+    unspaced_typed = _words(user_text).replace(" ", "")
+    items = value if isinstance(value, list) else [value]
+    words = _words(" ".join(str(item) for item in items)).split()
+    # "posts" for the "post" they typed, and the other way round.
+    return [
+        word
+        for word in dict.fromkeys(words)
+        if not {word, word.removesuffix("s"), f"{word}s"} & typed
+        and not (_unspaced(word) and word in unspaced_typed)
+    ]
 
 
 def _without_blanks(tool_input: dict[str, Any]) -> dict[str, Any]:
@@ -739,7 +1093,7 @@ def _performance_metrics(tool_input: dict[str, Any]) -> tuple[dict[str, int], st
     }
     for name, value in metrics.items():
         # bool is an int subclass; True is not a count.
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        if not mem.is_count(value) or value < 0:
             return {}, f"Error: {name} {value!r} must be a whole number of 0 or more."
     if not metrics and not tool_input.get("note"):
         return {}, (
@@ -750,43 +1104,55 @@ def _performance_metrics(tool_input: dict[str, Any]) -> tuple[dict[str, int], st
 
 def _invalid_arguments(tool_input: dict[str, Any]) -> str:
     """
-    Explain the first status or date argument that is not valid, or return "".
+    Explain the first status, date, text or over-long argument that is not valid, or return "".
 
     The tool schema lists the allowed values, but models do not always follow
     it, and an unknown status or a date like "last week" would be saved, or
     silently compared as text, without this check.
     """
+    for field in ("post_id", *mem.POST_TEXT_FIELDS):
+        if not isinstance(tool_input.get(field, ""), str):
+            return f"Error: {field} must be text, not {type(tool_input[field]).__name__}."
+    for field in mem.POST_TEXT_FIELDS:
+        if hidden := _hidden_character(str(tool_input.get(field) or "")):
+            return (
+                f"Error: {field} has a character readers can't see (U+{ord(hidden):04X}); "
+                "remove it and call again."
+            )
+    for field, limit in FIELD_CHARS.items():
+        if len(str(tool_input.get(field) or "")) > limit:
+            return f"Error: {field} is longer than {limit} characters; shorten it and call again."
     status = tool_input.get("status")
     if status is not None and status not in mem.POST_STATUSES:
         return f"Error: status {status!r} is not one of {', '.join(mem.POST_STATUSES)}."
     for field in ("scheduled_for", "since", "until"):
         value = tool_input.get(field)
-        if value is None:
-            continue
-        try:
-            date.fromisoformat(value)
-        except (TypeError, ValueError):
+        if value is not None and not mem.is_date(value):
             return f"Error: {field} {value!r} is not a date in YYYY-MM-DD format."
     return ""
 
 
-async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> str:
-    """Execute the named tool and return its result string."""
-    validated = tool_name in ("save_post", "update_post_status", "search_ledger")
+async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str, turn: Turn) -> str:
+    """Execute the named tool and return its result string; turn as in handle_tool_call."""
+    validated = tool_name in (
+        "save_post",
+        "update_post_status",
+        "search_ledger",
+        "record_performance",
+        "show_post",
+    )
     if validated and (error := _invalid_arguments(tool_input)):
         return error
+    if tool_name in ("research_org", "refresh_research"):
+        org_url, refusal = await _research_url(org_id, tool_input.get("org_url", ""))
+        if refusal:
+            return refusal
+        result = await _run_research(tool_input["org_name"], org_url, org_id)
     if tool_name == "research_org":
-        result = await _run_research(tool_input["org_name"], tool_input.get("org_url", ""), org_id)
-        await mem.fill_org_details(org_id, tool_input["org_name"], tool_input.get("org_url", ""))
+        await mem.fill_org_details(org_id, tool_input["org_name"])
         return f"{_format_research_summary(tool_input['org_name'], result)}\n\n{RESEARCH_NEXT_STEP}"
 
     elif tool_name == "refresh_research":
-        result = await _run_research(
-            tool_input["org_name"],
-            tool_input.get("org_url", ""),
-            org_id,
-            time.strftime("%Y-%m-%dT%H:%M:%S"),
-        )
         return (
             f"Research refreshed for {tool_input['org_name']}. "
             f"Sources: {len(result.get('sources', []))}. "
@@ -795,18 +1161,24 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
 
     elif tool_name == "web_search":
         max_results = max(1, min(int(tool_input.get("max_results", 5)), MAX_WEB_RESULTS))
-        results = await res.search_web(tool_input["query"], max_results)
-        found = [r for r in results if "error" not in r]
+        found = await res.search_web(tool_input["query"], max_results)
         await _remember_search_sources(org_id, found)
         # Same trust boundary as research results: snippets are third-party text.
         lines = [_wrap_search_result(r, WEB_SEARCH_SNIPPET_CHARS) for r in found]
         return "\n".join(lines) if lines else "No results found."
 
     elif tool_name == "save_post":
-        blocking, warnings = _check_post(tool_input, await mem.load_profile(org_id))
+        status = tool_input.get("status", "suggested")
+        if status in LIVE_STATUSES and not _typed_by_user(tool_input["content"], turn.user_text):
+            return (
+                f"Not saved: a post you wrote can't be saved as {status!r}; only the user "
+                "approves one. Save it as 'draft', show it, and ask the user to approve it."
+            )
+        # A post the user says already went out is recorded as it was, rules or not.
+        already_out = status == "posted"
+        blocking, warnings = _check_post(tool_input, await mem.load_profile(org_id), already_out)
         if blocking:
             return blocking
-        status = tool_input.get("status", "suggested")
         post = {
             # Stored as ids are written in skills/, so "LinkedIn" and "linkedin" are one platform.
             "platform": tool_input["platform"].lower(),
@@ -816,39 +1188,84 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
         }
         post.update({k: tool_input[k] for k in OPTIONAL_POST_FIELDS if tool_input.get(k)})
         post_id = await mem.add_post(org_id, post)
+        if status in LIVE_STATUSES:
+            await mem.add_voice_example(org_id, post["content"], f"{status} {post_id}")
         reply = f"Saved to ledger as {post_id} (status: {status})"
+        if status == "draft":
+            # The prompt says so too, but a live model copied drafts out itself, and approval
+            # then cost the user a turn; the result is where models look next.
+            reply += SHOW_DRAFT_NEXT.format(post_id=post_id)
         return reply + "".join(f"\nWarning: {w}" for w in warnings)
 
     elif tool_name == "update_post_status":
         post_id, status = tool_input["post_id"], tool_input["status"]
         post = await mem.get_post(org_id, post_id)
-        if post and status in LIVE_STATUSES and (problem := _live_post_problem(post)):
+        # Only before approval: a post marked posted already went out as it was.
+        if post and status == "approved" and (problem := _live_post_problem(post)):
             return (
-                f"Not updated: {post_id} can't be {status} yet: {problem}. Save the finished "
-                f'version with save_post (status "draft", parent_id {post_id}), then {status} that one.'
+                f"Not updated: {post_id} can't be approved yet: {problem}. Save the finished "
+                f'version with save_post (status "draft", parent_id {post_id}), show it, and '
+                "ask the user to approve it."
             )
-        if not await mem.update_post_status(org_id, post_id, status):
+        if post and status in LIVE_STATUSES and not turn.has_seen(post):
+            return (
+                f"Not updated: Mackie hasn't shown {post_id} to the user as it is saved, so they "
+                "haven't approved it. Call show_post for it, and ask them to approve it."
+            )
+        previous = await mem.update_post_status(org_id, post_id, status)
+        if previous is None:
             return f"Post {post_id} not found in ledger"
-        # post is the version from before the update, so approving it again adds no duplicate.
-        if status == "approved" and post.get("status") != "approved" and post.get("content"):
+        # Approval makes a post a voice example (once; its content never changes). "Posted"
+        # without approval doesn't: the text that went out may have been changed first.
+        if status == "approved" and previous not in LIVE_STATUSES and post and post.get("content"):
             await mem.add_voice_example(org_id, post["content"], f"approved {post_id}")
         return f"Updated {post_id} → {status}"
 
     elif tool_name == "save_preference":
-        if problem := _preference_size_problem(tool_input) or await _preference_growth_problem(
-            org_id, tool_input
-        ):
+        if not _typed_by_user(tool_input["quote"], turn.user_text):
+            return (
+                "Not saved: quote must be the user's own words from this conversation, copied "
+                "exactly. Save only a preference the user expressed."
+            )
+        key = str(tool_input["key"])
+        if not PREFERENCE_KEY_PATTERN.fullmatch(key):
+            return "Not saved: key must be a short label of lowercase letters, digits and _."
+        if untyped := [
+            word for word in _untyped_words(key, turn.user_text) if word not in PREFERENCE_KEY_WORDS
+        ]:
+            return (
+                f"Not saved: the key has words that are neither the user's nor a usual label "
+                f"({', '.join(untyped[:5])}). Name it with the user's words, or e.g. voice, "
+                "tone, banned_topics, linkedin_voice."
+            )
+        if tool_input["value"] in ([], ""):
+            return "Not saved: the value is empty; use forget_preference to remove one."
+        if untyped := _untyped_words(tool_input["value"], turn.user_text):
+            return (
+                f"Not saved: the value has words the user didn't use ({', '.join(untyped[:5])}). "
+                "Write the value in the user's own words."
+            )
+        if problem := _preference_size_problem(tool_input):
             return f"Not saved: {problem}"
-        await mem.save_preference(
+        if problem := await mem.save_preference(
             org_id,
             tool_input["key"],
             tool_input["value"],
             quote=tool_input.get("quote", ""),
-            append=tool_input.get("append", False),
-        )
+            # A model may send "false" as text; only a real true appends.
+            append=tool_input.get("append") is True,
+            refuse=lambda prefs, quotes: _preference_growth_problem(tool_input, prefs, quotes),
+        ):
+            return f"Not saved: {problem}"
         return f"Preference saved: {tool_input['key']} = {tool_input['value']}"
 
     elif tool_name == "forget_preference":
+        stored = (await mem.load_profile(org_id))["preferences"].get(tool_input["key"], "")
+        named = f"{tool_input['key']} {tool_input.get('value') or ''} {stored}"
+        if not _names_any(named, turn.user_text):
+            return (
+                "Not forgotten: the user didn't name this preference. Ask them which one to forget."
+            )
         if await mem.forget_preference(org_id, tool_input["key"], tool_input.get("value")):
             return f"Forgot preference: {tool_input['key']}" + (
                 f" (removed {tool_input['value']!r})" if tool_input.get("value") else ""
@@ -856,7 +1273,19 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
         return f"No saved preference matches {tool_input['key']!r}"
 
     elif tool_name == "save_voice_example":
-        await mem.add_voice_example(org_id, tool_input["content"], tool_input["note"])
+        content = tool_input["content"]
+        if _too_short_for_a_post(str(content)):
+            return (
+                "Not saved: that is too short to learn a voice from (a post of a few words). "
+                "Don't save it as an example."
+            )
+        if not _typed_by_user(content, turn.user_text):
+            return (
+                "Not saved: a voice example must be a post the user pasted or typed in this "
+                "conversation, copied exactly."
+            )
+        # A fixed source, not one the model writes: the prompt shows it beside the example.
+        await mem.add_voice_example(org_id, content, PASTED_SOURCE)
         return "Saved as a voice example."
 
     elif tool_name == "record_performance":
@@ -864,6 +1293,26 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
         if error:
             return error
         post_id = tool_input["post_id"]
+        post = await mem.get_post(org_id, post_id)
+        if post_id in turn.new_post_ids:
+            return (
+                f"Not recorded: {post_id} was saved after the user's last message, so it can't "
+                "have gone out. Record results for the post the user published."
+            )
+        # The user named it (its id or its title) or has read it: results steer every later post.
+        named = post_id in mem.POST_ID_MENTION.findall(turn.user_text) or _names_any(
+            str((post or {}).get("title") or ""), turn.user_text
+        )
+        if post and not named and not turn.has_seen(post):
+            return (
+                f"Not recorded: the user hasn't named or seen {post_id}. Ask them which post "
+                "the results are for."
+            )
+        if untyped := _untyped_words(tool_input.get("note", ""), turn.user_text):
+            return (
+                f"Not recorded: the note has words the user didn't use ({', '.join(untyped[:5])}). "
+                "Write it in the user's own words."
+            )
         if not await mem.record_performance(org_id, post_id, metrics, tool_input.get("note", "")):
             return f"Post {post_id} not found in ledger"
         reported = ", ".join(f"{value} {name}" for name, value in metrics.items())
@@ -873,9 +1322,13 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str) -> 
         filters = {k: tool_input.get(k) for k in ("status", "platform", "since", "until", "text")}
         return _format_ledger_results(await mem.search_ledger(org_id, **filters))
 
+    elif tool_name == "show_post":
+        post = await mem.get_post(org_id, tool_input["post_id"])
+        return _format_post(post) if post else f"Post {tool_input['post_id']} not found in ledger"
+
     elif tool_name == "generate_calendar":
         posts_per_week = int(tool_input.get("posts_per_week", DEFAULT_POSTS_PER_WEEK))
-        return await _generate_calendar_async(
+        return await _generate_calendar(
             org_id,
             tool_input["month_year"],
             tool_input.get("focus", ""),
@@ -962,27 +1415,21 @@ def _preference_chars(value: Any) -> int:
     return sum(len(str(item)) for item in items)
 
 
-def _quote_chars(note: Any) -> int:
-    """Length of the user's words shown beside a preference in the prompt."""
-    return len(str(note.get("quote") or "")) if isinstance(note, dict) else 0
-
-
-async def _preference_growth_problem(org_id: str, tool_input: dict[str, Any]) -> str:
+def _preference_growth_problem(
+    tool_input: dict[str, Any], prefs: dict[str, Any], quotes: dict[str, str]
+) -> str:
     """
     Say if the save would take a list or all preferences over their caps, or return "".
 
-    The total counts each preference's quote too, as the prompt shows both.
-    Only a save that adds length is refused, so shortening or replacing a
-    preference always works, even in an imported profile past the caps.
+    Called by memory.save_preference with the org locked, given the saved
+    preferences and each one's quote. The total counts each preference's
+    quote too, as the prompt shows both. Only a save that adds length is
+    refused, so shortening or replacing a preference always works, even in an
+    imported profile past the caps.
     """
-    profile = await mem.load_profile(org_id)
-    prefs, notes = profile["preferences"], profile["preference_notes"]
     key, value = tool_input["key"], tool_input["value"]
     before = prefs.get(key, [])
-    after: Any = value
-    if tool_input.get("append"):
-        items = before if isinstance(before, list) else [before]
-        after = items if value in items else items + [value]
+    after = mem.appended(before, value) if tool_input.get("append") is True else value
     before_chars, after_chars = _preference_chars(before), _preference_chars(after)
     if after_chars > max(before_chars, MAX_PREFERENCE_LIST_CHARS):
         return (
@@ -990,11 +1437,11 @@ async def _preference_growth_problem(org_id: str, tool_input: dict[str, Any]) ->
             f"the limit is {MAX_PREFERENCE_LIST_CHARS}. "
             f"Tell the user, and offer to replace {key} with a shorter version."
         )
-    shown_before = before_chars + _quote_chars(notes.get(key))
-    shown_after = after_chars + _quote_chars(tool_input)
+    shown_before = before_chars + len(quotes.get(key) or "")
+    shown_after = after_chars + len(str(tool_input.get("quote") or ""))
     if shown_after <= shown_before:
         return ""
-    shown_now = sum(_preference_chars(v) + _quote_chars(notes.get(k)) for k, v in prefs.items())
+    shown_now = sum(_preference_chars(v) + len(quotes.get(k) or "") for k, v in prefs.items())
     total = shown_now - shown_before + shown_after
     if total > MAX_PREFERENCES_TOTAL_CHARS:
         return (
@@ -1014,7 +1461,8 @@ def _calendar_platform(post: dict[str, Any], platform_ids: list[str]) -> str:
 def _calendar_format(post: dict[str, Any], format_platforms: dict[str, Any]) -> str:
     """The planned post's format if it exists on the post's platform, else "" (a live plan put email in feed_post)."""
     format_id = post.get("format")
-    if format_id not in format_platforms:
+    # A model may send a list or an object here, which can't be looked up.
+    if not isinstance(format_id, str) or format_id not in format_platforms:
         return ""
     allowed = format_platforms[format_id]
     return format_id if allowed is None or str(post.get("platform", "")).lower() in allowed else ""
@@ -1042,9 +1490,7 @@ def _parse_week_plan(text: str) -> list[dict[str, Any]]:
     return [post for post in posts if isinstance(post, dict) and post.get("angle")]
 
 
-async def _generate_calendar_async(
-    org_id: str, month_year: str, focus: str = "", posts_per_week: int = DEFAULT_POSTS_PER_WEEK
-) -> str:
+async def _generate_calendar(org_id: str, month_year: str, focus: str, posts_per_week: int) -> str:
     """
     Generate a 4-week content calendar by running one LLM call per week in parallel.
 

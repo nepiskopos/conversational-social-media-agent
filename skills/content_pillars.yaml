@@ -1,5 +1,6 @@
 # Content pillars define the framework for organizing post suggestions.
-# Each suggestion and calendar entry is labeled with a pillar so the ledger can group by theme.
+# Each suggestion and calendar entry is labeled with a pillar, and the results section shows it,
+# so what performs best can be seen by theme.
 # Mackie sees each pillar's name and description; the examples are notes for people.
 #
 # Safe to edit: add, rename, or remove pillars here without any code changes.

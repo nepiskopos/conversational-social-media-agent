@@ -26,30 +26,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+from agent.config import load_settings  # noqa: E402 - needs the path set above
+
+load_settings(Path(__file__).parent.parent / ".env")
 
 import psycopg
 
-from agent import db  # after load_dotenv and the path change
+from agent import db  # after load_settings and the path change
 from agent import memory as mem
-
-
-def org_id_for(path: Path, profile: dict) -> str:
-    """
-    The org a file belongs to: its "org_id", or the folder of an old data/{org}/profile.json.
-
-    Raises:
-        mem.ProfileError: neither is an org id.
-    """
-    org_id = str(profile.get("org_id") or (path.parent.name if path.name == "profile.json" else ""))
-    if not db.ORG_ID_PATTERN.fullmatch(org_id):
-        raise mem.ProfileError(
-            f"{path}: {org_id!r} is not an org id (lowercase letters, digits and dashes); "
-            'set "org_id" in the file'
-        )
-    return org_id
 
 
 async def import_files(paths: list[Path], check_only: bool) -> int:
@@ -59,13 +44,9 @@ async def import_files(paths: list[Path], check_only: bool) -> int:
         for path in paths:
             try:
                 profile = mem.read_profile_file(path)
-                org_id = org_id_for(path, profile)
+                org_id = mem.profile_org_id(path, profile)
                 if not check_only:
                     await mem.save_profile(org_id, profile)
-            except OSError as e:
-                print(f"Not imported: {path}: can't be read ({e.strerror})")
-                failures += 1
-                continue
             except mem.ProfileError as e:
                 print(f"Not imported: {e}")
                 failures += 1

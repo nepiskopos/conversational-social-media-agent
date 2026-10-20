@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from dotenv import dotenv_values
 
 # Bound before conftest's autouse fixture replaces litellm.acompletion.
 from litellm import acompletion as real_acompletion
@@ -66,8 +67,10 @@ def _chainlit_config() -> dict:
         (("project", "allow_origins"), lambda value: value == []),
         # Logins expire within a day.
         (("project", "user_session_timeout"), lambda value: 0 < value <= ONE_DAY_S),
+        # An edit reruns the turn, but the stored conversation would keep the original.
+        (("features", "edit_message"), lambda value: value is False),
     ],
-    ids=["no-uploads", "no-raw-html", "same-origin", "logins-expire"],
+    ids=["no-uploads", "no-raw-html", "same-origin", "logins-expire", "no-edits"],
 )
 def test_chainlit_settings_protect_the_server_and_sessions(path, allowed):
     value = _chainlit_config()
@@ -111,19 +114,28 @@ def test_compose_keeps_admin_secrets_out_of_the_app_container():
     assert environment["MACKIE_DATABASE_URL"].startswith("postgresql://mackie_app:")
 
 
-def test_compose_refuses_to_start_without_any_password():
+def test_compose_serves_the_app_only_to_this_machine_and_mounts_skills_read_only():
+    """Plain HTTP stays off the network (a TLS proxy serves others); the app can't edit skills."""
+    mackie = _compose_services()["mackie"]
+    assert mackie["ports"] == ["127.0.0.1:8000:8000"]
+    assert "./skills:/app/skills:ro" in mackie["volumes"]
+
+
+def test_compose_refuses_to_start_without_any_password_or_secret():
     """
-    Every password compose defines is ${NAME:?...}: an unset one would otherwise start the
-    database or the default account with an empty password. Blanked ones are not defined.
+    Every password and secret compose defines is ${NAME:?...}: an unset one would otherwise
+    start the database or the default account with an empty password, or a web UI whose
+    every login fails. Blanked ones are not defined.
     """
     defined = {
         (service_name, name): value
         for service_name, service in _compose_services().items()
         for name, value in (service.get("environment") or {}).items()
-        if name.endswith("_PASSWORD") and value != ""
+        if name.endswith(("_PASSWORD", "_SECRET")) and value != ""
     }
     expected = {("postgres", name) for name in COMPOSE_PASSWORDS} | {
-        ("migrate", "MACKIE_DEFAULT_PASSWORD")
+        ("migrate", "MACKIE_DEFAULT_PASSWORD"),
+        ("mackie", "CHAINLIT_AUTH_SECRET"),
     }
     assert set(defined) == expected
     for (_, name), value in defined.items():
@@ -168,6 +180,30 @@ def test_env_example_documents_every_database_and_login_secret_without_a_real_va
         assert ":CHANGE_ME@" in settings[name], name
 
 
+def test_env_example_leaves_every_key_blank():
+    """Any value makes a provider count as configured: a placeholder key became the main model."""
+    keys = {
+        name: value
+        for name, value in dotenv_values(ROOT / ".env.example").items()
+        if name.endswith("_API_KEY")
+    }
+    assert "TAVILY_API_KEY" in keys and "ANTHROPIC_API_KEY" in keys
+    assert {name: value for name, value in keys.items() if value} == {}
+
+
+def test_env_example_puts_comments_on_their_own_lines():
+    """
+    Compose's env_file reads `NAME=  # note` as the value "# note", unlike python-dotenv, so
+    an inline comment works in a local run and breaks the same setting in Docker.
+    """
+    inline = [
+        line
+        for line in (ROOT / ".env.example").read_text().splitlines()
+        if not line.lstrip().startswith("#") and "=" in line and "#" in line
+    ]
+    assert inline == []
+
+
 def test_ci_gives_the_suite_room_and_cleans_up_its_docker_stack():
     """
     Shared runners vary in speed, so CI raises the time budget; and the deployment job must
@@ -179,5 +215,9 @@ def test_ci_gives_the_suite_room_and_cleans_up_its_docker_stack():
     assert float(tests["env"]["MACKIE_TEST_BUDGET_S"]) > 30
     deploy = ci["jobs"]["deploy"]
     assert deploy["env"]["COMPOSE_PROJECT_NAME"] == "mackie-ci"
+    # A hung browser or stack stops within minutes, not GitHub's default six hours.
+    assert all(0 < job["timeout-minutes"] <= 30 for job in ci["jobs"].values())
+    # The jobs only read the repository, so a compromised step can't push or publish.
+    assert ci["permissions"] == {"contents": "read"}
     last = deploy["steps"][-1]
     assert last["if"] == "always()" and "docker compose down --volumes" in last["run"]

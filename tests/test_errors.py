@@ -40,6 +40,14 @@ def _provider_errors() -> list[tuple[Exception, str]]:
     ]
 
 
+def test_no_provider_set_up_is_said_plainly_not_as_a_refused_key():
+    """Regression: with no key in .env, the user was told the AI service refused Mackie's key."""
+    from agent.errors import NO_PROVIDER_MESSAGE, user_message
+
+    error = litellm.AuthenticationError("missing x-api-key", **PROVIDER)
+    assert user_message(error) == NO_PROVIDER_MESSAGE
+
+
 def test_a_too_long_conversation_names_the_button_that_starts_a_new_one():
     """
     The message names the web UI's button by its label constant, so the two can't drift
@@ -63,9 +71,10 @@ def _response(status: int):
     _provider_errors(),
     ids=lambda value: type(value).__name__ if isinstance(value, Exception) else "",
 )
-def test_a_provider_failure_is_explained_without_its_own_text(error, expected):
+def test_a_provider_failure_is_explained_without_its_own_text(error, expected, monkeypatch):
     from agent.errors import user_message
 
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-configured")  # a key that was refused
     shown = user_message(error)
     assert expected in shown
     for leak in (FAKE_KEY, "{", "litellm", "Exception", type(error).__name__):
@@ -88,6 +97,24 @@ def test_a_database_failure_hides_the_server_details(error):
     shown = user_message(error)
     assert shown == UNAVAILABLE_MESSAGE
     assert "10.0.0.5" not in shown and "5432" not in shown
+
+
+def test_a_turn_stopped_at_the_tool_round_limit_asks_for_less_at_once():
+    from langgraph.errors import GraphRecursionError
+
+    from agent.errors import TOO_MANY_STEPS_MESSAGE, user_message
+
+    assert user_message(GraphRecursionError("Recursion limit of 81 reached")) == (
+        TOO_MANY_STEPS_MESSAGE
+    )
+
+
+def test_an_overlong_message_says_the_limit_and_what_to_do():
+    from agent.assistant import MessageTooLong
+    from agent.errors import user_message
+
+    shown = user_message(MessageTooLong("That message is 30,000 characters; the limit is 20,000."))
+    assert shown == "That message is 30,000 characters; the limit is 20,000."
 
 
 def test_a_database_that_is_not_set_up_says_what_to_fix():

@@ -11,8 +11,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Run as an unprivileged user; Chainlit writes its .files and translations under /app.
-RUN useradd --create-home --uid 10001 mackie && chown -R mackie /app
+# Run as an unprivileged user that can't change the app's code or settings
+# (.chainlit/config.toml). Chainlit writes only .files and .chainlit/translations. Bytecode
+# isn't cached, as the user can't write it.
+ENV PYTHONDONTWRITEBYTECODE=1
+RUN useradd --create-home --uid 10001 mackie && mkdir -p .files \
+    && chown -R mackie .files .chainlit/translations
 USER mackie
 
 EXPOSE 8000

@@ -346,6 +346,47 @@ async def test_every_kind_of_org_write_at_once_loses_no_update(database):
     assert profile["research"] is not None and "org_brief" in profile  # research saved too
 
 
+async def test_one_post_approved_in_two_sessions_at_once_is_one_voice_example(database):
+    """Regression: each session read the old status separately, and both added the post."""
+    import agent.memory as mem
+    from agent.tools import Turn, _format_post, handle_tool_call
+
+    await mem.add_post("org", {"platform": "general", "content": "Our post", "status": "draft"})
+    approve = {"post_id": "post_001", "status": "approved"}
+    shown = _format_post(await mem.get_post("org", "post_001"))
+    typed = Turn(user_text="approve it", shown_posts=(shown,))
+    await asyncio.wait_for(
+        asyncio.gather(
+            *(handle_tool_call("update_post_status", approve, "org", typed) for _ in range(5))
+        ),
+        WAIT_S,
+    )
+    assert len((await mem.load_profile("org"))["voice_examples"]) == 1
+
+
+async def test_appends_in_parallel_sessions_cannot_take_a_list_over_its_cap(database):
+    """Regression: the cap was checked outside the transaction that saved, so all passed it."""
+    import agent.memory as mem
+    from agent.tools import MAX_PREFERENCE_LIST_CHARS, Turn, handle_tool_call
+
+    item = "x" * (MAX_PREFERENCE_LIST_CHARS // 4)
+    rules = [f"{n}{item}" for n in range(8)]
+    typed = Turn(user_text=" ".join(["q", *rules]))
+    saves = [
+        handle_tool_call(
+            "save_preference",
+            {"key": "rules", "value": rule, "quote": "q", "append": True},
+            "org",
+            typed,
+        )
+        for rule in rules
+    ]
+    results = await asyncio.wait_for(asyncio.gather(*saves), WAIT_S)
+    rules = (await mem.load_profile("org"))["preferences"]["rules"]
+    assert sum(len(rule) for rule in rules) <= MAX_PREFERENCE_LIST_CHARS
+    assert sum(result.startswith("Not saved") for result in results) == 8 - len(rules)
+
+
 async def test_a_profile_read_is_one_snapshot_while_another_session_replaces_it(database):
     """
     load_profile reads four tables one after another. A whole-profile write that commits

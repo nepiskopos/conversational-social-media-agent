@@ -216,6 +216,14 @@ def test_litellm_prefix_added_to_a_bare_model_name(caplog):
         assert resolve_model() == "hosted_vllm/qwen3-8b"
     with patch.dict("os.environ", _env(GROQ_API_KEY="g", GROQ_MODEL="groq/llama-3.1-8b-instant")):
         assert resolve_model() == "groq/llama-3.1-8b-instant"
+    # LiteLLM can't route these bare names on its own; every call failed before.
+    with patch.dict("os.environ", _env(XAI_API_KEY="x", XAI_MODEL="grok-3-mini")):
+        assert resolve_model() == "xai/grok-3-mini"
+    with patch.dict("os.environ", _env(GEMINI_API_KEY="g", GEMINI_MODEL="gemini-2.0-flash")):
+        assert resolve_model() == "gemini/gemini-2.0-flash"
+    # OpenAI's bare names route natively; newer families must not be flagged as mismatches.
+    with patch.dict("os.environ", _env(OPENAI_API_KEY="o", OPENAI_MODEL="o4-mini")):
+        assert resolve_model() == "o4-mini"
     assert _logged(caplog) == ""
 
 
@@ -364,3 +372,39 @@ def test_a_providers_own_model_stays_with_it_whatever_a_role_names():
     )
     with patch.dict("os.environ", env):
         assert connection_kwargs("openai/glm-5.3-flash")["api_key"] == "z"
+
+
+def test_load_settings_applies_the_time_zone_in_the_env_file(tmp_path, monkeypatch):
+    """Regression: Python reads TZ at start, so a TZ from .env changed nothing outside Docker."""
+    import time
+    from datetime import datetime
+
+    from agent.config import load_settings
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("TZ=America/New_York\n")
+    monkeypatch.delenv("TZ")
+    try:
+        load_settings(env_file)
+        assert datetime(2026, 1, 15, 12).astimezone().utcoffset().total_seconds() == -5 * 3600
+    finally:
+        monkeypatch.setenv("TZ", "UTC")
+        time.tzset()
+
+
+def test_a_blank_tz_in_the_env_file_leaves_the_servers_zone(tmp_path, monkeypatch):
+    """Regression: .env.example's blank "TZ=" switched the server to UTC instead."""
+    import os
+    import time
+
+    from agent.config import load_settings
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("TZ=\n")
+    monkeypatch.delenv("TZ")
+    try:
+        load_settings(env_file)
+        assert "TZ" not in os.environ
+    finally:
+        monkeypatch.setenv("TZ", "UTC")
+        time.tzset()

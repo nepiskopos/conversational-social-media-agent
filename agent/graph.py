@@ -38,7 +38,6 @@ from __future__ import annotations
 import json
 import logging
 import operator
-import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -57,6 +56,7 @@ from psycopg_pool import AsyncConnectionPool
 from . import db
 from . import memory as mem
 from .config import (
+    BACKGROUND_RETRIES,
     background_kwargs,
     connection_kwargs,
     is_anthropic_model,
@@ -64,10 +64,20 @@ from .config import (
     resolve_fast_model,
 )
 from .logs import describe
-from .tools import TOOL_DEFINITIONS, UNPARSED_ARGUMENTS_KEY, handle_tool_call
+from .tools import (
+    SHOWN_POST_PATTERN,
+    TOOL_DEFINITIONS,
+    UNPARSED_ARGUMENTS_KEY,
+    Turn,
+    handle_tool_call,
+    post_display,
+)
 from .untrusted import wrap_untrusted
 
 logger = logging.getLogger(__name__)
+
+# Between the parts of one turn's reply: a model call's text, a displayed post, the next text.
+REPLY_JOINER: str = "\n\n"
 
 # The model sees the newest messages up to MAX_MESSAGES and about WINDOW_TOKENS tokens,
 # estimated as CHARS_PER_TOKEN characters each (no tokenizer fits every provider).
@@ -98,6 +108,15 @@ SUMMARY_MAX_TOKENS: int = 2000
 # provider hands over quickly; the last model keeps the full retries, as nothing comes after it.
 CHAT_RETRIES_BEFORE_FALLBACK: int = 1
 CHAT_RETRIES_LAST_MODEL: int = 3
+# A ceiling, not a target, on the tokens of one reply or set of tool calls.
+REPLY_MAX_TOKENS: int = 4096
+# Tool rounds (summarize → agent → tools) one turn may take. A model stuck calling tools stops
+# there with GraphRecursionError, instead of at LangGraph's default of 10,000 steps, each round
+# a paid call. A real turn takes a handful: research, then a save_post per idea.
+MAX_TOOL_ROUNDS: int = 25
+# LangGraph steps per tool round, and for the final reply plus one save_check round.
+_STEPS_PER_TOOL_ROUND: int = 3
+_STEPS_TO_FINISH: int = 6
 SUMMARY_MESSAGE_CHARS: int = 3000  # research results run ~4k chars; keep most of them
 # The summary's first section; scripts/eval.py looks for the open items under it.
 OPEN_ITEMS_HEADING: str = "Open requests and dates:"
@@ -108,7 +127,9 @@ SUMMARY_INSTRUCTIONS: str = (
     "this form:\n"
     f"{OPEN_ITEMS_HEADING}\n"
     "- every request the user made that isn't done yet, every follow-up Mackie "
-    "promised, and every date, deadline or event mentioned, with what it is for\n"
+    "promised, and every date, deadline or event mentioned, with what it is for; write "
+    "the date itself in each item (e.g. '- Annual walk on June 14: post about it the "
+    "week before')\n"
     "Summary:\n"
     "- facts learned about the organization (programs, events, figures) with their "
     "source URLs; every correction or preference the user expressed; posts discussed "
@@ -124,7 +145,6 @@ LOST_TOOL_RESULT: str = (
     "Error: this call was interrupted and its result was lost; it may or may not have run. "
     "Check with search_ledger before doing it again."
 )
-POST_ID_PATTERN: re.Pattern[str] = re.compile(r"\bpost_\d+\b")
 # Name of the follow-up message the save_check node adds; it is not a user turn.
 SAVE_CHECK_NAME: str = "save_check"
 SAVE_CHECK_INSTRUCTIONS: str = (
@@ -204,47 +224,60 @@ def _answer_lost_tool_calls(messages: list[dict]) -> list[dict]:
     answer, and providers reject every later request in that thread.
     """
     repaired: list[dict] = []
-    open_calls: list[str] = []
+    open_calls: dict[str, str] = {}  # id → tool name, for calls not answered yet
     for message in messages:
         if message["role"] == "tool" and message["tool_call_id"] in open_calls:
-            open_calls.remove(message["tool_call_id"])
+            del open_calls[message["tool_call_id"]]
         elif open_calls:
-            repaired += [
-                {"role": "tool", "tool_call_id": call_id, "name": "", "content": LOST_TOOL_RESULT}
-                for call_id in open_calls
-            ]
-            open_calls = []
+            repaired += _lost_results(open_calls)
+            open_calls = {}
         repaired.append(message)
         if message["role"] == "assistant" and message.get("tool_calls"):
-            open_calls = [call["id"] for call in message["tool_calls"]]
-    repaired += [
-        {"role": "tool", "tool_call_id": call_id, "name": "", "content": LOST_TOOL_RESULT}
-        for call_id in open_calls
+            open_calls = {call["id"]: call["function"]["name"] for call in message["tool_calls"]}
+    return repaired + _lost_results(open_calls)
+
+
+def _lost_results(open_calls: dict[str, str]) -> list[dict]:
+    """A LOST_TOOL_RESULT tool message for each call id, named after its tool."""
+    return [
+        {"role": "tool", "tool_call_id": call_id, "name": name, "content": LOST_TOOL_RESULT}
+        for call_id, name in open_calls.items()
     ]
-    return repaired
 
 
-def _is_user_turn(msg: BaseMessage) -> bool:
+def is_user_turn(msg: BaseMessage) -> bool:
     """True for a message the user sent, as opposed to the save_check follow-up."""
     return isinstance(msg, HumanMessage) and msg.name != SAVE_CHECK_NAME
 
 
 def _turn_start(messages: Sequence[BaseMessage]) -> int:
     """Return the index of the last user message: where the current turn begins."""
-    return max((i for i, msg in enumerate(messages) if _is_user_turn(msg)), default=0)
+    return max((i for i, msg in enumerate(messages) if is_user_turn(msg)), default=0)
 
 
 def turn_reply(messages: Sequence[BaseMessage]) -> str:
     """
     Return the text the user saw for the current turn.
 
-    That is every final reply after the last user message: normally one, two
-    when save_check asked the model to save posts its first reply showed.
+    That is every post Mackie displayed (show_post) and every final reply after
+    the last user message, in order: normally one reply, two when save_check
+    asked the model to save posts its first reply showed.
     """
-    return "\n\n".join(
-        str(msg.content)
-        for msg in messages[_turn_start(messages) :]
-        if isinstance(msg, AIMessage) and not msg.tool_calls and msg.content
+    parts: list[str] = []
+    for msg in messages[_turn_start(messages) :]:
+        if displays_a_post(msg):
+            parts.append(post_display(str(msg.content)))
+        elif isinstance(msg, AIMessage) and not msg.tool_calls and msg.content:
+            parts.append(str(msg.content))
+    return REPLY_JOINER.join(parts)
+
+
+def displays_a_post(msg: BaseMessage) -> bool:
+    """Whether a tool result is a post show_post found, which the UIs display in full."""
+    return (
+        isinstance(msg, ToolMessage)
+        and msg.name == "show_post"
+        and bool(SHOWN_POST_PATTERN.match(str(msg.content)))
     )
 
 
@@ -257,7 +290,7 @@ def _shorten_old_tool_results(messages: list[BaseMessage]) -> list[BaseMessage]:
     the bulk of every long conversation's tokens. The stored history keeps
     every result whole.
     """
-    user_turns = [i for i, msg in enumerate(messages) if _is_user_turn(msg)]
+    user_turns = [i for i, msg in enumerate(messages) if is_user_turn(msg)]
     keep_from = (
         user_turns[-FULL_TOOL_RESULT_TURNS] if len(user_turns) >= FULL_TOOL_RESULT_TURNS else 0
     )
@@ -307,7 +340,7 @@ def _window_start(messages: list[BaseMessage]) -> int:
             break
         first_candidate = i
     for i in range(first_candidate, len(messages)):
-        if _is_user_turn(messages[i]):
+        if is_user_turn(messages[i]):
             return i
     return _turn_start(messages)
 
@@ -319,7 +352,9 @@ def _view_start(messages: list[BaseMessage], summarized_count: int) -> int:
     That is the window's start once the summary covers everything before it.
     Until SUMMARY_BATCH_MESSAGES messages have left the window, they are not
     summarized yet, so the view starts where the summary ends and they stay
-    visible: nothing falls between the summary and the window.
+    visible: nothing falls between the summary and the window. The exception
+    is a summary call that failed: the batch is out of view until the next
+    turn's summary call succeeds, rather than the view growing without limit.
     """
     start = _window_start(messages)
     return start if start - summarized_count >= SUMMARY_BATCH_MESSAGES else summarized_count
@@ -330,7 +365,7 @@ def _render_transcript(messages: list[BaseMessage]) -> str:
     lines: list[str] = []
     for msg in messages:
         if isinstance(msg, HumanMessage):
-            lines.append(f"{'USER' if _is_user_turn(msg) else 'AUTOMATIC CHECK'}: {msg.content}")
+            lines.append(f"{'USER' if is_user_turn(msg) else 'AUTOMATIC CHECK'}: {msg.content}")
         elif isinstance(msg, AIMessage):
             if msg.content:
                 lines.append(f"MACKIE: {msg.content}")
@@ -364,7 +399,7 @@ async def _summarize(model: str, previous_summary: str, dropped: list[BaseMessag
         model=model,
         messages=[{"role": "user", "content": prompt}],
         max_tokens=SUMMARY_MAX_TOKENS,
-        num_retries=3,
+        num_retries=BACKGROUND_RETRIES,
         **background_kwargs(model),
     )
     summary = (response.choices[0].message.content or "").strip()
@@ -479,7 +514,7 @@ async def _open_stream(
                 + history,
                 tools=TOOL_DEFINITIONS,
                 tool_choice="auto",
-                max_tokens=4096,
+                max_tokens=REPLY_MAX_TOKENS,
                 num_retries=(
                     CHAT_RETRIES_BEFORE_FALLBACK if i < len(models) - 1 else CHAT_RETRIES_LAST_MODEL
                 ),
@@ -494,6 +529,10 @@ async def _open_stream(
             )
 
 
+class ReplyCutOff(Exception):
+    """The model's reply stopped before it said it was done, or at its length limit."""
+
+
 async def _read_stream(stream: Any, writer: Callable[[dict], None]) -> tuple[str, dict[int, dict]]:
     """
     Consume a streaming completion: emit each text token, accumulate tool calls.
@@ -501,12 +540,21 @@ async def _read_stream(stream: Any, writer: Callable[[dict], None]) -> tuple[str
     Returns:
         (full_text, tool_calls_raw) — tool_calls_raw maps the chunk index to the
         accumulated {"id", "function": {"name", "arguments"}} of each tool call.
+
+    Raises:
+        ReplyCutOff: the stream ended at the length limit ("length"), or with no
+            finish reason at all. Through LiteLLM only the first happens: its
+            stream wrapper closes every stream with "stop", even one a provider
+            cut off ("Happy to! It's" was saved as a whole reply that way), which
+            nothing here can tell apart.
     """
     text_parts: list[str] = []
     tool_calls_raw: dict[int, dict] = {}
+    finish_reason = None
     async for chunk in stream:
         if not chunk.choices:
             continue  # a usage-only chunk, which some providers send at the end
+        finish_reason = chunk.choices[0].finish_reason or finish_reason
         delta = chunk.choices[0].delta
         if delta.content:
             text_parts.append(delta.content)
@@ -524,6 +572,8 @@ async def _read_stream(stream: Any, writer: Callable[[dict], None]) -> tuple[str
                     tool_calls_raw[idx]["function"]["name"] = function.name
                 if function and function.arguments:
                     tool_calls_raw[idx]["function"]["arguments"] += function.arguments
+    if finish_reason in (None, "length"):
+        raise ReplyCutOff(f"the reply stream ended with finish reason {finish_reason!r}")
     return "".join(text_parts), tool_calls_raw
 
 
@@ -577,7 +627,7 @@ def _build_call_model(
         if tool_calls_raw:
             if full_text:
                 # Keep pre-tool text ("Let me research that…") apart from the reply that follows.
-                writer({"type": "text", "content": "\n\n"})
+                writer({"type": "text", "content": REPLY_JOINER})
             tool_calls = [
                 {
                     "id": tool_calls_raw[idx]["id"],
@@ -607,7 +657,9 @@ def _build_call_tools() -> Callable[[AgentState], Awaitable[dict]]:
         writer = get_stream_writer()
         for tc in last.tool_calls:
             t0 = time.time()
-            result = await handle_tool_call(tc["name"], tc["args"], state["org_id"])
+            # Read again for each call: a save_post earlier in this message adds a new post.
+            turn = Turn.from_messages([*state["messages"], *tool_messages], is_user_turn)
+            result = await handle_tool_call(tc["name"], tc["args"], state["org_id"], turn)
             entry = {
                 "tool": tc["name"],
                 "input_preview": json.dumps(tc["args"])[:300],
@@ -615,9 +667,13 @@ def _build_call_tools() -> Callable[[AgentState], Awaitable[dict]]:
                 "latency_ms": round((time.time() - t0) * 1000),
             }
             writer({"type": "tool_step", **entry})
-            tool_messages.append(
-                ToolMessage(content=str(result), tool_call_id=tc["id"], name=tc["name"])
-            )
+            message = ToolMessage(content=str(result), tool_call_id=tc["id"], name=tc["name"])
+            if displays_a_post(message):
+                # Shown by Mackie, not left to the model: approval relies on it (tools.Turn).
+                writer(
+                    {"type": "text", "content": REPLY_JOINER + post_display(result) + REPLY_JOINER}
+                )
+            tool_messages.append(message)
         return {"messages": tool_messages}
 
     return call_tools
@@ -637,14 +693,14 @@ async def _unsaved_post_ids(state: AgentState) -> list[str]:
     turn = messages[_turn_start(messages) :]
     if any(isinstance(msg, HumanMessage) and msg.name == SAVE_CHECK_NAME for msg in turn):
         return []
-    shown = set(POST_ID_PATTERN.findall(str(messages[-1].content)))
+    shown = set(mem.POST_ID_MENTION.findall(str(messages[-1].content)))
     if not shown:
         return []
     mentioned = {
         post_id
         for msg in turn
         if isinstance(msg, (HumanMessage, ToolMessage))
-        for post_id in POST_ID_PATTERN.findall(str(msg.content))
+        for post_id in mem.POST_ID_MENTION.findall(str(msg.content))
     }
     ledger = await mem.get_ledger(state["org_id"])
     unsaved = shown - mentioned - {post.get("id") for post in ledger}
@@ -671,7 +727,7 @@ def _build_save_check() -> Callable[[AgentState], Awaitable[dict]]:
                 "latency_ms": 0,
             }
         )
-        writer({"type": "text", "content": "\n\n"})
+        writer({"type": "text", "content": REPLY_JOINER})
         instructions = SAVE_CHECK_INSTRUCTIONS.format(ids=", ".join(ids))
         return {"messages": [HumanMessage(content=instructions, name=SAVE_CHECK_NAME)]}
 
@@ -760,7 +816,8 @@ async def build_graph(model: str, org_id: str) -> AsyncIterator[Any]:
     window into a running summary), agent (calls LLM), tools (dispatches tool
     calls) and save_check (asks the model to save posts it showed unsaved) —
     looping summarize → agent → tools → summarize until the LLM returns a text
-    reply, with at most one save_check round after it. Conversation history,
+    reply, with at most one save_check round after it, and at most
+    MAX_TOOL_ROUNDS tool rounds (then GraphRecursionError). Conversation history,
     the summary and its coverage are persisted keyed by the thread_id in the
     invoke config, which must belong to org_id ("{org_id}" or "{org_id}:...").
     Use astream(stream_mode="custom") to receive real-time tool and text
@@ -795,4 +852,5 @@ async def build_graph(model: str, org_id: str) -> AsyncIterator[Any]:
     # Back through summarize: a long tool loop can push older turns out mid-turn.
     builder.add_edge("tools", "summarize")
     builder.add_edge("save_check", "summarize")
-    yield builder.compile(checkpointer=checkpointer)
+    step_limit = MAX_TOOL_ROUNDS * _STEPS_PER_TOOL_ROUND + _STEPS_TO_FINISH
+    yield builder.compile(checkpointer=checkpointer).with_config(recursion_limit=step_limit)

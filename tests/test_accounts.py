@@ -13,13 +13,6 @@ from unittest.mock import patch
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def cheap_hashing():
-    """scrypt at its real cost takes ~50 ms per hash; the rules don't depend on the cost."""
-    with patch("agent.accounts.SCRYPT_N", 2**4):
-        yield
-
-
 def test_a_password_hash_verifies_only_its_own_password():
     from agent.accounts import hash_password, verify_password
 
@@ -237,6 +230,19 @@ async def test_a_user_opens_a_new_org_and_becomes_its_member(database):
     assert await accounts.open_org(alice.user_id, "org-a")
 
 
+@pytest.mark.parametrize("setting", ["false", "False", "0", "no", "off"])
+async def test_only_admins_create_orgs_when_users_may_not(database, monkeypatch, setting):
+    """With MACKIE_USERS_CREATE_ORGS=false, nobody claims an org before its team arrives."""
+    from agent import accounts
+
+    monkeypatch.setenv("MACKIE_USERS_CREATE_ORGS", setting)
+    alice = await accounts.create_user("alice", "a long passphrase")
+    assert not await accounts.open_org(alice.user_id, "org-a")
+    assert await accounts.list_users() == [("alice", [])]
+    await accounts.grant("alice", "org-a")
+    assert await accounts.open_org(alice.user_id, "org-a")
+
+
 async def test_a_user_cannot_open_someone_elses_org(database):
     from agent import accounts
 
@@ -313,3 +319,20 @@ async def test_has_access_follows_memberships_and_deleted_accounts(database):
     await accounts.grant("alice", "org-a")
     await accounts.delete_user("alice")
     assert not await accounts.has_access(alice.user_id, "org-a")
+
+
+async def test_a_password_change_ends_sessions_opened_with_the_old_one(database):
+    """Regression: after passwd, a stolen login cookie kept working for up to a day."""
+    from agent import accounts
+
+    alice = await accounts.create_user("alice", "a long passphrase")
+    await accounts.grant("alice", "org-a")
+    logged_in = await accounts.authenticate("alice", "a long passphrase")
+    assert logged_in == alice == await accounts.get_user(alice.user_id)
+    assert await accounts.has_access(alice.user_id, "org-a", alice.session_key)
+    await accounts.set_password("alice", "another long passphrase")
+    assert not await accounts.has_access(alice.user_id, "org-a", alice.session_key)
+    assert await accounts.has_access(alice.user_id, "org-a")  # scripts: no session to check
+    renewed = await accounts.get_user(alice.user_id)
+    assert renewed.session_key != alice.session_key
+    assert await accounts.has_access(alice.user_id, "org-a", renewed.session_key)

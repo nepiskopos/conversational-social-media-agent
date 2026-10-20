@@ -3,8 +3,9 @@ Write an organization's memory to a JSON file a person can read and edit.
 
 Owns: the export command. The file holds what Mackie learned (preferences
 with the user's words, voice examples, research and brief, any content
-pillars of its own) and the post ledger with reported results; scripts/import_profiles.py loads it back. Does not own the format
-(agent/memory.py).
+pillars of its own) and the post ledger with reported results;
+scripts/import_profiles.py loads it back. An org with nothing stored, such as
+a misspelled name, is refused. Does not own the format (agent/memory.py).
 
 Usage (from the project root):
     python scripts/export_profile.py "BRCA Strong" > brca-strong.json
@@ -22,13 +23,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+from agent.config import load_settings  # noqa: E402 - needs the path set above
+
+load_settings(Path(__file__).parent.parent / ".env")
 
 import psycopg
 
-from agent import db  # after load_dotenv and the path change
+from agent import db  # after load_settings and the path change
 from agent import memory as mem
 
 
@@ -39,6 +41,12 @@ async def export(org: str, output: Path | None) -> int:
         if not org_id:
             raise ValueError(f"{org!r} is not an organization name")
         profile = await mem.load_profile(org_id)
+        # A misspelled name would export an empty profile, which an import turns into a new org.
+        if profile == mem.default_profile(org_id):
+            raise ValueError(
+                f"nothing is stored for {org_id} yet; check the name "
+                "(scripts/users.py list shows each user's organizations)"
+            )
     except (ValueError, db.DatabaseError, psycopg.Error) as e:
         print(f"Export failed: {e}", file=sys.stderr)
         return 1
@@ -48,7 +56,7 @@ async def export(org: str, output: Path | None) -> int:
     if output is None:
         sys.stdout.write(text)
     else:
-        output.write_text(text)
+        output.write_text(text, encoding="utf-8")  # what read_profile_file reads
         print(f"Wrote {org_id} to {output}.", file=sys.stderr)
     return 0
 

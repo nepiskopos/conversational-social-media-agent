@@ -12,7 +12,9 @@ services:
       - ./docker/postgres-init.sh:/docker-entrypoint-initdb.d/10-mackie.sh:ro
     # No ports: only the services below can reach the database.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d mackie"]
+      # Over TCP, as the others connect: on first start the image's temporary setup server
+      # answers on the Unix socket only, so a socket check could pass before setup is done.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d mackie"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -28,6 +30,7 @@ services:
       # The account that can always log in; created once, never changed after.
       MACKIE_DEFAULT_USERNAME: ${MACKIE_DEFAULT_USERNAME:-admin}
       MACKIE_DEFAULT_PASSWORD: ${MACKIE_DEFAULT_PASSWORD:?set MACKIE_DEFAULT_PASSWORD in .env}
+      MACKIE_LOG_LEVEL: ${MACKIE_LOG_LEVEL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -35,11 +38,14 @@ services:
   mackie:
     build: .
     ports:
-      - "8000:8000"
+      # This machine only: put an HTTPS reverse proxy in front for other machines (README).
+      - "127.0.0.1:8000:8000"
     env_file:
       - .env
     environment:
       MACKIE_DATABASE_URL: postgresql://mackie_app:${MACKIE_APP_PASSWORD}@postgres:5432/mackie
+      # Signs login sessions; without it the stack would start and every login would fail.
+      CHAINLIT_AUTH_SECRET: ${CHAINLIT_AUTH_SECRET:?set CHAINLIT_AUTH_SECRET in .env (openssl rand -hex 32)}
       # env_file passes all of .env; these stay out of the app, so a compromised app
       # can't log in as the superuser or the schema owner.
       MACKIE_MIGRATION_URL: ""
@@ -49,8 +55,8 @@ services:
       MACKIE_APP_PASSWORD: ""
     volumes:
       # Skills are mounted so a non-engineer can add or edit a platform, content type
-      # or format YAML without rebuilding the image
-      - ./skills:/app/skills
+      # or format YAML without rebuilding the image; read-only, as Mackie never writes them
+      - ./skills:/app/skills:ro
     depends_on:
       migrate:
         condition: service_completed_successfully

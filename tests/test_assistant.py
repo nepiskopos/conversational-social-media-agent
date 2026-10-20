@@ -94,6 +94,7 @@ SOURCES = [
             [],
             ["Research sources"],
         ),
+        (_profile(website="https://org.example"), ["**Website:** https://org.example"], []),
         (
             _profile(
                 content_pillars=[{"name": "Custom Pillar", "description": "Our unique focus area"}]
@@ -109,6 +110,7 @@ SOURCES = [
         "ledger",
         "sources",
         "no-sources",
+        "website",
         "own-pillars",
     ],
 )
@@ -181,27 +183,6 @@ async def test_clear_history_empties_only_its_own_thread_and_keeps_org_memory(da
     assert (await load_profile("org"))["preferences"] == {"voice": "warm"}
 
 
-async def test_system_prompt_includes_todays_date(database):
-    from datetime import date
-
-    prompt = await _full_prompt("org")
-    assert f"{date.today():%B %d, %Y}" in prompt
-
-
-async def test_system_prompt_blocks_put_ledger_and_prefs_in_per_turn_block(database):
-    from agent.assistant import _build_system_prompt_blocks
-    from agent.memory import add_post, save_preference
-
-    await save_preference("org", "voice", "playful and punchy")
-    await add_post("org", {"platform": "instagram", "content": "Volunteer spotlight"})
-
-    stable, per_turn = await _build_system_prompt_blocks("org")
-
-    assert "Security Policy" in stable and "Platform Guidelines" in stable
-    assert "playful and punchy" in per_turn and "Volunteer spotlight" in per_turn
-    assert "playful and punchy" not in stable and "Volunteer spotlight" not in stable
-
-
 async def test_stable_block_is_byte_identical_when_only_per_turn_state_changes(database):
     """The cached prefix survives a turn's writes and a new day; any byte change re-bills it."""
     from datetime import date, timedelta
@@ -229,6 +210,7 @@ async def test_stable_block_is_byte_identical_when_only_per_turn_state_changes(d
         stable_tomorrow, per_turn_tomorrow = await _build_system_prompt_blocks("org")
 
     assert stable_before == stable_after == stable_tomorrow
+    assert "Security Policy" in stable_before and "Platform Guidelines" in stable_before
     # The changes did reach the prompt, in the per-turn block.
     assert "Tutor spotlight" in per_turn_after and "Our tutors rock" in per_turn_after
     assert per_turn_after != per_turn_before
@@ -525,6 +507,7 @@ async def test_system_prompt_describes_the_job_and_the_approval_rule(database):
         "record_performance",
         "Lead with what needs doing",
         "Nothing goes live without the user's approval",
+        "Then call `show_post` with its id",
         'call `update_post_status` with status "approved"',
     ):
         assert part in stable
@@ -660,24 +643,37 @@ def test_count_noun_uses_the_right_form():
     assert count_noun(3, "draft", "drafts") == "3 drafts"
 
 
-@pytest.mark.parametrize("removal", ["revoke", "delete the account"])
+async def test_for_user_opens_the_users_own_thread_in_each_interface(database):
+    from agent import accounts
+    from agent.assistant import Assistant
+
+    sam = accounts.User(7, "sam", "key")
+    web, cli = Assistant.for_user("org", sam, "web"), Assistant.for_user("org", sam, "cli")
+    assert (web.thread_id, cli.thread_id) == ("org:web-user-7", "org:cli-user-7")
+    assert (web.user_id, web.session_key) == (7, "key")
+
+
+@pytest.mark.parametrize("removal", ["revoke", "delete the account", "change the password"])
 async def test_removing_access_stops_an_open_conversation_at_its_next_message(database, removal):
     """The check runs before every turn and reset, so an open session can't keep using the org."""
     from agent import accounts
     from agent.assistant import Assistant
     from agent.graph import build_graph
 
-    with patch("agent.accounts.SCRYPT_N", 2**4):
-        user = await accounts.create_user("sam", "a long passphrase")
+    user = await accounts.create_user("sam", "a long passphrase")
     await accounts.grant("sam", "org")
-    assistant = Assistant("org", thread_id="org:tab", user_id=user.user_id)
+    assistant = Assistant(
+        "org", thread_id="org:tab", user_id=user.user_id, session_key=user.session_key
+    )
     model = AsyncMock(side_effect=lambda **_: text_stream("Hello"))
     with patch("agent.graph.litellm.acompletion", new=model):
         assert await assistant.chat("first") == "Hello"
         if removal == "revoke":
             await accounts.revoke("sam", "org")
-        else:
+        elif removal == "delete the account":
             await accounts.delete_user("sam")
+        else:
+            await accounts.set_password("sam", "another long passphrase")
         with pytest.raises(accounts.AccessRevoked, match="no longer have access to org"):
             await assistant.chat("second")
         with pytest.raises(accounts.AccessRevoked):
@@ -728,3 +724,52 @@ async def test_recent_exchanges_lists_only_what_the_user_saw(database):
         ("assistant", "You're welcome"),
     ]
     assert await assistant.recent_exchanges(0) == []
+
+
+async def test_recent_exchanges_show_the_posts_mackie_displayed(database):
+    """Regression: a resumed chat asked "Approve this draft?" without the draft it displayed."""
+    from agent.assistant import Assistant
+    from agent.memory import add_post
+    from agent.tools import post_display
+
+    await add_post("org", {"platform": "general", "content": "Meet Ana"})
+    model = AsyncMock(
+        side_effect=[
+            tool_call_stream("tc_1", "show_post", '{"post_id": "post_001"}'),
+            text_stream("Approve this draft?"),
+        ]
+    )
+    assistant = Assistant("org")
+    with patch("agent.graph.litellm.acompletion", new=model):
+        await assistant.chat("Show me the draft")
+
+    [user, display, reply] = await assistant.recent_exchanges(10)
+    assert display[0] == "assistant" and display[1].startswith(post_display("Post: post_001"))
+    assert "Meet Ana" in display[1] and reply == ("assistant", "Approve this draft?")
+
+
+async def test_an_overlong_message_is_refused_before_it_reaches_the_model_or_history(database):
+    """One huge paste must not fill the model's context or every later turn's history."""
+    from agent.assistant import MAX_MESSAGE_CHARS, Assistant, MessageTooLong
+
+    assistant = Assistant("org")
+    model = AsyncMock(side_effect=lambda **_: text_stream("ok"))
+    with patch("agent.graph.litellm.acompletion", new=model):
+        with pytest.raises(MessageTooLong, match="the limit is 20,000"):
+            await assistant.chat("x" * (MAX_MESSAGE_CHARS + 1))
+        with pytest.raises(MessageTooLong):
+            async for _ in assistant.achat_stream("x" * (MAX_MESSAGE_CHARS + 1)):
+                pass
+        assert await assistant.chat("x" * MAX_MESSAGE_CHARS) == "ok"
+    assert model.await_count == 1
+    assert [len(text) for _, text in await assistant.recent_exchanges(5)] == [MAX_MESSAGE_CHARS, 2]
+
+
+def test_a_long_source_title_is_cut_in_the_prompt():
+    """Third-party page titles appear in every prompt; a long one must not take it over."""
+    from agent.assistant import SOURCE_TITLE_CHARS, _build_org_section
+
+    source = {"type": "news", "url": "https://n.example", "title": "T" * 1000}
+    section = _build_org_section({"name": "Org", "research": {"sources": [source]}})
+    assert f"- [news] {'T' * SOURCE_TITLE_CHARS} — https://n.example" in section
+    assert "T" * (SOURCE_TITLE_CHARS + 1) not in section

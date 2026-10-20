@@ -3,7 +3,8 @@ User accounts and which orgs each user may open.
 
 Owns: password hashing (scrypt from the standard library, a random salt per
 password, compared in constant time), logging in with a lockout after
-repeated failures, creating and removing users, and org memberships: a user
+repeated failures, creating and removing users, the session key that ends
+a user's sessions when their password changes, and org memberships: a user
 opens only the orgs they belong to, and becomes a member of an org they
 create. Usernames are case-insensitive.
 Does not own the login screens (app.py, main.py), the admin commands
@@ -18,12 +19,11 @@ import functools
 import hashlib
 import hmac
 import logging
+import os
 import re
 import secrets
 from dataclasses import dataclass
 from datetime import timedelta
-
-from psycopg import errors
 
 from . import db
 from .logs import safe
@@ -53,12 +53,28 @@ RETURNING locked_until > now() AS locked
 logger = logging.getLogger(__name__)
 
 
+# Hex characters of a session key; it only has to change when the password hash does.
+SESSION_KEY_CHARS: int = 32
+
+
 @dataclass(frozen=True)
 class User:
-    """A logged-in user."""
+    """
+    A logged-in user.
+
+    session_key is derived from the stored password hash, so it changes with
+    the password: a login session keeps it and has_access compares it, so a
+    password change ends sessions that were opened with the old password.
+    """
 
     user_id: int
     username: str
+    session_key: str = ""
+
+
+def _session_key(password_hash: str) -> str:
+    """The session key for a password hash (see User)."""
+    return hashlib.sha256(password_hash.encode()).hexdigest()[:SESSION_KEY_CHARS]
 
 
 class AccountError(Exception):
@@ -138,36 +154,9 @@ def _check_password_strength(password: str) -> None:
         raise AccountError(f"A password needs at least {MIN_PASSWORD_CHARS} characters.")
 
 
-async def create_user(username: str, password: str) -> User:
+async def _insert_user(username: str, password: str) -> User | None:
     """
-    Create an account.
-
-    Raises:
-        AccountError: the username is taken or invalid, or the password too short.
-    """
-    name = normalize_username(username)
-    _check_password_strength(password)
-    password_hash = await asyncio.to_thread(hash_password, password)
-    try:
-        async with db.transaction() as conn:
-            row = await (
-                await conn.execute(
-                    "INSERT INTO users (username, password_hash) VALUES (%s, %s) RETURNING user_id",
-                    (name, password_hash),
-                )
-            ).fetchone()
-    except errors.UniqueViolation as e:
-        raise AccountError(f"The username {name} is taken.") from e
-    logger.info("Account created: %s", safe(name))
-    return User(row["user_id"], name)
-
-
-async def ensure_user(username: str, password: str) -> bool:
-    """
-    Create the account unless one with this username exists; an existing one is left as it is.
-
-    Returns:
-        True if the account was created.
+    Create an account; None if the username is taken.
 
     Raises:
         AccountError: the username is invalid or the password too short.
@@ -183,9 +172,36 @@ async def ensure_user(username: str, password: str) -> bool:
                 (name, password_hash),
             )
         ).fetchone()
-    if row is not None:
-        logger.info("Account created: %s", safe(name))
-    return row is not None
+    if row is None:
+        return None
+    logger.info("Account created: %s", safe(name))
+    return User(row["user_id"], name, _session_key(password_hash))
+
+
+async def create_user(username: str, password: str) -> User:
+    """
+    Create an account.
+
+    Raises:
+        AccountError: the username is taken or invalid, or the password too short.
+    """
+    user = await _insert_user(username, password)
+    if user is None:
+        raise AccountError(f"The username {normalize_username(username)} is taken.")
+    return user
+
+
+async def ensure_user(username: str, password: str) -> bool:
+    """
+    Create the account unless one with this username exists; an existing one is left as it is.
+
+    Returns:
+        True if the account was created.
+
+    Raises:
+        AccountError: the username is invalid or the password too short.
+    """
+    return await _insert_user(username, password) is not None
 
 
 async def set_password(username: str, password: str) -> bool:
@@ -195,9 +211,9 @@ async def set_password(username: str, password: str) -> bool:
     Raises:
         AccountError: the password is too short.
     """
+    name = normalize_username(username)
     _check_password_strength(password)
     password_hash = await asyncio.to_thread(hash_password, password)
-    name = normalize_username(username)
     async with db.transaction() as conn:
         cursor = await conn.execute(
             "UPDATE users SET password_hash = %s, failed_logins = 0, locked_until = NULL "
@@ -226,8 +242,9 @@ async def authenticate(username: str, password: str) -> User | None:
     Return the user if the password is right and the account isn't locked, else None.
 
     The answer is the same for an unknown user, a wrong password and a locked
-    account, and each costs one password check, so neither the answer nor its
-    timing reveals which usernames exist. MAX_FAILED_LOGINS wrong passwords in
+    account, and each costs one password check, which takes far longer than
+    anything else here, so neither the answer nor its timing tells which
+    usernames exist (a wrong password also counts it, one quick statement). MAX_FAILED_LOGINS wrong passwords in
     a row lock the account for LOCKOUT. The check runs with no database
     connection held, and the count of wrong passwords goes up in one
     statement, so a flood of guesses neither ties up the pool nor goes
@@ -283,16 +300,20 @@ async def authenticate(username: str, password: str) -> User | None:
         logger.warning("Login refused for %s: the account was locked meanwhile", safe(name))
         return None
     logger.info("Login: %s", safe(name))
-    return User(row["user_id"], name)
+    return User(row["user_id"], name, _session_key(row["password_hash"]))
 
 
 async def get_user(user_id: int) -> User | None:
     """The user with this id, or None if the account has been deleted."""
     async with db.transaction() as conn:
         row = await (
-            await conn.execute("SELECT user_id, username FROM users WHERE user_id = %s", (user_id,))
+            await conn.execute(
+                "SELECT user_id, username, password_hash FROM users WHERE user_id = %s", (user_id,)
+            )
         ).fetchone()
-    return User(row["user_id"], row["username"]) if row else None
+    return (
+        User(row["user_id"], row["username"], _session_key(row["password_hash"])) if row else None
+    )
 
 
 async def user_orgs(user_id: int) -> list[str]:
@@ -306,21 +327,27 @@ async def user_orgs(user_id: int) -> list[str]:
     return [row["org_id"] for row in rows]
 
 
-async def has_access(user_id: int, org_id: str) -> bool:
+async def has_access(user_id: int, org_id: str, session_key: str | None = None) -> bool:
     """
-    True if the user's account exists and they belong to the org.
+    True if the user's account exists, they belong to the org and, given a session key, it is current.
 
-    Checked before every message, so removing a user or their access also
-    stops chat sessions they already have open.
+    Checked before every message, so removing a user or their access, or
+    changing their password, also stops chat sessions they already have open.
+    session_key None skips the password check (scripts have no login).
     """
     async with db.transaction() as conn:
         row = await (
             await conn.execute(
-                "SELECT 1 FROM memberships WHERE user_id = %s AND org_id = %s",
+                "SELECT u.password_hash FROM memberships m JOIN users u USING (user_id) "
+                "WHERE m.user_id = %s AND m.org_id = %s",
                 (user_id, db.check_org_id(org_id)),
             )
         ).fetchone()
-    return row is not None
+    if row is None:
+        return False
+    return session_key is None or hmac.compare_digest(
+        _session_key(row["password_hash"]), session_key
+    )
 
 
 async def open_org(user_id: int, org_id: str) -> bool:
@@ -328,20 +355,25 @@ async def open_org(user_id: int, org_id: str) -> bool:
     True if the user may open the org: they are a member, or it is new and they become its first.
 
     An org that exists and that the user doesn't belong to is refused; an
-    admin adds members with scripts/users.py grant.
+    admin adds members with scripts/users.py grant. With
+    MACKIE_USERS_CREATE_ORGS=false, a new org is refused too, so on a server
+    several organizations share, nobody can claim one before its team arrives.
 
     Raises:
         ValueError: org_id is not a slugify() id.
     """
-    member = None
+    member = created = None
+    setting = os.getenv("MACKIE_USERS_CREATE_ORGS", "").strip().lower()
+    may_create = setting not in ("false", "0", "no", "off")
     async with db.org_transaction(org_id) as conn:
-        created = await (
-            await conn.execute(
-                "INSERT INTO orgs (org_id) VALUES (%s) ON CONFLICT (org_id) DO NOTHING "
-                "RETURNING org_id",
-                (org_id,),
-            )
-        ).fetchone()
+        if may_create:
+            created = await (
+                await conn.execute(
+                    "INSERT INTO orgs (org_id) VALUES (%s) ON CONFLICT (org_id) DO NOTHING "
+                    "RETURNING org_id",
+                    (org_id,),
+                )
+            ).fetchone()
         if created:
             await conn.execute(
                 "INSERT INTO memberships (user_id, org_id) VALUES (%s, %s)", (user_id, org_id)

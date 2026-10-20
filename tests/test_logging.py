@@ -36,7 +36,6 @@ from tests.test_logs import root_log_stream
 from tests.test_ui import FakeChainlit, _import_entry_point
 
 PASSWORD = "correct horse battery"
-FAST_SCRYPT_N = 2**4
 # A failure's log line ends with where it happened (logs.stack()).
 FRAME = 'File "'
 
@@ -51,8 +50,7 @@ def logs(caplog):
 @pytest.fixture
 async def sam(database):
     """The account "sam" (PASSWORD), hashed at a low cost to keep the tests fast."""
-    with patch.object(accounts, "SCRYPT_N", FAST_SCRYPT_N):
-        yield await accounts.create_user("sam", PASSWORD)
+    yield await accounts.create_user("sam", PASSWORD)
 
 
 @pytest.fixture(scope="module")
@@ -101,7 +99,7 @@ async def _cli_session(
         patch.object(accounts, "authenticate", new=authenticate or AsyncMock(return_value=user)),
         patch.object(accounts, "user_orgs", new=AsyncMock(return_value=[])),
         patch.object(accounts, "open_org", new=AsyncMock(return_value=True)),
-        patch.object(main_module, "Assistant", return_value=assistant),
+        patch.object(main_module.Assistant, "for_user", return_value=assistant),
     ):
         await main_module.main()
 
@@ -191,11 +189,10 @@ async def test_a_lockout_is_logged_once_when_the_account_locks(sam, logs):
 
 
 async def test_account_changes_are_logged(database, logs):
-    with patch.object(accounts, "SCRYPT_N", FAST_SCRYPT_N):
-        await accounts.create_user("sam", PASSWORD)
-        await accounts.ensure_user("alex", PASSWORD)
-        await accounts.ensure_user("alex", PASSWORD)  # exists: nothing changes, nothing logged
-        await accounts.set_password("sam", "another long password")
+    await accounts.create_user("sam", PASSWORD)
+    await accounts.ensure_user("alex", PASSWORD)
+    await accounts.ensure_user("alex", PASSWORD)  # exists: nothing changes, nothing logged
+    await accounts.set_password("sam", "another long password")
     await accounts.grant("sam", "food-bank")
     await accounts.revoke("sam", "food-bank")
     await accounts.revoke("sam", "food-bank")  # not a member any more: nothing logged
@@ -211,8 +208,7 @@ async def test_account_changes_are_logged(database, logs):
 
 
 async def test_opening_an_org_is_logged_when_it_is_created_or_refused(sam, logs):
-    with patch.object(accounts, "SCRYPT_N", FAST_SCRYPT_N):
-        alex = await accounts.create_user("alex", PASSWORD)
+    alex = await accounts.create_user("alex", PASSWORD)
     logs.clear()
     assert await accounts.open_org(sam.user_id, "food-bank")
     assert await accounts.open_org(sam.user_id, "food-bank")  # a member: nothing logged
@@ -481,7 +477,7 @@ async def test_a_database_failure_at_login_or_session_start_is_logged_once(app, 
     ):
         await app.start()
     described = "OperationalError: 'connection to db:5432 refused'"
-    assert [(r.name, r.getMessage()) for r in _errors(logs)] == [
+    assert [(r.name, r.getMessage().split("\n")[0]) for r in _errors(logs)] == [
         ("agent.app", f"Login failed: the database can't be reached: {described}"),
         ("agent.app", f"A session couldn't start: {described}"),
     ]
@@ -501,7 +497,7 @@ async def test_a_failed_reset_or_cli_session_is_logged_once(app, main_module, da
     )
     await _cli_session(main_module, ["sam", PASSWORD], None, AsyncMock(side_effect=error))
     described = "OperationalError: 'connection to db:5432 refused'"
-    assert [(r.name, r.getMessage()) for r in _errors(logs)] == [
+    assert [(r.name, r.getMessage().split("\n")[0]) for r in _errors(logs)] == [
         ("agent.app", f"Starting a new conversation failed for food-bank: {described}"),
         ("agent.main", f"Reset failed for food-bank: {described}"),
         ("agent.main", f"The terminal session stopped: {described}"),
@@ -514,7 +510,9 @@ async def test_a_recap_that_cant_load_is_logged_once(app, main_module, sam, logs
     error = psycopg.OperationalError("connection to db:5432 refused")
     recent = AsyncMock(side_effect=error)
     fake = FakeChainlit()
-    session = {"user": SimpleNamespace(metadata={"user_id": sam.user_id})}
+    session = {
+        "user": SimpleNamespace(metadata={"user_id": sam.user_id, "session_key": sam.session_key})
+    }
     with (
         patch.object(app.cl, "Message", side_effect=fake.message),
         patch.object(app.cl, "user_session", MagicMock(get=session.get, set=session.__setitem__)),

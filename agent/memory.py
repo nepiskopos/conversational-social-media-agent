@@ -11,7 +11,7 @@ imported again (scripts/export_profile.py, scripts/import_profiles.py); read_pro
 checks such a file with plain-English messages.
 
 Owns: assembling the profile dict the prompt and tools read, saving or
-replacing it, the org-id guard (slugify), assigning post ids, searching the
+replacing it, making org ids (slugify), assigning post ids, searching the
 ledger, the agenda of posts that need the user's attention, performance
 results reported for posted posts, learned preferences with their
 provenance, voice examples, research, and the tool-call trace.
@@ -26,6 +26,7 @@ import hashlib
 import json
 import math
 import re
+import unicodedata
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -46,7 +47,28 @@ PERFORMANCE_METRICS: tuple[str, ...] = ("reach", *ENGAGEMENT_METRICS)
 # many days after a post went out (platforms need a few days to collect them).
 AGENDA_LOOKAHEAD_DAYS: int = 7
 RESULTS_AFTER_DAYS: int = 3
-POST_ID_PATTERN: re.Pattern[str] = re.compile(r"post_(\d+)")
+POST_ID_PATTERN: re.Pattern[str] = re.compile(r"post_([0-9]+)")
+# A post id written in a message ("post_003"), for finding the ids a text names.
+POST_ID_MENTION: re.Pattern[str] = re.compile(r"\bpost_[0-9]+\b")
+# Hex characters of the name hash slugify adds for letters with no ASCII form.
+SLUG_HASH_CHARS: int = 10
+# Fields of an edited profile that the prompt and tools read as text (None is allowed: left out).
+PROFILE_TEXT_FIELDS: tuple[str, ...] = ("name", "website", "org_brief")
+SOURCE_TEXT_FIELDS: tuple[str, ...] = ("type", "title", "url")
+POST_TEXT_FIELDS: tuple[str, ...] = (
+    "platform",
+    "content",
+    "title",
+    "pillar",
+    "content_type",
+    "format",
+    "visual",
+    "source_url",
+    "source_summary",
+)
+# The longest org name slugify takes; longer text is not a name (and its id wouldn't fit an index).
+MAX_ORG_NAME_CHARS: int = 100
+DATE_PATTERN: re.Pattern[str] = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 # Years a stored time may have: within what every time zone can show and PostgreSQL holds.
 MIN_YEAR: int = 2
 MAX_YEAR: int = 9998
@@ -84,15 +106,45 @@ def slugify(text: str) -> str:
     """
     Convert a display name to an org ID ([a-z0-9-] only).
 
-    A name with no Latin letters or digits (e.g. Greek or Japanese) gets a
-    stable "org-" + hash ID instead of an empty one, which would put every
-    such org under one id. Returns "" for a name with no letters or digits in
-    any script ("", "!!!"), so the UIs ask for the name again.
+    Ids already stored depend on this, so it changes only what collided:
+
+    - Characters other than a-z and 0-9 separate words ("Café" → "caf",
+      "Røde Kors" → "r-de-kors"), after NFKC ("ﬁsh" → "fish").
+    - A name with no a-z or 0-9 at all (Greek, Japanese) gets "org-" and a
+      hash of the name as typed (in NFC, the form names are typed in), as it
+      always has.
+    - A name that mixes them ("日本 Org") adds a hash of its words, ignoring
+      case, spacing and punctuation, so "日本 Org" and "中国 Org" aren't both
+      "org". Modifier letters ("ʻ" in "Hawaiʻi") don't count as another script.
+
+    Returns "" for a name with no letters or digits in any script ("", "!!!")
+    or one longer than MAX_ORG_NAME_CHARS (a pasted paragraph), so the UIs
+    ask for the name again.
     """
-    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    if slug or not any(char.isalnum() for char in text):
+    if len(text.strip()) > MAX_ORG_NAME_CHARS:
+        return ""
+    normal = unicodedata.normalize("NFKC", text)
+    slug = re.sub(r"[^a-z0-9]+", "-", normal.lower()).strip("-")
+    if not slug:
+        if not any(char.isalnum() for char in text):
+            return ""
+        # NFC: the form names are typed in, so their ids stay as they were.
+        return "org-" + _hash(unicodedata.normalize("NFC", text).strip().casefold())
+    if not any(char.isalnum() and _other_script(char) for char in normal):
         return slug
-    return "org-" + hashlib.sha256(text.strip().casefold().encode()).hexdigest()[:10]
+    return f"{slug}-{_hash(' '.join(re.findall(r'\w+', normal.casefold())))}"
+
+
+def _hash(text: str) -> str:
+    """A short stable hash of text, for org ids."""
+    return hashlib.sha256(text.encode()).hexdigest()[:SLUG_HASH_CHARS]
+
+
+def _other_script(char: str) -> bool:
+    """Whether a letter or digit is of another script than Latin ("日" is; "é", "ø", "ʻ" aren't)."""
+    if char.isascii() or unicodedata.category(char) == "Lm":  # modifier letters: no script
+        return False
+    return not unicodedata.name(char, "").startswith("LATIN")
 
 
 def _storable(value: Any) -> Any:
@@ -147,6 +199,27 @@ def _parse_time(value: Any) -> datetime | None:
     except (ValueError, OverflowError):
         return None
     return moment if MIN_YEAR <= moment.year <= MAX_YEAR else None
+
+
+def is_date(value: Any) -> bool:
+    """
+    Whether value is a date written YYYY-MM-DD, as the agenda and date searches compare them.
+
+    date.fromisoformat alone also takes "20261101" and "2026-W45", which
+    would be stored as written and compared as text.
+    """
+    if not isinstance(value, str) or not DATE_PATTERN.fullmatch(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:  # e.g. 2026-02-30
+        return False
+    return True
+
+
+def is_count(value: Any) -> bool:
+    """Whether value is a whole number: an int, but not a bool, which is an int subclass."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def default_profile(org_id: str) -> dict[str, Any]:
@@ -294,17 +367,38 @@ async def load_profile(org_id: str) -> dict[str, Any]:
     return profile
 
 
+def _read_text(path: Path) -> str:
+    """
+    A profile file's text.
+
+    Raises:
+        ProfileError: the file can't be read, or isn't UTF-8 text.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise ProfileError(
+            f"{path} is not saved as UTF-8 text; save it as UTF-8 in your editor."
+        ) from e
+    except OSError as e:
+        raise ProfileError(f"{path}: can't be read ({e.strerror})") from e
+
+
 def read_profile_file(path: Path) -> dict[str, Any]:
     """
     Read a profile exported with scripts/export_profile.py, after a person may have edited it.
 
     Raises:
-        ProfileError: the file is not valid JSON, not a JSON object, or a
-            section has the wrong type; the message names the file and the fix.
+        ProfileError: the file can't be read, is not UTF-8 text, not valid JSON,
+            not a JSON object, or a section has the wrong type; the message names
+            the file and the fix.
     """
+    text = _read_text(path)
     try:
         data = json.loads(
-            path.read_text(), parse_constant=_refuse_constant, parse_float=_finite_float
+            text,
+            parse_constant=_refuse_constant,
+            parse_float=_finite_float,
         )
     except ProfileError as e:
         raise ProfileError(f"{path}: {e}") from e
@@ -332,14 +426,21 @@ def _refuse_constant(name: str) -> None:
     raise ProfileError(f"{name} is not a number PostgreSQL can store; use a plain number or null.")
 
 
+def _is_text(value: Any) -> bool:
+    """Whether a profile field is text, or left out (None)."""
+    return value is None or isinstance(value, str)
+
+
 def profile_problem(data: dict[str, Any]) -> str:
     """
     Describe the first thing in a profile that can't be saved as it is, or return "".
 
-    Checks section types, the fields the prompt relies on (research sources
-    are a list, a post's parent_id is a post id), and what the database
-    constrains: ids look like post_001, fit its counter and are unique,
-    statuses are POST_STATUSES, and dates and times are dates and times.
+    Checks section types, the fields the prompt and tools rely on (the text
+    fields are text, research sources are a list, a post's parent_id is a
+    post id and its scheduled_for a date, a preference is a value or a list
+    of values), and what the database constrains: ids look like
+    post_001, fit its counter and are unique, statuses are POST_STATUSES, and
+    times are times.
     """
     for key in ("post_ledger", "voice_examples"):
         items = data.get(key, [])
@@ -352,14 +453,31 @@ def profile_problem(data: dict[str, Any]) -> str:
         return "research must be a { ... } object, or null to research the org again"
     if not isinstance(data.get("content_pillars"), list | None):
         return "content_pillars must be a list of { ... } entries, or null for the defaults"
-    if not isinstance((data.get("research") or {}).get("sources", []), list):
+    for key in PROFILE_TEXT_FIELDS:
+        if not _is_text(data.get(key)):
+            return f"{key} must be text in quotes"
+    research = data.get("research") or {}
+    if not _is_text(research.get("website_content")):
+        return "research website_content must be text in quotes"
+    sources = research.get("sources", [])
+    if not isinstance(sources, list):
         return "research sources must be a list of { ... } entries"
+    for number, source in enumerate(sources, 1):
+        for field in SOURCE_TEXT_FIELDS:
+            if isinstance(source, dict) and not _is_text(source.get(field)):
+                return f"research source {number} has {field} {source[field]!r}; it must be text"
+    for key, value in data.get("preferences", {}).items():
+        items = value if isinstance(value, list) else [value]
+        if any(isinstance(item, dict | list) for item in items):
+            return f"preference {key!r} must be text, or a list of texts"
     for key, note in data.get("preference_notes", {}).items():
         if not isinstance(note, dict):
             return f"the note for preference {key!r} must be a {{ ... }} object"
         if note.get("learned_at") and _parse_time(note["learned_at"]) is None:
             return f"preference {key!r} has learned_at {note['learned_at']!r}, which is not a date and time"
     for number, example in enumerate(data.get("voice_examples", []), 1):
+        if not all(_is_text(example.get(field)) for field in ("content", "source")):
+            return f"voice example {number}: its content and source must be text"
         if example.get("added_at") and _parse_time(example["added_at"]) is None:
             return f"voice example {number} has added_at {example['added_at']!r}, which is not a date and time"
     seen: set[str] = set()
@@ -374,13 +492,33 @@ def profile_problem(data: dict[str, Any]) -> str:
         if post_id is not None and post_id in seen:
             return f"two posts have the id {post_id}"
         seen.add(post_id)
+        if bad := next((f for f in POST_TEXT_FIELDS if not _is_text(post.get(f))), None):
+            return f"post {number} has {bad} {post[bad]!r}; it must be text"
         if post.get("status", "suggested") not in POST_STATUSES:
             return f"post {number} has status {post.get('status')!r}; use one of {', '.join(POST_STATUSES)}"
         if post.get("created_at") is not None and _parse_time(post["created_at"]) is None:
             return (
                 f"post {number} has created_at {post['created_at']!r}, which is not a date and time"
             )
+        if post.get("scheduled_for") and not is_date(post["scheduled_for"]):
+            return f"post {number} has scheduled_for {post['scheduled_for']!r}; use YYYY-MM-DD"
     return ""
+
+
+def profile_org_id(path: Path, profile: dict[str, Any]) -> str:
+    """
+    The org a profile file belongs to: its "org_id", or the folder of an old data/{org}/profile.json.
+
+    Raises:
+        ProfileError: neither is an org id.
+    """
+    org_id = str(profile.get("org_id") or (path.parent.name if path.name == "profile.json" else ""))
+    if not db.ORG_ID_PATTERN.fullmatch(org_id):
+        raise ProfileError(
+            f"{path}: {org_id!r} is not an org id (lowercase letters, digits and dashes); "
+            'set "org_id" in the file'
+        )
+    return org_id
 
 
 async def save_profile(org_id: str, profile: dict[str, Any]) -> None:
@@ -442,7 +580,7 @@ async def save_profile(org_id: str, profile: dict[str, Any]) -> None:
                         str(key),
                         Jsonb(_storable(value)),
                         str(note.get("quote") or ""),
-                        _parse_time(note.get("learned_at")) if note else None,
+                        _parse_time(note.get("learned_at")),
                     )
                 ),
             )
@@ -481,24 +619,21 @@ async def fill_org_details(org_id: str, name: str, website: str = "") -> None:
         )
 
 
-async def save_research(
-    org_id: str, research: dict[str, Any], brief: str, updated_at: str = ""
-) -> None:
+async def save_research(org_id: str, research: dict[str, Any], brief: str) -> None:
     """
-    Store the org's research and the brief written from it.
+    Store the org's research and the brief written from it, stamped with the current time.
 
     Args:
-        org_id:     The org identifier.
-        research:   What research.research_org returned.
-        brief:      The short org brief for the prompt.
-        updated_at: When a refresh ran, shown to the user; "" keeps the earlier value.
+        org_id:   The org identifier.
+        research: What research.research_org returned.
+        brief:    The short org brief for the prompt.
     """
     async with db.org_transaction(org_id) as conn:
         await _lock_org(conn, org_id)
         await conn.execute(
             "UPDATE orgs SET research = %s, org_brief = %s, "
-            "research_updated_at = coalesce(nullif(%s, ''), research_updated_at) WHERE org_id = %s",
-            (Jsonb(_storable(research)), _storable(brief), updated_at, org_id),
+            "research_updated_at = %s WHERE org_id = %s",
+            (Jsonb(_storable(research)), _storable(brief), _iso(_now(), "seconds"), org_id),
         )
 
 
@@ -518,9 +653,20 @@ async def update_research(org_id: str, change: Callable[[dict[str, Any]], bool])
             )
 
 
+def appended(current: Any, value: Any) -> list[Any]:
+    """A list preference with value added once: a plain value becomes the list's first item."""
+    items = current if isinstance(current, list) else [current]
+    return items if value in items else items + [value]
+
+
 async def save_preference(
-    org_id: str, key: str, value: str, quote: str = "", append: bool = False
-) -> None:
+    org_id: str,
+    key: str,
+    value: str,
+    quote: str = "",
+    append: bool = False,
+    refuse: Callable[[dict[str, Any], dict[str, str]], str] | None = None,
+) -> str:
     """
     Persist a brand preference for the org, with a note of where it came from.
 
@@ -534,26 +680,32 @@ async def save_preference(
         quote:  The user's words that expressed the preference, if any.
         append: Add value to a list under key (e.g. one more banned topic)
                 instead of replacing what is there.
+        refuse: Given every saved preference and each one's quote, with the
+                org locked, says why not to save ("" to save). It runs inside
+                the transaction, so a cap it checks holds against parallel saves.
+
+    Returns:
+        "" if saved, else what refuse said.
     """
     key, value, quote = _storable(key), _storable(value), _storable(quote)
     async with db.org_transaction(org_id) as conn:
         await _lock_org(conn, org_id)
-        new_value: Any = value
-        if append:
-            row = await (
-                await conn.execute(
-                    "SELECT value FROM preferences WHERE org_id = %s AND key = %s", (org_id, key)
-                )
-            ).fetchone()
-            current = row["value"] if row else []
-            items = current if isinstance(current, list) else [current]
-            new_value = items + [value] if value not in items else items
+        rows = await (
+            await conn.execute(
+                "SELECT key, value, quote FROM preferences WHERE org_id = %s", (org_id,)
+            )
+        ).fetchall()
+        prefs = {row["key"]: row["value"] for row in rows}
+        if refuse and (problem := refuse(prefs, {row["key"]: row["quote"] for row in rows})):
+            return problem
+        new_value = appended(prefs.get(key, []), value) if append else value
         await conn.execute(
             "INSERT INTO preferences (org_id, key, value, quote, learned_at) "
             "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (org_id, key) DO UPDATE SET "
             "value = EXCLUDED.value, quote = EXCLUDED.quote, learned_at = EXCLUDED.learned_at",
             (org_id, key, Jsonb(new_value), quote, _now()),
         )
+    return ""
 
 
 async def forget_preference(org_id: str, key: str, value: str | None = None) -> bool:
@@ -605,7 +757,9 @@ async def add_voice_example(org_id: str, content: str, source: str) -> None:
     Remember a post that shows the org's real voice, keeping the newest few.
 
     Voice examples come from posts the org approved, wrote themselves, or
-    rewrote from a draft; the prompt shows them as the style to imitate.
+    rewrote from a draft; the prompt shows them as the style to imitate. A
+    text already kept is not added again (a post approved, reopened and
+    approved again), so it can't push the others out.
 
     Args:
         org_id:  The org identifier.
@@ -614,6 +768,12 @@ async def add_voice_example(org_id: str, content: str, source: str) -> None:
     """
     async with db.org_transaction(org_id) as conn:
         await _lock_org(conn, org_id)
+        kept = await conn.execute(
+            "SELECT 1 FROM voice_examples WHERE org_id = %s AND content = %s",
+            (org_id, _storable(content)),
+        )
+        if await kept.fetchone():
+            return
         await conn.execute(
             "INSERT INTO voice_examples (org_id, content, source, added_at) VALUES (%s, %s, %s, %s)",
             (org_id, _storable(content), _storable(source), _now()),
@@ -658,9 +818,12 @@ async def add_post(org_id: str, post: dict[str, Any]) -> str:
     return post_id
 
 
-async def update_post_status(org_id: str, post_id: str, status: str) -> bool:
+async def update_post_status(org_id: str, post_id: str, status: str) -> str | None:
     """
     Update the status of an existing ledger entry.
+
+    The post's row is locked while its old status is read, so of two
+    sessions approving one post at once, only the first sees it unapproved.
 
     Args:
         org_id:  The org identifier.
@@ -668,14 +831,23 @@ async def update_post_status(org_id: str, post_id: str, status: str) -> bool:
         status:  New status, one of POST_STATUSES.
 
     Returns:
-        True if the post was found and updated; False if post_id does not exist.
+        The post's status before the update; None if post_id does not exist.
     """
+    post_id = _storable(post_id)
     async with db.org_transaction(org_id) as conn:
-        cursor = await conn.execute(
-            "UPDATE posts SET status = %s WHERE org_id = %s AND post_id = %s RETURNING post_id",
-            (status, org_id, _storable(post_id)),
+        row = await (
+            await conn.execute(
+                "SELECT status FROM posts WHERE org_id = %s AND post_id = %s FOR UPDATE",
+                (org_id, post_id),
+            )
+        ).fetchone()
+        if row is None:
+            return None
+        await conn.execute(
+            "UPDATE posts SET status = %s WHERE org_id = %s AND post_id = %s",
+            (status, org_id, post_id),
         )
-        return await cursor.fetchone() is not None
+        return row["status"]
 
 
 async def record_performance(
@@ -717,11 +889,7 @@ def engagement(post: dict[str, Any]) -> int:
     if not isinstance(performance, dict):
         return 0
     # isinstance check: an imported count such as "40" or null must not break every turn.
-    return sum(
-        value
-        for name in ENGAGEMENT_METRICS
-        if isinstance(value := performance.get(name), int) and not isinstance(value, bool)
-    )
+    return sum(value for name in ENGAGEMENT_METRICS if is_count(value := performance.get(name)))
 
 
 def top_performing(ledger: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:

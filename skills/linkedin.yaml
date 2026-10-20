@@ -8,7 +8,7 @@
 # Fields:
 #   kind:          Optional — leave it out; "platform" is the default
 #   name:          Display name referenced in responses (e.g. "LinkedIn") (required)
-#   id:            Machine-readable identifier — must be unique, lowercase, no spaces (required)
+#   id:            Unique identifier: lowercase letters, digits and _ only (required)
 #   tone:          Writing style guide injected into the system prompt each turn
 #   max_length:    Character limit for posts; a longer finished post is not saved (required)
 #   hashtag_count: Number of hashtags a finished post must have, or a range like "3-5"

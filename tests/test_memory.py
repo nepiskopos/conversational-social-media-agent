@@ -14,7 +14,8 @@ writes to one org (test_sessions.py), row-level security and SQL injection
 import json
 import os
 import time
-from datetime import date, datetime
+import unicodedata
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -32,6 +33,9 @@ NINE_AM = datetime(2026, 10, 1, 9).astimezone().isoformat()
         ("--Leading Dashes--", "leading-dashes"),
         # Accented letters are separators, not dropped: the id stays ASCII.
         ("Café Ñoño", "caf-o-o"),
+        # Compatibility characters count as the letters they stand for.
+        ("ﬁsh Club", "fish-club"),
+        ("Tokyo ２ Org", "tokyo-2-org"),
     ],
 )
 def test_slugify_makes_an_id_from_a_name(name, org_id):
@@ -47,10 +51,26 @@ def test_slugify_gives_non_latin_names_distinct_stable_ids():
     assert greek.startswith("org-") and japanese.startswith("org-")
     assert greek != japanese
     assert slugify("Ελληνική Ένωση") == greek
+    # Regression: Latin letters beside them used to be the whole id, so these were one org.
+    mixed = {slugify(name) for name in ("日本 Org", "中国 Org", "Org")}
+    assert len(mixed) == 3 and slugify("日本 Org").startswith("org-")
+    assert slugify("Ένωση 2024").startswith("2024-")
+    # One org however the name is spaced, punctuated or Unicode-normalised.
+    assert slugify("日本  Org.") == slugify("日本 Org")
+    assert slugify(unicodedata.normalize("NFD", "Ελληνική Ένωση")) == greek
+    # Ids stored before stay as they were: Latin letters separate, other scripts hash the same.
+    assert (slugify("Røde Kors"), slugify("Straße e.V.")) == ("r-de-kors", "stra-e-e-v")
+    assert greek == "org-f6adf79fa7"
+    for name, stored in (
+        ("Σύλλογος «Ελπίδα»", "org-c6b590d102"),  # punctuation: the name as typed, as before
+        ("Hawaiʻi Foodbank", "hawai-i-foodbank"),  # a modifier letter is no other script
+    ):
+        assert slugify(name) == stored
 
 
-@pytest.mark.parametrize("name", ["!!!", "  ", "—", "🎉🎉", "-_-"])
-def test_slugify_gives_no_id_to_a_name_without_letters_or_digits(name):
+@pytest.mark.parametrize("name", ["!!!", "  ", "—", "🎉🎉", "-_-", "word " * 21])
+def test_slugify_gives_no_id_to_a_name_without_letters_or_digits_or_too_long(name):
+    """Nor to a pasted paragraph: its id didn't fit the database index, which looked like an outage."""
     from agent.memory import slugify
 
     assert slugify(name) == ""
@@ -215,19 +235,15 @@ async def test_save_profile_round_trip_is_lossless_and_stable(database):
 
 @pytest.fixture
 def set_zone():
-    """Set the process's local time zone for the test; restore it afterwards."""
-    saved = os.environ.get("TZ")
+    """Set the process's local time zone for the test; restore the run's (conftest sets it)."""
+    saved = os.environ["TZ"]
 
     def set_zone(name: str) -> None:
         os.environ["TZ"] = name
         time.tzset()
 
     yield set_zone
-    if saved is None:
-        os.environ.pop("TZ", None)
-    else:
-        os.environ["TZ"] = saved
-    time.tzset()
+    set_zone(saved)
 
 
 async def test_export_and_import_in_another_time_zone_keep_the_same_moments(database, set_zone):
@@ -313,6 +329,16 @@ async def test_a_time_without_an_offset_is_read_as_the_importing_zone(database, 
                 "0001-01-01T00:00:00+14:00",
             )
         ],
+        # Python's \d matches any script's digits; the database's CHECK takes only 0-9.
+        ({"post_ledger": [{"id": "post_\u0663"}]}, "ids look like post_001"),
+        (
+            {"post_ledger": [{"scheduled_for": "next week"}]},
+            "post 1 has scheduled_for 'next week'; use YYYY-MM-DD",
+        ),
+        (
+            {"research": {"sources": [{"url": "https://a.org"}, {"url": 5}]}},
+            "research source 2 has url 5; it must be text",
+        ),
         (
             {"post_ledger": [{"id": "post_99999999999"}]},
             "post 1 has id 'post_99999999999'; the number is too large",
@@ -338,6 +364,16 @@ async def test_a_time_without_an_offset_is_read_as_the_importing_zone(database, 
             {"voice_examples": [{"content": "Hi", "added_at": "yesterday"}]},
             "voice example 1 has added_at 'yesterday', which is not a date and time",
         ),
+        # Regression: each of these passed, then broke every turn or every calendar.
+        (
+            {"research": {"sources": [{"type": ["news"], "url": "https://x.org"}]}},
+            "research source 1 has type ['news']; it must be text",
+        ),
+        ({"research": {"website_content": 12}}, "research website_content must be text"),
+        ({"name": ["Org"]}, "name must be text"),
+        ({"post_ledger": [{"title": 7}]}, "post 1 has title 7; it must be text"),
+        ({"voice_examples": [{"content": {"x": 1}}]}, "voice example 1: its content and source"),
+        ({"preferences": {"voice": {"tone": "warm"}}}, "preference 'voice' must be text"),
     ],
 )
 def test_profile_problem_names_each_mistake(profile, expected):
@@ -354,6 +390,7 @@ def test_profile_problem_names_each_mistake(profile, expected):
         {"research": None, "content_pillars": None},
         {"post_ledger": [{"title": "only a title", "performance": "lots"}]},
         {"post_ledger": [{"id": "post_007", "status": "posted", "created_at": "2026-10-01"}]},
+        {"preferences": {"limit": 3, "banned_topics": ["politics", "religion"]}},
     ],
 )
 def test_profile_problem_accepts_a_valid_profile(profile):
@@ -382,28 +419,35 @@ def test_read_profile_file_returns_a_valid_profile(tmp_path):
         ('{"research": {"score": NaN}}', "NaN is not a number PostgreSQL can store"),
         ('{"research": {"score": -Infinity}}', "-Infinity is not a number PostgreSQL can store"),
         ('{"research": {"score": 1e999}}', "1e999 is too large a number to store"),
+        # An editor that saved it as Latin-1.
+        ('{"name": "Caf\u00e9"}'.encode("latin-1"), "is not saved as UTF-8 text"),
     ],
 )
 def test_read_profile_file_explains_hand_editing_mistakes(tmp_path, text, expected):
     from agent.memory import ProfileError, read_profile_file
 
     path = tmp_path / "profile.json"
-    path.write_text(text)
+    if isinstance(text, bytes):
+        path.write_bytes(text)
+    else:
+        path.write_text(text)
     with pytest.raises(ProfileError) as excinfo:
         read_profile_file(path)
     assert expected in str(excinfo.value)
     assert str(path) in str(excinfo.value)
 
 
-async def test_save_research_stores_research_brief_and_date(database):
+async def test_save_research_stores_research_brief_and_when_it_ran(database):
     from agent.memory import load_profile, save_research
 
-    await save_research("org", {"summary": "first"}, "Brief 1", "2026-10-01")
-    await save_research("org", {"summary": "second"}, "Brief 2")  # "" keeps the date
+    await save_research("org", {"summary": "first"}, "Brief 1")
+    await save_research("org", {"summary": "second"}, "Brief 2")
     profile = await load_profile("org")
     assert profile["research"] == {"summary": "second"}
     assert profile["org_brief"] == "Brief 2"
-    assert profile["research_updated_at"] == "2026-10-01"
+    stamped = datetime.fromisoformat(profile["research_updated_at"])
+    assert stamped.tzinfo is not None
+    assert abs(stamped - datetime.now().astimezone()) < timedelta(minutes=5)
 
 
 async def test_update_research_saves_only_when_the_change_says_so(database):
@@ -498,13 +542,14 @@ async def test_numbers_jsonb_cant_store_are_saved_as_null(database):
     assert preferences == {"limits": [1.5, None], "score": None}
 
 
-async def test_update_post_status_changes_a_post_or_says_there_is_none(database):
+async def test_update_post_status_returns_the_old_status_or_none_for_no_post(database):
     from agent.memory import add_post, get_ledger, update_post_status
 
     post_id = await add_post("org", {"platform": "linkedin", "content": "Hello"})
-    assert await update_post_status("org", post_id, "approved") is True
+    assert await update_post_status("org", post_id, "approved") == "suggested"
     assert (await get_ledger("org"))[0]["status"] == "approved"
-    assert await update_post_status("org", "post_999", "approved") is False
+    assert await update_post_status("org", post_id, "approved") == "approved"
+    assert await update_post_status("org", "post_999", "approved") is None
 
 
 async def test_update_post_status_refuses_an_unknown_status_and_keeps_the_post(database):
@@ -528,7 +573,7 @@ async def test_hand_edited_post_without_fields_does_not_break_ledger_operations(
     assert (post["platform"], post["content"], post["status"]) == ("", "", "suggested")
     assert post["performance"] == "lots"
     assert await search_ledger("org", platform="linkedin", since="2026-01-01") == []
-    assert await update_post_status("org", "post_001", "draft") is True
+    assert await update_post_status("org", "post_001", "draft") == "suggested"
     assert (await get_post("org", "post_001"))["status"] == "draft"
     assert await add_post("org", {"platform": "linkedin", "content": "x"}) == "post_002"
 
@@ -582,6 +627,32 @@ async def test_save_preference_append_builds_list_without_duplicates(database):
     assert (await load_profile("org"))["preferences"]["banned_topics"] == ["politics", "religion"]
 
 
+async def test_save_preference_refusal_sees_every_preference_and_saves_nothing(database):
+    from agent.memory import load_profile, save_preference
+
+    await save_preference("org", "voice", "warm", quote="be warm")
+    seen = []
+
+    def refuse(prefs, quotes):
+        seen.append((prefs, quotes))
+        return "too long"
+
+    assert await save_preference("org", "tone", "plain", refuse=refuse) == "too long"
+    assert seen == [({"voice": "warm"}, {"voice": "be warm"})]
+    assert await save_preference("org", "tone", "plain", refuse=lambda *_: "") == ""
+    assert (await load_profile("org"))["preferences"] == {"voice": "warm", "tone": "plain"}
+
+
+@pytest.mark.parametrize(
+    "current, value, expected",
+    [([], "a", ["a"]), ("a", "b", ["a", "b"]), (["a", "b"], "a", ["a", "b"])],
+)
+def test_appended_adds_a_value_once_and_turns_a_plain_value_into_a_list(current, value, expected):
+    from agent.memory import appended
+
+    assert appended(current, value) == expected
+
+
 async def test_forget_preference_removes_key_and_note(database):
     from agent.memory import forget_preference, load_profile, save_preference
 
@@ -631,6 +702,16 @@ async def test_add_voice_example_keeps_newest(database):
     assert examples[0]["content"] == "post 2"
     assert examples[-1]["content"] == f"post {MAX_VOICE_EXAMPLES + 1}"
     assert examples[0]["source"] == "pasted by user"
+
+
+async def test_add_voice_example_keeps_one_copy_of_a_text(database):
+    """Regression: approved, reopened and approved again, a post pushed out another example."""
+    from agent.memory import add_voice_example, load_profile
+
+    for source in ("pasted by user", "approved post_001", "approved post_001"):
+        await add_voice_example("org", "Our post", source)
+    examples = (await load_profile("org"))["voice_examples"]
+    assert [(e["content"], e["source"]) for e in examples] == [("Our post", "pasted by user")]
 
 
 def _post(post_id: str, created_at: str, **fields) -> dict:
@@ -857,3 +938,29 @@ async def test_read_trace_is_empty_for_an_org_without_calls(database):
     from agent.memory import read_trace
 
     assert await read_trace("org") == []
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("2026-11-03", True),
+        ("2026-02-30", False),  # no such day
+        ("20261103", False),  # Python reads these, but they'd be stored and compared as written
+        ("2026-W45", False),
+        (20261103, False),
+        (None, False),
+    ],
+)
+def test_is_date_takes_only_a_yyyy_mm_dd_date(value, expected):
+    from agent.memory import is_date
+
+    assert is_date(value) is expected
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(0, True), (40, True), (True, False), (4.0, False), ("4", False)]
+)
+def test_is_count_takes_only_a_whole_number(value, expected):
+    from agent.memory import is_count
+
+    assert is_count(value) is expected

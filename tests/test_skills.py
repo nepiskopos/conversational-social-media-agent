@@ -66,11 +66,22 @@ def test_load_skills_ignores_content_pillars_file(skills_dir):
         ("name: No Id\nmax_length: 500\n", "missing required field(s) id"),
         ("id: x\nname: X\nmax_length: lots\n", "max_length must be a whole number"),
         ("kind: video\nid: x\nname: X\n", "kind must be one of"),
+        # A list is unhashable: the kind check itself must not raise on it.
+        ("kind: [a]\nid: x\nname: X\n", "kind must be one of"),
+        # bool is an int in Python, but true is no length.
+        ("id: x\nname: X\nmax_length: true\n", "max_length must be a whole number"),
         ("kind: content_type\nid: x\nname: X\n", "missing required field(s) purpose, structure"),
         ("id: x\nname: [unclosed\n", "not valid YAML"),
         ("- just\n- a list\n", "expected 'field: value' lines"),
         (NOT_UTF8, "not saved as UTF-8"),
         (A_FOLDER, "can't be read"),
+        # Regression: ids are matched lowercased, so "LinkedIn" silently skipped its rules.
+        ("id: LinkedIn\nname: X\nmax_length: 5\n", "'LinkedIn' must be written in lowercase"),
+        ("id: x-twitter\nname: X\nmax_length: 5\n", "'x-twitter' must be written in lowercase"),
+        (
+            "kind: format\nid: x\nname: X\npurpose: p\nstructure: s\nplatforms: [Instagram]\n",
+            "'Instagram' must be written in lowercase",
+        ),
     ],
 )
 def test_load_skills_reports_and_skips_invalid_files(skills_dir, content, expected_problem):
@@ -112,6 +123,7 @@ def test_load_content_pillars_prefers_profile_override(skills_dir):
         ("pillars: [unclosed\n", "not valid YAML"),
         ("- just a list\n", "expected a 'pillars:' list"),
         ("pillars: Community\n", "expected a 'pillars:' list"),
+        ("pillars: 5\n", "expected a 'pillars:' list"),
         ("pillars:\n  - description: no name\n", "every pillar needs a name"),
         (NOT_UTF8, "not saved as UTF-8"),
         (A_FOLDER, "can't be read"),
@@ -142,6 +154,12 @@ def test_load_content_pillars_drops_entries_without_name(skills_dir):
     assert load_content_pillars(profile) == [{"name": "Ok", "description": ""}]
 
 
+def test_per_org_pillars_that_are_not_a_list_mean_no_pillars(skills_dir):
+    from agent.skills import load_content_pillars
+
+    assert load_content_pillars({"content_pillars": 5}) == []
+
+
 @pytest.mark.parametrize(
     "value, expected",
     [
@@ -150,6 +168,7 @@ def test_load_content_pillars_drops_entries_without_name(skills_dir):
         (0, (0, 0)),
         ("a few", None),
         (None, None),
+        (True, None),
     ],
 )
 def test_hashtag_range_parses_common_forms(value, expected):
@@ -181,6 +200,8 @@ def test_shipped_skill_files_are_all_valid():
         (STORY_YAML + "has_caption: no-thanks\n", "has_caption must be true or false"),
         (STORY_YAML + "needs_visual: maybe\n", "needs_visual must be true or false"),
         (STORY_YAML + "platforms: instagram\n", "platforms must be a list"),
+        # Rendered as "on all platforms" but matching none: leaving it out means all.
+        (STORY_YAML + "platforms: []\n", "list the platforms under platforms, or leave it out"),
         # An id like [a, b] is unhashable; the duplicate-id check must not raise on it.
         ("id: [a, b]\nname: X\nmax_length: 100\n", "id must be text"),
     ],

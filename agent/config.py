@@ -18,8 +18,12 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,23 @@ _ROLE_VARIABLES: tuple[tuple[str, str], ...] = (
 # Seconds before an LLM request is abandoned. For a streamed reply it applies to the
 # wait for each chunk, so a long answer is fine but a stalled provider is not.
 LLM_TIMEOUT_S: int = 120
+# LiteLLM retries for a background call with no fallback model (the summary, the org brief).
+BACKGROUND_RETRIES: int = 3
+
+
+def load_settings(env_file: Path) -> None:
+    """
+    Load the .env file into the environment (variables already set win) and apply its TZ.
+
+    The entry points call this before importing the rest of agent/. Python reads
+    TZ when it starts, so a TZ from .env changed nothing outside Docker (where
+    Compose sets it first) until time.tzset() read it again; Windows has no tzset.
+    """
+    load_dotenv(env_file)
+    if not os.environ.get("TZ"):
+        os.environ.pop("TZ", None)  # "TZ=" in .env means unset (the server's zone), not UTC
+    if hasattr(time, "tzset"):
+        time.tzset()
 
 
 @dataclass(frozen=True)
@@ -39,6 +60,10 @@ class _Provider:
     """
     Static descriptor for one LLM provider.
 
+    id:              the name LLM_PROVIDER, FAST_PROVIDER and JUDGE_PROVIDER use.
+    key_env:         variable holding the API key, passed as api_key.
+    model_env:       variable that overrides default_model.
+    default_model:   the model used when model_env is unset.
     model_prefixes:  prefixes a valid model string for this provider starts with;
                      empty means any string is accepted (no mismatch check).
     litellm_prefix:  added in front of the configured model when missing, so a
@@ -89,7 +114,7 @@ PROVIDERS: list[_Provider] = [
         id="openai",
         key_env="OPENAI_API_KEY",
         model_env="OPENAI_MODEL",
-        model_prefixes=("gpt-", "o1-", "o3-", "openai/"),
+        model_prefixes=("gpt-", "o1", "o3", "o4", "chatgpt-", "openai/"),
         default_model="gpt-4o-mini",
         requires=("OPENAI_API_KEY",),
     ),
@@ -97,9 +122,10 @@ PROVIDERS: list[_Provider] = [
         id="xai",
         key_env="XAI_API_KEY",
         model_env="XAI_MODEL",
-        model_prefixes=("grok-", "xai/"),
+        model_prefixes=("xai/",),
         default_model="xai/grok-3-mini",
         requires=("XAI_API_KEY",),
+        litellm_prefix="xai/",
     ),
     _Provider(
         id="google",
@@ -108,6 +134,7 @@ PROVIDERS: list[_Provider] = [
         model_prefixes=("gemini/",),
         default_model="gemini/gemini-2.0-flash",
         requires=("GEMINI_API_KEY",),
+        litellm_prefix="gemini/",
     ),
     _Provider(
         id="mistral",
@@ -252,6 +279,11 @@ def _configured_providers() -> list[_Provider]:
     return [chosen] + [p for p in configured if p is not chosen]
 
 
+def provider_configured() -> bool:
+    """Whether any provider is configured; without one, calls go to the Anthropic default unkeyed."""
+    return bool(_configured_providers())
+
+
 def resolve_model() -> str:
     """
     Resolve the LLM model to use from environment variables.
@@ -383,8 +415,8 @@ def connection_kwargs(model: str) -> dict[str, Any]:
     that role's model, else the first whose prefixes match. Native providers need nothing
     here when their key uses LiteLLM's own variable name, but passing it is
     harmless; OpenAI-compatible endpoints (OpenCode Zen, vLLM, LLM_API_BASE)
-    need both values, since LiteLLM cannot guess them. Unknown models get {}
-    and LiteLLM reads its usual environment variables.
+    need both values, since LiteLLM cannot guess them. Unknown models get only
+    the timeout, and LiteLLM reads its usual environment variables.
 
     Args:
         model: A LiteLLM model string, e.g. from resolve_model() or FAST_MODEL.

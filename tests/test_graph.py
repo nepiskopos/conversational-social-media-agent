@@ -19,7 +19,7 @@ import psycopg
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import END
-from psycopg import errors
+from psycopg import errors, sql
 
 from tests.llm_fakes import completion, text_chunk, text_stream, tool_call_stream
 
@@ -150,6 +150,8 @@ def test_to_litellm_answers_tool_calls_whose_result_was_lost(messages, expected)
         (role, call_id, LOST_TOOL_RESULT if content == LOST else content)
         for role, call_id, content in expected
     ]
+    # Named after the tool called, as some providers refuse a tool result without a name.
+    assert all(m["name"] == "save_post" for m in result if m["role"] == "tool")
 
 
 @pytest.mark.parametrize(
@@ -246,11 +248,11 @@ def test_window_starts_at_a_user_turn(history, first):
     part of the user's turn. A current turn bigger than the window is kept whole, so
     its tool calls stay paired with their results.
     """
-    from agent.graph import MAX_MESSAGES, _is_user_turn, _window_start
+    from agent.graph import MAX_MESSAGES, _window_start, is_user_turn
 
     messages = history(MAX_MESSAGES)
     start = _window_start(messages)
-    assert _is_user_turn(messages[start]) and messages[start].content == first
+    assert is_user_turn(messages[start]) and messages[start].content == first
 
 
 LONG_MESSAGE_CHARS: int = 3_000
@@ -305,17 +307,17 @@ def test_window_is_capped_by_messages_and_by_tokens(history):
         CHARS_PER_TOKEN,
         MAX_MESSAGES,
         WINDOW_TOKENS,
-        _is_user_turn,
         _message_chars,
         _window_start,
+        is_user_turn,
     )
 
     messages = history()
     budget = WINDOW_TOKENS * CHARS_PER_TOKEN
     start = _window_start(messages)
-    one_more_turn = messages[max(i for i in range(start) if _is_user_turn(messages[i])) :]
+    one_more_turn = messages[max(i for i in range(start) if is_user_turn(messages[i])) :]
 
-    assert _is_user_turn(messages[start])
+    assert is_user_turn(messages[start])
     assert sum(map(_message_chars, messages[start:])) <= budget
     assert len(messages) - start <= MAX_MESSAGES
     assert sum(map(_message_chars, one_more_turn)) > budget or len(one_more_turn) > MAX_MESSAGES
@@ -864,6 +866,37 @@ async def test_save_check_node_asks_to_save_the_unsaved_posts(database):
     assert events[1] == {"type": "text", "content": "\n\n"}
 
 
+async def test_a_post_mackie_shows_is_streamed_and_kept_in_the_reply(database):
+    """
+    show_post's display is Mackie's, not the model's: it reaches the screen in full, in both
+    UIs (streamed for the web, in the reply for the terminal), and approval relies on it.
+    """
+    from agent.assistant import Assistant
+    from agent.memory import add_post
+
+    await add_post("org", {"platform": "general", "content": "Meet [Ana](https://x.example)"})
+    model = AsyncMock(
+        side_effect=[
+            tool_call_stream("tc1", "show_post", json.dumps({"post_id": "post_001"})),
+            text_stream("Approve it?"),
+        ]
+    )
+    with patch("agent.graph.litellm.acompletion", new=model):
+        assistant = Assistant("org")
+        streamed = [
+            e["content"] async for e in assistant.achat_stream("show me") if e["type"] == "text"
+        ]
+        model.side_effect = [
+            tool_call_stream("tc2", "show_post", json.dumps({"post_id": "post_001"})),
+            text_stream("Approve it?"),
+        ]
+        reply = await assistant.chat("again")
+
+    display = [part for part in streamed if "Copy" in part]
+    assert len(display) == 1 and "Meet \\[Ana\\]\\(https\\:" in display[0]
+    assert reply.startswith(display[0].strip()) and reply.endswith("Approve it?")
+
+
 def test_turn_reply_joins_the_reply_and_the_save_check_answer():
     from agent.graph import SAVE_CHECK_NAME, turn_reply
 
@@ -921,11 +954,12 @@ def test_summary_transcript_labels_the_save_check_message():
 CHECKPOINT_TABLES: tuple[str, ...] = ("checkpoints", "checkpoint_writes", "checkpoint_blobs")
 
 
-def _checkpoint_rows(database, thread_id: str) -> dict[str, int]:
+def checkpoint_rows(database, thread_id: str) -> dict[str, int]:
     """How many rows each checkpoint table holds for a thread (read past row-level security)."""
+    count = sql.SQL("SELECT count(*) FROM {} WHERE thread_id = %s")
     return {
         table: database["cleaner"]
-        .execute(f"SELECT count(*) FROM {table} WHERE thread_id = %s", (thread_id,))
+        .execute(count.format(sql.Identifier(table)), (thread_id,))
         .fetchone()[0]
         for table in CHECKPOINT_TABLES
     }
@@ -975,7 +1009,7 @@ async def test_prune_history_keeps_one_checkpoint_with_the_whole_conversation(da
     for n in range(3):
         await _chat(assistant, f"q{n}", f"a{n}")
 
-    assert _checkpoint_rows(database, "org")["checkpoints"] == 1
+    assert checkpoint_rows(database, "org")["checkpoints"] == 1
     assert _rows_of_older_checkpoints(database, "org") == 0
     async with build_graph(assistant.model, "org") as graph:
         state = await graph.aget_state({"configurable": {"thread_id": "org"}})
@@ -992,7 +1026,7 @@ async def test_prune_history_leaves_other_threads_alone(database):
 
     with patch("agent.assistant.prune_history", new=AsyncMock()):  # org:b keeps every checkpoint
         await _chat(Assistant("org", thread_id="org:b"), "hi", "x")
-    unpruned = _checkpoint_rows(database, "org:b")
+    unpruned = checkpoint_rows(database, "org:b")
     assert unpruned["checkpoints"] > 1
     assert _rows_of_older_checkpoints(database, "org:b") > 0  # so the 0 above means pruned
 
@@ -1000,9 +1034,9 @@ async def test_prune_history_leaves_other_threads_alone(database):
     async with build_graph("claude-haiku-4-5-20251001", "org") as graph:
         await prune_history(graph, "org:missing")  # an unknown thread is a no-op
 
-    assert _checkpoint_rows(database, "org:a")["checkpoints"] == 1
-    assert _checkpoint_rows(database, "org:b") == unpruned
-    assert _checkpoint_rows(database, "org:missing") == dict.fromkeys(CHECKPOINT_TABLES, 0)
+    assert checkpoint_rows(database, "org:a")["checkpoints"] == 1
+    assert checkpoint_rows(database, "org:b") == unpruned
+    assert checkpoint_rows(database, "org:missing") == dict.fromkeys(CHECKPOINT_TABLES, 0)
 
 
 @pytest.mark.parametrize(
@@ -1053,9 +1087,9 @@ async def test_a_turn_interrupted_after_its_tool_ran_leaves_a_working_thread(dat
         )
         return row[0] > 0
 
-    async def tool_then_outage(name: str, args: dict, org_id: str) -> str:
+    async def tool_then_outage(name: str, args: dict, org_id: str, turn: object) -> str:
         nonlocal database_gone
-        result = await real_handle_tool_call(name, args, org_id)
+        result = await real_handle_tool_call(name, args, org_id, turn)
         for _ in range(500):
             if tool_call_is_stored():
                 break
@@ -1081,7 +1115,9 @@ async def test_a_turn_interrupted_after_its_tool_ran_leaves_a_working_thread(dat
         ),
         patch(
             "agent.graph.litellm.acompletion",
-            new=AsyncMock(return_value=tool_call_stream("tc_lost", "save_post", save)),
+            new=AsyncMock(
+                side_effect=[tool_call_stream("tc_lost", "save_post", save), text_stream("Saved.")]
+            ),
         ),
         pytest.raises(psycopg.OperationalError),
     ):
@@ -1121,7 +1157,30 @@ async def test_streamed_turns_are_pruned_too(database):
         with patch("agent.graph.litellm.acompletion", new=AsyncMock(return_value=text_stream("x"))):
             async for _event in assistant.achat_stream("hi"):
                 pass
-    assert _checkpoint_rows(database, "org")["checkpoints"] == 1
+    assert checkpoint_rows(database, "org")["checkpoints"] == 1
+
+
+@pytest.mark.parametrize("finish_reason", [None, "length"])
+async def test_a_reply_cut_off_mid_stream_fails_the_turn(database, finish_reason):
+    """
+    Regression: a provider's stream stopped after "Happy to! It's", and that was saved and
+    judged as the whole reply; the user is now told the reply was cut off.
+    """
+    from agent.assistant import Assistant
+    from agent.errors import CUT_OFF_MESSAGE, user_message
+    from agent.graph import ReplyCutOff
+
+    async def cut_off():
+        yield text_chunk("Happy to! It's")
+        if finish_reason:
+            yield text_chunk(None, finish_reason)
+
+    with (
+        patch("agent.graph.litellm.acompletion", new=AsyncMock(return_value=cut_off())),
+        pytest.raises(ReplyCutOff) as raised,
+    ):
+        await Assistant("org").chat("Suggest some posts")
+    assert user_message(raised.value) == CUT_OFF_MESSAGE
 
 
 async def test_read_stream_skips_usage_only_chunks_and_tool_fragments_without_a_function():
@@ -1141,6 +1200,7 @@ async def test_read_stream_skips_usage_only_chunks_and_tool_fragments_without_a_
     async def stream():
         for c in (chunk("Hi"), chunk(tool_calls=[named]), chunk(tool_calls=[bare]), usage_only):
             yield c
+        yield text_chunk(None, "tool_calls")
 
     text, tool_calls = await _read_stream(stream(), lambda event: None)
     assert text == "Hi"
@@ -1230,3 +1290,74 @@ async def test_tool_step_previews_stay_short_however_large_the_tool_input(databa
         steps = [e async for e in Assistant("org").achat_stream("save") if e["type"] == "tool_step"]
     assert len(steps[0]["input_preview"]) <= 300
     assert len(steps[0]["result_preview"]) <= 500
+
+
+async def test_a_model_stuck_calling_tools_stops_at_the_round_limit_and_the_thread_works(
+    database, monkeypatch
+):
+    """Without a limit, LangGraph runs 10,000 steps: thousands of paid model calls in one turn."""
+    from langgraph.errors import GraphRecursionError
+
+    from agent import graph
+    from agent.assistant import Assistant
+
+    monkeypatch.setattr(graph, "MAX_TOOL_ROUNDS", 2)
+    calls = iter(range(100))
+    stuck = AsyncMock(
+        side_effect=lambda **_: tool_call_stream(f"tc_{next(calls)}", "search_ledger", "{}")
+    )
+    assistant = Assistant("org")
+    with patch("agent.graph.litellm.acompletion", new=stuck), pytest.raises(GraphRecursionError):
+        await assistant.chat("loop forever")
+    assert stuck.await_count <= graph.MAX_TOOL_ROUNDS + 2
+
+    assert await _chat(assistant, "hello again", "hi") is not None
+
+
+async def test_tools_check_quotes_against_what_the_user_typed_in_any_turn(database):
+    """A quote from an earlier turn is the user's; one only the model wrote is not."""
+    from agent.assistant import Assistant
+    from agent.memory import load_profile
+
+    def pref(key: str, quote: str) -> str:
+        return json.dumps({"key": key, "value": "warm", "quote": quote})
+
+    model = AsyncMock(
+        side_effect=[
+            text_stream("I'd keep it upbeat and corporate."),
+            tool_call_stream("tc1", "save_preference", pref("voice", "we're warm, not corporate")),
+            tool_call_stream("tc2", "save_preference", pref("tone", "upbeat and corporate")),
+            text_stream("Saved."),
+        ]
+    )
+    with patch("agent.graph.litellm.acompletion", new=model):
+        assistant = Assistant("org")
+        await assistant.chat("We're warm, not corporate.")
+        await assistant.chat("Remember that.")
+
+    results = [m["content"] for m in model.call_args.kwargs["messages"] if m["role"] == "tool"]
+    assert results[0] == "Preference saved: voice = warm"
+    assert results[1].startswith("Not saved: quote must be the user's own words")
+    assert list((await load_profile("org"))["preferences"]) == ["voice"]
+
+
+async def test_a_usage_chunk_after_the_finish_reason_doesnt_cut_off_the_reply():
+    """Providers send token usage in a last chunk with no finish reason; the reply is whole."""
+    from agent.graph import _read_stream
+
+    async def stream():
+        yield text_chunk("Done.")
+        yield text_chunk(None, "stop")
+        yield text_chunk(None)  # usage only
+
+    assert await _read_stream(stream(), lambda event: None) == ("Done.", {})
+
+
+def test_a_post_show_post_didnt_find_is_not_displayed():
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    from agent.graph import displays_a_post, turn_reply
+
+    missing = ToolMessage("Post post_404 not found in ledger", tool_call_id="t", name="show_post")
+    assert not displays_a_post(missing)
+    assert turn_reply([HumanMessage("show it"), missing]) == ""

@@ -3,7 +3,7 @@ LLM-as-judge evaluator for the end-to-end 7-step acceptance scenario.
 
 Owns: driving the 7-step scenario against a real org (it saves to that org's
 memory in the database, like a normal chat), scoring each response on three
-rubrics in parallel (21 total judge calls), checking what the run saved (no
+rubrics in parallel (21 judge calls, plus one more for each empty reply), checking what the run saved (no
 LLM involved), checking that a date mentioned far back in a long conversation
 survives into the summary's open requests and dates and is recalled (one
 summary call and one answer, no judge), and printing a markdown report. Does not own
@@ -18,6 +18,9 @@ agent/config.py and .env.example) and TAVILY_API_KEY for the research step.
 The judge model is JUDGE_MODEL (and JUDGE_PROVIDER) if set (recommended: a
 different provider, or at least another model family, than the assistant, to
 avoid self-grading bias), otherwise the assistant's own model.
+
+A new --org is created with no members, as an import is: run
+scripts/users.py grant for anyone who should open it in the UIs.
 """
 
 from __future__ import annotations
@@ -29,12 +32,14 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import litellm
-from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-load_dotenv(Path(__file__).parent.parent / ".env")
+from agent.config import load_settings  # noqa: E402 - needs the path set above
+
+load_settings(Path(__file__).parent.parent / ".env")
 
 from agent.config import (
     background_kwargs,
@@ -136,7 +141,7 @@ async def _score_one(
     rubric_name: str,
     rubric_desc: str,
     earlier_reply: str = "",
-) -> dict:
+) -> dict[str, Any]:
     """
     Call the judge LLM for one (step, rubric) pair and return {rubric, score, reason}.
 
@@ -183,7 +188,7 @@ async def _score_one(
         return {"rubric": rubric_name, "score": -1, "reason": f"parse error: {text[:80]}"}
 
 
-async def score_all(responses: list[dict]) -> list[list[dict]]:
+async def score_all(responses: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """
     Run all 21 judge calls (7 steps × 3 rubrics) concurrently via asyncio.gather.
 
@@ -211,7 +216,7 @@ async def score_all(responses: list[dict]) -> list[list[dict]]:
     return [list(flat[i * n : (i + 1) * n]) for i in range(len(responses))]
 
 
-def run_scenario(org_name: str, org_url: str) -> tuple[list[dict], list[dict]]:
+def run_scenario(org_name: str, org_url: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Drive the Assistant through the 7-step acceptance scenario.
 
@@ -340,7 +345,7 @@ def check_saved_state(snapshots: list[dict]) -> dict[str, tuple[bool, str]]:
     }
 
 
-def memory_history() -> list:
+def memory_history() -> list[Any]:
     """MEMORY_SEED and its reply, then MEMORY_FILLER_TURNS long filler turns."""
     from langchain_core.messages import AIMessage, HumanMessage
 
@@ -478,7 +483,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate Mackie on the 7-step acceptance scenario."
     )
-    parser.add_argument("--org", default="BRCA Strong", help="Test org name (default: BRCA Strong)")
+    parser.add_argument(
+        "--org", default="BRCA Strong eval", help="Test org name (default: BRCA Strong eval)"
+    )
     parser.add_argument("--url", default="", help="Org website URL (optional)")
     args = parser.parse_args()
 

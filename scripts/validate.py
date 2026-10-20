@@ -14,6 +14,8 @@ Exit code is 0 when everything is valid, 1 otherwise.
 
 from __future__ import annotations
 
+import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -25,16 +27,12 @@ from agent import skills
 
 def profile_problems(paths: list[Path]) -> list[str]:
     """
-    Return one message per profile file whose contents scripts/import_profiles.py would refuse.
-
-    The org id is checked only at import, since it can come from the file's folder.
+    Return one message per profile file that scripts/import_profiles.py would refuse.
     """
     problems: list[str] = []
     for path in paths:
         try:
-            mem.read_profile_file(path)
-        except OSError as e:
-            problems.append(f"{path}: can't be read ({e.strerror})")
+            mem.profile_org_id(path, mem.read_profile_file(path))
         except mem.ProfileError as e:
             problems.append(str(e))
     return problems
@@ -42,11 +40,21 @@ def profile_problems(paths: list[Path]) -> list[str]:
 
 def main(argv: list[str]) -> int:
     """Print a report and return the process exit code."""
-    skill_set = skills.load_skills()
+    parser = argparse.ArgumentParser(
+        description="Check skills/*.yaml, and any exported profile files named, without changing them."
+    )
+    parser.add_argument("profiles", nargs="*", type=Path, help="exported profile JSON files")
+    paths = parser.parse_args(argv).profiles
+    # The report below lists every problem; the skills module's log lines would repeat each.
+    logging.disable(logging.WARNING)
+    try:
+        skill_set = skills.load_skills()
+    finally:
+        logging.disable(logging.NOTSET)
     print(f"Platforms:     {', '.join(s['id'] for s in skill_set.platforms) or '(none)'}")
     print(f"Content types: {', '.join(s['id'] for s in skill_set.content_types) or '(none)'}")
     print(f"Formats:       {', '.join(s['id'] for s in skill_set.formats) or '(none)'}")
-    problems = skill_set.problems + profile_problems([Path(arg) for arg in argv])
+    problems = skill_set.problems + profile_problems(paths)
     if not problems:
         print("All files are valid.")
         return 0

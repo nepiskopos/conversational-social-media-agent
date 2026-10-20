@@ -26,13 +26,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+from agent.config import load_settings  # noqa: E402 - needs the path set above
+
+load_settings(Path(__file__).parent.parent / ".env")
 
 import psycopg
 
-from agent import accounts, db  # after load_dotenv and the path change
+from agent import accounts, db  # after load_settings and the path change
 from agent.memory import slugify
 
 
@@ -93,16 +94,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     """The command line as a Namespace with command, username, org and password_stdin."""
     parser = argparse.ArgumentParser(description="Manage Mackie's users.")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("add", "passwd"):
-        command = commands.add_parser(name)
+    for name, about in (
+        ("add", "create an account (asks for a password of 12+ characters)"),
+        ("passwd", "set a new password, which also unlocks the account"),
+    ):
+        command = commands.add_parser(name, help=about)
         command.add_argument("username")
-        command.add_argument("--password-stdin", action="store_true")
-    commands.add_parser("remove").add_argument("username")
-    for name in ("grant", "revoke"):
-        command = commands.add_parser(name)
+        command.add_argument(
+            "--password-stdin", action="store_true", help="read the password from one line of input"
+        )
+    commands.add_parser("remove", help="delete an account and its access").add_argument("username")
+    for name, about in (
+        ("grant", "let a user open an organization"),
+        ("revoke", "stop a user opening an organization; open chats end at their next message"),
+    ):
+        command = commands.add_parser(name, help=about)
         command.add_argument("username")
         command.add_argument("org", help="organization name or id")
-    commands.add_parser("list")
+    commands.add_parser("list", help="list the accounts and the organizations each may open")
     return parser.parse_args(argv)
 
 

@@ -7,26 +7,22 @@ file that can't be read. Does not own the individual checks (test_skills.py,
 test_memory.py for profile_problem).
 """
 
-import importlib.util
-import sys
-from pathlib import Path
+import logging
 from unittest.mock import patch
 
 import pytest
 
-VALIDATE_PATH = Path(__file__).parent.parent / "scripts" / "validate.py"
+from tests.conftest import load_script
+
 PLATFORM_YAML = "name: Test\nid: test\nmax_length: 500\n"
-GOOD_PROFILE = '{"name": "Org", "post_ledger": [{"id": "post_001", "title": "Hello"}]}'
+GOOD_PROFILE = (
+    '{"org_id": "org", "name": "Org", "post_ledger": [{"id": "post_001", "title": "Hello"}]}'
+)
 
 
 @pytest.fixture(scope="module")
 def validate_module():
-    """Import scripts/validate.py as a module."""
-    spec = importlib.util.spec_from_file_location("mackie_validate", VALIDATE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    sys.modules.pop("mackie_validate", None)
-    return module
+    return load_script("validate")
 
 
 @pytest.fixture
@@ -54,24 +50,37 @@ def test_validate_passes_valid_files_and_changes_nothing(
     assert (skills_dir / "test.yaml").read_text() == PLATFORM_YAML
 
 
-def test_validate_reports_every_broken_file(validate_module, skills_dir, tmp_path, capsys):
+def test_validate_help_prints_usage_instead_of_checking_a_file_named_help(validate_module, capsys):
+    with pytest.raises(SystemExit) as stopped:
+        validate_module.main(["--help"])
+    assert stopped.value.code == 0
+    assert "usage: " in capsys.readouterr().out
+
+
+def test_validate_reports_every_broken_file(validate_module, skills_dir, tmp_path, capsys, caplog):
     (skills_dir / "broken.yaml").write_text("id: x\nname: X\nmax_length: lots\n")
     (skills_dir / "content_pillars.yaml").write_text("pillars:\n  - description: no name\n")
     profiles = {
         "comma.json": '{"name": "Org",}',
         "list.json": "[]",
         "status.json": '{"post_ledger": [{"status": "maybe"}]}',
+        # Regression: passed here, then the import refused it for having no org.
+        "no-org.json": '{"name": "Org"}',
     }
     for name, text in profiles.items():
         (tmp_path / name).write_text(text)
     assert validate_module.main([str(tmp_path / name) for name in profiles]) == 1
     out = capsys.readouterr().out
-    assert "5 problem(s):" in out
+    assert "6 problem(s):" in out
+    # Regression: the skills module's log repeated each skill problem; logging is back on after.
+    assert caplog.records == []
+    assert not logging.root.manager.disable
     assert "broken.yaml: max_length must be a whole number" in out
     assert "content_pillars.yaml: every pillar needs a name" in out
     assert "comma.json has a formatting error at line 1" in out
     assert "list.json must be a JSON object" in out
     assert "status.json: post 1 has status 'maybe'" in out
+    assert "no-org.json: '' is not an org id" in out
 
 
 def test_validate_reports_a_profile_file_it_cant_read(validate_module, skills_dir, tmp_path):

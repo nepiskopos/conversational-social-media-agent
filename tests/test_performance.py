@@ -17,14 +17,10 @@ time budget (conftest.py).
 """
 
 import asyncio
-import importlib.util
 import json
-import sys
 import threading
 import time
 from collections.abc import Iterator
-from pathlib import Path
-from types import ModuleType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -32,12 +28,13 @@ import psycopg
 import pytest
 from psycopg import sql
 
+from tests.conftest import load_script
 from tests.llm_fakes import completion, text_stream, tool_call_stream
 
-# Wall-clock ceiling for the linear-time checks. The inputs take milliseconds when
-# parsing is linear and far longer if backtracking were quadratic, so this
-# generous bound doesn't flake on a slow runner.
-LINEAR_TIME_CEILING_S: float = 1.0
+# Wall-clock ceiling for the linear-time checks. The inputs take a fraction of a second
+# when parsing is linear (up to 0.4 s under coverage) and minutes if backtracking were
+# quadratic, so this generous bound doesn't flake on a slow shared runner.
+LINEAR_TIME_CEILING_S: float = 2.0
 HOSTILE_INPUT_CHARS: int = 200_000
 # Upper bound for any wait in the responsiveness tests: a buffered stream or a blocked
 # event loop deadlocks instead of passing slowly, and this turns that into a failure.
@@ -139,19 +136,6 @@ LOGIN_GUESSES: int = 20
 LOGIN_FLOOD_POOL_SIZE: int = 2
 
 
-EVAL_SCRIPT: Path = Path(__file__).parent.parent / "scripts" / "eval.py"
-
-
-def _load_eval_script() -> ModuleType:
-    """Import scripts/eval.py without loading the real .env into the test process."""
-    spec = importlib.util.spec_from_file_location("mackie_eval_perf", EVAL_SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    with patch("dotenv.load_dotenv"):
-        spec.loader.exec_module(module)
-    sys.modules.pop("mackie_eval_perf", None)
-    return module
-
-
 # --- Parallel I/O -----------------------------------------------------------------
 
 
@@ -213,7 +197,7 @@ async def test_scrape_site_fetches_subpages_in_parallel(concurrency_probe):
 
 
 async def test_eval_runs_all_judge_calls_in_parallel(concurrency_probe):
-    module = _load_eval_script()
+    module = load_script("eval")
     responses = [{"step": i, "user": "m", "reply": "r"} for i in range(1, 8)]
     calls = len(responses) * len(module.RUBRICS)
     probe = concurrency_probe(calls, completion(json.dumps({"score": 3, "reason": "ok"})))
@@ -270,6 +254,28 @@ async def test_system_prompt_size_does_not_grow_with_org_memory(database):
     assert len(large_stable) == len(small_stable)
     assert len(large_turn) < len(small_turn) * 1.1
     assert "use search_ledger to list them" in large_turn
+
+
+async def test_long_titles_pillars_platforms_and_notes_are_cut_in_the_prompt(database):
+    """
+    Regression: titles, pillars and results notes were shown whole in the ledger, agenda and
+    results sections, so twenty long ones (imported, or saved by a fooled model) filled
+    every prompt, past the context window, and "start a new conversation" didn't help.
+    """
+    from agent.assistant import _build_system_prompt_blocks
+    from agent.memory import save_profile
+
+    profile = _big_profile(SMALL_ORG_POSTS)
+    for post in profile["post_ledger"]:
+        post |= {"title": "t" * 10_000, "pillar": "p" * 10_000, "platform": "x" * 10_000}
+        post["performance"]["note"] = "n" * 10_000
+    await save_profile("long", profile)
+    await save_profile("short", _big_profile(SMALL_ORG_POSTS))
+    long_turn = (await _build_system_prompt_blocks("long"))[1]
+    short_turn = (await _build_system_prompt_blocks("short"))[1]
+    assert len(long_turn) < len(short_turn) + 30_000
+    for cut in ("t" * 100, "p" * 100, "X" * 100, "n" * 300):
+        assert cut not in long_turn
 
 
 def test_tool_results_are_capped_whatever_the_research_size():
@@ -439,7 +445,7 @@ async def test_every_llm_call_has_a_timeout(database):
         await _summarize("claude-haiku-5-5", "", [HumanMessage(content="old")])
         await handle_tool_call("research_org", {"org_name": "Org"}, "org")
         await handle_tool_call("generate_calendar", {"month_year": "July 2026"}, "org")
-    eval_script = _load_eval_script()
+    eval_script = load_script("eval")
     with patch.object(eval_script.litellm, "acompletion", new=model):
         await eval_script.score_all([{"step": 1, "user": "m", "reply": "r"}])
 
@@ -450,12 +456,32 @@ async def test_every_llm_call_has_a_timeout(database):
 async def test_every_website_fetch_has_a_timeout():
     from agent import research
 
-    response = MagicMock(is_redirect=False, text="<p>Hi</p>")
-    client = MagicMock(get=AsyncMock(return_value=response))
+    stream = MagicMock(side_effect=AssertionError("stop after the request"))
     with patch.object(research.httpx, "AsyncClient") as client_class:
-        client_class.return_value.__aenter__.return_value = client
-        await research._fetch_html("https://org.example")
-    assert client.get.await_args.kwargs["timeout"] == research.FETCH_TIMEOUT_S
+        client_class.return_value.__aenter__.return_value = MagicMock(stream=stream)
+        with pytest.raises(AssertionError):
+            await research._fetch_html("https://org.example")
+    assert stream.call_args.kwargs["timeout"] == research.FETCH_TIMEOUT_S
+
+
+async def test_a_page_that_trickles_gives_up_after_the_fetch_timeout(monkeypatch):
+    """httpx's timeout bounds each wait for data; a byte every few seconds must not last forever."""
+    from agent import research
+
+    monkeypatch.setattr(research, "FETCH_TIMEOUT_S", 0.05)
+
+    async def trickle():
+        while True:
+            yield b"x"
+            await asyncio.sleep(0.01)
+
+    response = MagicMock(is_redirect=False, aiter_raw=trickle, encoding="utf-8", headers={})
+    stream = MagicMock()
+    stream.return_value.__aenter__.return_value = response
+    with patch.object(research.httpx, "AsyncClient") as client_class:
+        client_class.return_value.__aenter__.return_value = MagicMock(stream=stream)
+        with pytest.raises(TimeoutError):
+            await research._fetch_html("https://org.example")
 
 
 # --- Scale ------------------------------------------------------------------------
@@ -661,18 +687,18 @@ def test_a_full_window_estimated_by_characters_stays_within_its_token_budget():
         CHARS_PER_TOKEN,
         MAX_MESSAGES,
         WINDOW_TOKENS,
-        _is_user_turn,
         _message_chars,
         _shorten_old_tool_results,
         _to_litellm,
         _window_start,
+        is_user_turn,
     )
 
     turns = EVERYDAY_TURNS + RESEARCH_TURNS
     history = [m for n in range(turns) for m in _everyday_turn(n, n >= EVERYDAY_TURNS)]
     shortened = _shorten_old_tool_results(history)
     start = _window_start(history)
-    previous_turn = max(i for i in range(start) if _is_user_turn(history[i]))
+    previous_turn = max(i for i in range(start) if is_user_turn(history[i]))
     # The token budget, not the message cap, bounds this window: one more turn won't fit.
     assert len(history) - start < MAX_MESSAGES
     assert sum(map(_message_chars, shortened[previous_turn:])) > WINDOW_TOKENS * CHARS_PER_TOKEN
@@ -823,7 +849,6 @@ async def test_a_flood_of_wrong_passwords_does_not_hold_up_a_chat(fresh_pool, mo
     from agent.memory import load_profile
 
     monkeypatch.setenv("MACKIE_DATABASE_POOL_SIZE", str(LOGIN_FLOOD_POOL_SIZE))
-    monkeypatch.setattr(accounts, "SCRYPT_N", 2**4)
     await accounts.create_user("alice", "a long passphrase")
     real_verify = accounts._verify
     checking, profile_loaded = 0, asyncio.Event()
@@ -859,7 +884,6 @@ async def test_a_login_checks_its_password_without_blocking_other_sessions(datab
     """
     from agent import accounts
 
-    monkeypatch.setattr(accounts, "SCRYPT_N", 2**4)
     await accounts.create_user("alice", "a long passphrase")
     checking, released = threading.Event(), threading.Event()
 

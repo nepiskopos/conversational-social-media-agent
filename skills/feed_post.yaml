@@ -10,7 +10,7 @@
 #
 # Fields:
 #   kind:      Must be "format" (this is what makes it a format)
-#   id:        Machine-readable identifier — unique, lowercase, no spaces      (required)
+#   id:        Unique identifier: lowercase letters, digits and _ only (required)
 #   name:      Display name                                                     (required)
 #   purpose:   The role this format plays in the org's social media mix         (required)
 #   structure: What the draft must contain, one part per line                   (required)

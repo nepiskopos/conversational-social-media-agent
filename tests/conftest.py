@@ -1,30 +1,36 @@
 """
 Shared pytest fixtures for the Mackie test suite.
 
-Owns: blanking the database and model settings so .env never changes a run; the throwaway
-PostgreSQL database (created once per run on the server
-at TEST_DATABASE_URL, migrated as an owner role and used through an app role,
-as in production) and the database fixture that empties it before each test;
-autouse fixtures that block database access without the database fixture,
-unmocked LLM calls, HTTP requests and DNS lookups, so tests never touch the
-network or real org data; the ConcurrencyProbe used to prove that work runs
-in parallel; and the suite time budget from CLAUDE.md (not applied under
-coverage or to the opt-in browser and deployed tests).
+Owns: blanking every setting .env defines, and the model settings, so .env
+never changes a run, and setting the time zone to UTC; the throwaway
+PostgreSQL database (created once per run on the server at TEST_DATABASE_URL,
+migrated as an owner role and used through an app role, as in production) and
+the database fixture that empties it before each test; autouse fixtures that
+hash passwords cheaply and block database access without the database
+fixture, unmocked LLM calls, HTTP requests and DNS lookups, so tests never
+touch the network or real org data; the ConcurrencyProbe used to prove that
+work runs in parallel; and the suite time budget from CLAUDE.md (not applied
+under coverage or to the opt-in browser and deployed tests).
 Does not own test logic — that lives in the individual test_*.py files.
 """
 
 import asyncio
 import gc
+import importlib.util
 import os
+import sys
 import time
 from collections.abc import Callable
 from graphlib import TopologicalSorter
+from pathlib import Path
+from types import ModuleType
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import litellm  # noqa: F401 — imported before no_real_http, since import creates an httpx client
 import psycopg
 import pytest
+from dotenv import dotenv_values
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
@@ -49,6 +55,8 @@ SELECT c.relname,
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND c.relname NOT LIKE '%\_migrations'
 """
+_DOTENV: Path = Path(__file__).parent.parent / ".env"
+SCRIPTS_DIR: Path = Path(__file__).parent.parent / "scripts"
 # Settings outside PROVIDERS that choose a model or reach a paid service.
 _MODEL_SELECTORS: tuple[str, ...] = (
     "LLM_PROVIDER",
@@ -62,14 +70,29 @@ _MODEL_SELECTORS: tuple[str, ...] = (
 PROBE_TIMEOUT_S: float = 1.0
 
 
+def load_script(name: str) -> ModuleType:
+    """Import scripts/<name>.py as a module, without loading the real .env into the test process."""
+    module_name = f"mackie_script_{name}"
+    spec = importlib.util.spec_from_file_location(module_name, SCRIPTS_DIR / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    with patch("agent.config.load_dotenv"):
+        spec.loader.exec_module(module)
+    sys.modules.pop(module_name, None)
+    return module
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """
-    Blank the database and model settings, so .env can't change what the tests reach or see.
+    Blank every setting .env defines, and the model settings, so .env can't change a run.
 
-    No test can reach a real database, and every run picks the model CI picks (no provider
-    configured), whatever keys the developer's .env holds. load_dotenv() never overrides a
-    variable that is already set; tests that need a provider set it with monkeypatch.
+    No test can reach a real database, secrets in .env never reach the log redaction under
+    test, and every run picks the model CI picks (no provider configured), whatever the
+    developer's .env or shell holds; the time zone is UTC, as on CI. load_settings(), which
+    the app and scripts call on import, never overrides a variable that is already set;
+    tests that need one set it with monkeypatch.
     """
+    for name in dotenv_values(_DOTENV):
+        os.environ[name] = ""
     os.environ["MACKIE_DATABASE_URL"] = ""
     os.environ["MACKIE_MIGRATION_URL"] = ""
     from agent.config import PROVIDERS
@@ -85,6 +108,9 @@ def pytest_configure(config: pytest.Config) -> None:
                 os.environ[name] = ""
     for name in _MODEL_SELECTORS:
         os.environ[name] = ""
+    # An empty TZ is not an unset one: the first tzset() would switch the run to UTC midway.
+    os.environ["TZ"] = "UTC"
+    time.tzset()
 
 
 def _tables_to_empty(conn: psycopg.Connection) -> tuple[str, ...]:
@@ -218,6 +244,13 @@ def no_real_dns():
 
 
 @pytest.fixture(autouse=True)
+def cheap_hashing():
+    """scrypt at its real cost takes ~50 ms a hash; no test depends on the cost."""
+    with patch("agent.accounts.SCRYPT_N", 2**4):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def no_real_http():
     """
     Fail any website fetch a test did not mock, keeping the suite offline.
@@ -232,6 +265,7 @@ def no_real_http():
         client.get = client.post = client.request = AsyncMock(
             side_effect=AssertionError("unmocked HTTP request")
         )
+        client.stream = MagicMock(side_effect=AssertionError("unmocked HTTP request"))
         yield
 
 

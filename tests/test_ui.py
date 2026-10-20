@@ -44,7 +44,6 @@ from tests.llm_fakes import text_stream
 USERNAME = "sam@food.example"
 PASSWORD = "correct horse battery"
 # Hashing at the production cost takes about 50 ms; the stored hash records its own cost.
-FAST_SCRYPT_N = 2**4
 # The driver's own message names the server; none of it may reach the screen.
 DRIVER_DOWN = 'connection to server at "10.0.0.5", port 5432 failed: Connection refused'
 
@@ -52,7 +51,7 @@ DRIVER_DOWN = 'connection to server at "10.0.0.5", port 5432 failed: Connection 
 def _import_entry_point(name: str) -> ModuleType:
     """Import app.py or main.py without loading the real .env into the test process."""
     sys.modules.pop(name, None)
-    with patch("dotenv.load_dotenv"):
+    with patch("agent.config.load_dotenv"):
         return importlib.import_module(name)
 
 
@@ -118,14 +117,15 @@ def fake_cl(app):
 @pytest.fixture
 async def user(database):
     """A Mackie account (USERNAME, PASSWORD), hashed at a low cost to keep the tests fast."""
-    with patch.object(accounts, "SCRYPT_N", FAST_SCRYPT_N):
-        yield await accounts.create_user(USERNAME, PASSWORD)
+    yield await accounts.create_user(USERNAME, PASSWORD)
 
 
 @pytest.fixture
 def signed_in(fake_cl, user):
     """The web session of a logged-in user, as Chainlit stores it after login()."""
-    fake_cl.session["user"] = SimpleNamespace(metadata={"user_id": user.user_id})
+    fake_cl.session["user"] = SimpleNamespace(
+        metadata={"user_id": user.user_id, "session_key": user.session_key}
+    )
     return user
 
 
@@ -162,6 +162,19 @@ def _asks(*replies):
         ("Food Bank\nhttps://food.example\n", ("Food Bank", "https://food.example")),
         ("  Food Bank  ", ("Food Bank", "")),
         ("Smith, Jones & Co\nhttps://sj.example", ("Smith, Jones & Co", "https://sj.example")),
+        # Regression: only a website is taken as one; "Inc." became the org's website.
+        ("Feed the Children, Inc.", ("Feed the Children, Inc.", "")),
+        (
+            "Feed the Children, Inc., feed.example",
+            ("Feed the Children, Inc.", "https://feed.example"),
+        ),
+        ("Food Bank\nour site", ("Food Bank", "")),
+        # Regression: these became one long org name, website included.
+        ("BRCA Strong, brcastrong.org.", ("BRCA Strong", "https://brcastrong.org")),
+        ("BRCA Strong (brcastrong.org)", ("BRCA Strong", "https://brcastrong.org")),
+        ("BRCA Strong brcastrong.org", ("BRCA Strong", "https://brcastrong.org")),
+        ("BRCA Strong — brcastrong.org", ("BRCA Strong", "https://brcastrong.org")),
+        ("Code.org", ("Code.org", "")),  # a name that looks like a website stays the name
         ("", ("", "")),
     ],
 )
@@ -172,7 +185,7 @@ def test_parse_org_input_splits_name_and_url(app, text, expected):
 async def test_login_returns_the_user_only_for_the_right_password(app, user):
     logged_in = await app.login(USERNAME, PASSWORD)
     assert logged_in.identifier == USERNAME
-    assert logged_in.metadata == {"user_id": user.user_id}
+    assert logged_in.metadata == {"user_id": user.user_id, "session_key": user.session_key}
     assert await app.login(USERNAME, "wrong password!") is None
 
 
@@ -183,7 +196,7 @@ async def test_ask_for_org_reasks_for_a_missing_name_and_after_a_no(app, user):
         patch.object(app.cl, "AskUserMessage", ask),
         patch.object(app.cl, "AskActionMessage", confirm),
     ):
-        assert await app._ask_for_org(user.user_id) == ("Food Bank", "food.example")
+        assert await app._ask_for_org(user.user_id) == ("Food Bank", "https://food.example")
 
     prompts = [call.kwargs["content"] for call in ask.call_args_list]
     assert "couldn't find an organization name" in prompts[1]
@@ -218,7 +231,7 @@ async def test_ask_for_org_refuses_someone_elses_org_and_opens_a_new_one(app, us
         patch.object(app.cl, "AskUserMessage", ask),
         patch.object(app.cl, "AskActionMessage", confirm),
     ):
-        assert await app._ask_for_org(user.user_id) == ("Animal Shelter", "shelter.example")
+        assert await app._ask_for_org(user.user_id) == ("Animal Shelter", "https://shelter.example")
 
     assert ask.call_args.kwargs["content"] == app.NO_ACCESS_PROMPT.format(org_name="Food Bank")
     assert await accounts.user_orgs(user.user_id) == ["animal-shelter"]
@@ -248,7 +261,7 @@ async def test_start_leads_a_returning_org_with_what_needs_attention(app, fake_c
 
     assert fake_cl.sent[-1].startswith("Welcome back!")
     assert "1 draft waiting for your approval" in fake_cl.sent[-1]
-    assert "I remember 0 brand preferences and 1 post for **Food Bank**" in fake_cl.sent[-1]
+    assert "For **Food Bank** I remember 0 brand preferences and 1 post." in fake_cl.sent[-1]
 
 
 async def test_start_asks_what_to_work_on_when_nothing_needs_attention(app, fake_cl, signed_in):
@@ -259,7 +272,9 @@ async def test_start_asks_what_to_work_on_when_nothing_needs_attention(app, fake
     with _picks(app, "Food Bank"):
         await app.start()
 
-    assert fake_cl.sent[-1].startswith("Welcome back! I remember 1 brand preference and 0 posts")
+    assert fake_cl.sent[-1].startswith(
+        "Welcome back! For **Food Bank** I remember 1 brand preference and 0 posts."
+    )
     assert fake_cl.sent[-1].endswith("What would you like to work on?")
 
 
@@ -270,10 +285,11 @@ async def test_start_resumes_one_conversation_per_user_and_org(app, fake_cl, sig
         with _picks(app, "Food Bank"):
             await app.start()
         threads.append(fake_cl.session["assistant"].thread_id)
-    with patch.object(accounts, "SCRYPT_N", FAST_SCRYPT_N):
-        alex = await accounts.create_user("alex@food.example", PASSWORD)
+    alex = await accounts.create_user("alex@food.example", PASSWORD)
     await accounts.grant("alex@food.example", "food-bank")
-    fake_cl.session["user"] = SimpleNamespace(metadata={"user_id": alex.user_id})
+    fake_cl.session["user"] = SimpleNamespace(
+        metadata={"user_id": alex.user_id, "session_key": alex.session_key}
+    )
     with _picks(app, "Food Bank"):
         await app.start()
     threads.append(fake_cl.session["assistant"].thread_id)
@@ -345,7 +361,8 @@ async def test_start_ends_the_session_if_access_is_gone_when_the_recap_loads(
         await app.start()
 
     assert fake_cl.sent[-1] == (
-        "You no longer have access to food-bank. Refresh the page to choose another organization."
+        "You no longer have access to food-bank, or your password was changed. "
+        "Refresh the page to choose another organization."
     )
     assert fake_cl.session["assistant"] is None
 
@@ -372,16 +389,22 @@ async def test_start_handles_an_onboarding_timeout(app, fake_cl, signed_in):
     assert "assistant" not in fake_cl.session
 
 
-@pytest.mark.parametrize("deleted", [True, False], ids=["deleted-account", "no-login"])
-async def test_start_refuses_an_account_that_no_longer_exists(app, fake_cl, user, deleted):
-    if deleted:
-        fake_cl.session["user"] = SimpleNamespace(metadata={"user_id": user.user_id})
+@pytest.mark.parametrize("ended_by", ["deleted-account", "password-changed", "no-login"])
+async def test_start_refuses_a_login_that_has_ended(app, fake_cl, user, ended_by):
+    """A changed password ends logins made with the old one, which may be an attacker's."""
+    if ended_by != "no-login":
+        fake_cl.session["user"] = SimpleNamespace(
+            metadata={"user_id": user.user_id, "session_key": user.session_key}
+        )
+    if ended_by == "deleted-account":
         await accounts.delete_user(USERNAME)
+    if ended_by == "password-changed":
+        await accounts.set_password(USERNAME, "a brand new passphrase")
     ask_for_org = AsyncMock()
     with patch.object(app, "_ask_for_org", ask_for_org):
         await app.start()
 
-    assert "This account no longer exists" in fake_cl.sent[-1]
+    assert fake_cl.sent[-1] == app.SESSION_ENDED_MESSAGE
     ask_for_org.assert_not_awaited()
     assert "assistant" not in fake_cl.session
 
@@ -460,24 +483,25 @@ async def _run_cli(main_module, answers, assistant=None) -> tuple[str, MagicMock
     """
     Run main() with scripted prompt answers; return (terminal output, Assistant class mock).
 
-    The class mock's return_value is the Assistant the conversation used.
+    The mock's return_value is the Assistant the conversation used; its calls
+    are Assistant.for_user(org_id, user, "cli").
     """
     output = StringIO()
     assistant = assistant or _cli_assistant(chat=AsyncMock(return_value="**Hello** from Mackie"))
     with (
         patch.object(main_module, "console", Console(file=output, width=120)),
         patch.object(main_module.Prompt, "ask", side_effect=answers),
-        patch.object(main_module, "Assistant", return_value=assistant) as assistant_class,
+        patch.object(main_module.Assistant, "for_user", return_value=assistant) as for_user,
     ):
         await main_module.main()
-    return output.getvalue(), assistant_class
+    return output.getvalue(), for_user
 
 
 async def test_cli_runs_a_conversation_and_resets_history(main_module, user):
     from agent.memory import load_profile
 
     text, assistant_class = await _run_cli(
-        main_module, [*LOGIN, "Food Bank", "food.example", "", "reset", "hello", "quit"]
+        main_module, [*LOGIN, "Food Bank", "our site", "food.example", "", "reset", "hello", "quit"]
     )
 
     assistant = assistant_class.return_value
@@ -485,7 +509,24 @@ async def test_cli_runs_a_conversation_and_resets_history(main_module, user):
     assistant.chat.assert_awaited_once_with("hello")
     assert "Hello from Mackie" in text
     assert "Org memory and ledger are preserved" in text
-    assert (await load_profile("food-bank"))["name"] == "Food Bank"
+    profile = await load_profile("food-bank")
+    assert profile["name"] == "Food Bank"
+    assert profile["website"] == "https://food.example"  # "our site" was asked again
+
+
+async def test_cli_shows_an_org_name_with_brackets_as_text(main_module, user):
+    """Regression: rich read "[/b]" in a name as markup and the session crashed."""
+    text, _ = await _run_cli(main_module, [*LOGIN, "Acme [/b] Trust", "", "quit"])
+    assert "Working with Acme [/b] Trust" in text
+
+
+async def test_cli_prints_no_terminal_control_codes(main_module, user):
+    """Regression: ESC codes in a reply could hide text (conceal) or move the cursor over it."""
+    reply = "Join us!\x1b[8m wire money\x1b[0m See you.\x07"
+    assistant = _cli_assistant(chat=AsyncMock(return_value=reply))
+    text, _ = await _run_cli(main_module, [*LOGIN, "Food Bank", "", "hi", "quit"], assistant)
+    assert "\x1b" not in text and "\x07" not in text
+    assert "wire money" in text
 
 
 async def test_cli_logs_in_after_a_wrong_password(main_module, user):
@@ -511,20 +552,19 @@ async def test_cli_refuses_an_org_the_user_cant_open(main_module, user):
     assistant_class.assert_not_called()
 
 
-async def test_cli_gives_each_user_their_own_thread(main_module, user):
+async def test_cli_gives_each_user_their_own_conversation(main_module, user):
+    """Assistant.for_user names the thread (test_assistant.py); each user gets their own."""
     await _other_user_opens("food-bank")
     await accounts.grant(USERNAME, "food-bank")
-    threads = {}
+    opened = {}
     for username in (USERNAME, "alex@food.example"):
-        text, assistant_class = await _run_cli(
-            main_module, [username, PASSWORD, "Food Bank", "", "q"]
-        )
-        threads[username] = assistant_class.call_args.kwargs["thread_id"]
+        text, for_user = await _run_cli(main_module, [username, PASSWORD, "Food Bank", "", "q"])
+        org_id, logged_in, interface = for_user.call_args.args
+        opened[username] = (org_id, logged_in.user_id, interface)
         assert "Your organizations: food-bank" in text
 
-    assert threads[USERNAME] == f"food-bank:cli-user-{user.user_id}"
-    assert len(set(threads.values())) == 2
-    assert all(thread.startswith("food-bank:cli-user-") for thread in threads.values())
+    assert opened[USERNAME] == ("food-bank", user.user_id, "cli")
+    assert len({user_id for _, user_id, _ in opened.values()}) == 2
 
 
 @pytest.mark.parametrize(
@@ -559,25 +599,11 @@ async def test_cli_shows_what_needs_attention_at_start(main_module, user):
     assert "1 approved post ready to publish" in text
 
 
-FAKE_KEY = "sk-fake-0123456789abcdef"
-# What can end a turn: a bug (any exception), and real LiteLLM errors whose own text quotes
-# the raw JSON reply or the API key.
+# What can end a turn, where the UIs differ: a bug (any exception), and a conversation too long
+# for the model, which every later turn would hit too. What each error says, and that a
+# provider's own text never shows, is test_errors.py's.
 TURN_ERRORS = [
     pytest.param(RuntimeError("rate limited at 10.0.0.5"), id="unexpected"),
-    pytest.param(
-        litellm.Timeout(
-            "Request timed out after 60s", model="claude-haiku-5-5", llm_provider="anthropic"
-        ),
-        id="timeout",
-    ),
-    pytest.param(
-        litellm.AuthenticationError(
-            f'{{"error": {{"message": "Incorrect API key provided: {FAKE_KEY}"}}}}',
-            llm_provider="openai",
-            model="gpt-4o-mini",
-        ),
-        id="bad-key",
-    ),
     pytest.param(
         litellm.ContextWindowExceededError(
             "prompt is too long: 250000 tokens > 200000 maximum",
@@ -594,7 +620,7 @@ def _assert_shown_in_plain_words(shown: str, error: Exception) -> None:
     expected = UNEXPECTED_MESSAGE if isinstance(error, RuntimeError) else user_message(error)
     assert expected in " ".join(shown.split())  # the terminal may wrap the line
     own_text = str(error).split(": ", 1)[-1]
-    for leak in (own_text, type(error).__name__, "litellm", "{", FAKE_KEY, "Traceback"):
+    for leak in (own_text, type(error).__name__, "litellm", "{", "Traceback"):
         assert leak not in shown
 
 
@@ -688,6 +714,23 @@ async def test_errors_are_shown_in_plain_words_with_a_way_forward(app, fake_cl, 
         assert fake_cl.messages[-1]["actions"] == [action]  # sent last, below the error
     else:
         assert offered == []
+
+
+async def test_an_unexpected_failure_at_session_start_is_explained_not_raised(
+    app, fake_cl, main_module
+):
+    """A broken skill file once raised TypeError here, reaching the user as a raw error."""
+    from agent.errors import UNEXPECTED_MESSAGE
+
+    boom = TypeError("unhashable type: 'list'")
+    fake_cl.session["user"] = SimpleNamespace(metadata={"user_id": 1})
+    with patch.object(accounts, "get_user", AsyncMock(side_effect=boom)):
+        await app.start()
+    with patch.object(accounts, "authenticate", AsyncMock(side_effect=boom)):
+        cli, _ = await _run_cli(main_module, LOGIN)
+    for shown in (fake_cl.sent[-1], cli):
+        assert UNEXPECTED_MESSAGE.split(";")[0] in " ".join(shown.split())
+        assert "unhashable" not in shown
 
 
 @pytest.mark.parametrize(
@@ -798,6 +841,6 @@ async def test_removing_access_ends_an_open_cli_session(main_module, user, comma
     # No "quit" answer: the session must end by itself after the refused command.
     answers = [*LOGIN, "Food Bank", "", *([command] if command else [])]
     text, assistant_class = await _run_cli(main_module, answers, assistant)
-    assert assistant_class.call_args.kwargs["user_id"] == user.user_id
+    assert assistant_class.call_args.args[1].user_id == user.user_id
     assert "You no longer have access to food-bank" in text and "session has ended" in text
     assert "Traceback" not in text

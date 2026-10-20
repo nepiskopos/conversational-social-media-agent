@@ -13,21 +13,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import unicodedata
 from pathlib import Path
 
-import psycopg
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.prompt import Prompt
 
-load_dotenv(Path(__file__).parent / ".env")
+from agent.config import load_settings
 
-from agent import accounts, db  # after load_dotenv, which config reads
+load_settings(Path(__file__).parent / ".env")
+
+from agent import accounts, db  # after load_settings, as config reads the settings
 from agent import memory as mem
 from agent.assistant import Assistant, agenda_summary
 from agent.errors import user_message
 from agent.logs import configure_logging, describe, stack
+from agent.research import website_url
 
 # Warnings and errors only, so log lines don't interrupt the conversation on screen.
 configure_logging("WARNING")
@@ -35,6 +38,16 @@ logger = logging.getLogger("agent.main")
 
 console = Console()
 LOGIN_ATTEMPTS: int = 3
+
+
+def _without_controls(text: str) -> str:
+    """
+    Text without control characters, but for line breaks and tabs.
+
+    rich passes ESC through, so a reply could carry terminal codes that hide
+    text (conceal), move the cursor over what was shown, or set the clipboard.
+    """
+    return "".join(char for char in text if char in "\n\t" or unicodedata.category(char) != "Cc")
 
 
 async def _login() -> accounts.User | None:
@@ -52,8 +65,8 @@ async def main() -> None:
     """Run the interactive CLI conversation loop, closing the database pool at the end."""
     try:
         await _converse()
-    except (db.DatabaseError, psycopg.Error) as e:
-        logger.error("The terminal session stopped: %s", describe(e))
+    except Exception as e:
+        logger.error("The terminal session stopped: %s\n%s", describe(e), stack(e))
         console.print(f"[red]{user_message(e)}[/red]")
     finally:
         await db.close_pool()
@@ -70,23 +83,28 @@ async def _converse() -> None:
 
     org_name = Prompt.ask("[bold]Organization name[/bold]")
     while not mem.slugify(org_name):
-        org_name = Prompt.ask("[bold]Organization name[/bold] [dim](required)[/dim]")
+        org_name = Prompt.ask(
+            f"[bold]Organization name[/bold] [dim](required, up to {mem.MAX_ORG_NAME_CHARS} characters)[/dim]"
+        )
     org_id = mem.slugify(org_name)
     if not await accounts.open_org(user.user_id, org_id):
-        console.print(f"[red]You don't have access to {org_name}.[/red] Ask an admin to add you.")
+        console.print(
+            f"[red]You don't have access to {escape(org_name)}.[/red] Ask an admin to add you."
+        )
         return
-    org_url = Prompt.ask("Organization website [dim](press Enter to skip)[/dim]", default="")
+    typed = Prompt.ask("Organization website [dim](press Enter to skip)[/dim]", default="")
+    while typed.strip() and not website_url(typed):
+        typed = Prompt.ask(
+            "That isn't a website address; try again, or press Enter to skip", default=""
+        )
+    org_url = website_url(typed)
 
-    profile = await mem.load_profile(org_id)
-    if not profile.get("name"):
-        await mem.fill_org_details(org_id, org_name, org_url)
+    # Kept where the org already has them, so a typed website still fills a missing one.
+    await mem.fill_org_details(org_id, org_name, org_url)
+    assistant = Assistant.for_user(org_id, user, "cli")
 
-    # One resumable thread per user and org, so two users of an org never share a conversation.
-    assistant = Assistant(
-        org_id, thread_id=f"{org_id}:cli-user-{user.user_id}", user_id=user.user_id
-    )
-
-    console.print(f"\n[dim]Working with [bold]{org_name}[/bold] (id: {org_id})[/dim]")
+    # escape: a name like "Acme [/b] Trust" is text to show, not markup that crashes rich.
+    console.print(f"\n[dim]Working with [bold]{escape(org_name)}[/bold] (id: {org_id})[/dim]")
     console.print(
         "[dim]Commands: 'quit' to exit · 'reset' to clear conversation (memory kept)[/dim]\n"
     )
@@ -147,7 +165,7 @@ async def _converse() -> None:
 
         console.print()
         console.print("[bold cyan]Mackie[/bold cyan]")
-        console.print(Markdown(response))
+        console.print(Markdown(_without_controls(response)))
         console.print()
 
 

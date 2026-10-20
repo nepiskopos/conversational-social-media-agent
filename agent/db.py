@@ -8,8 +8,8 @@ security, and the schema must be up to date), org_transaction(), which scopes
 a transaction to one org so the database itself refuses any other org's rows,
 and migrate(), which applies migrations/*.sql as the owner role and grants the
 app's role only what it needs.
-Does not own what is stored (memory.py, accounts.py) or conversation
-checkpoints (graph.py).
+Does not own what is stored (memory.py, accounts.py) or how conversation
+checkpoints are read and written (graph.py); migrate() only creates their tables.
 """
 
 from __future__ import annotations
@@ -38,12 +38,16 @@ POOL_TIMEOUT_S: float = 30.0
 STATEMENT_TIMEOUT_MS: int = 30_000
 LOCK_TIMEOUT_MS: int = 10_000
 IDLE_IN_TRANSACTION_TIMEOUT_MS: int = 60_000
+# A migration waits this long for another migrate() run, or for a lock the app holds; it has
+# no statement timeout, since changing a large table can take a while.
+MIGRATION_LOCK_TIMEOUT_MS: int = 60_000
 # The row-level security policies in migrations/ compare each row's org with this setting.
 ORG_SETTING: str = "app.org_id"
 SET_ORG_SQL: str = f"SELECT set_config('{ORG_SETTING}', %s, %s)"
 # Any constant works; it only has to be the same for every migrate() run.
 MIGRATION_LOCK_KEY: int = 7_351_002
-# Run on every migrate(), so tables added later (e.g. by a LangGraph upgrade) are covered.
+# Run on every migrate(), so the app can use tables added later (e.g. by a LangGraph upgrade);
+# test_security.py fails until a migration gives such a table a row-level security policy.
 # The app's role reads and writes rows; it can't change the schema or the migration records.
 _GRANTS_SQL: str = """
 GRANT USAGE ON SCHEMA public TO {role};
@@ -208,7 +212,11 @@ async def get_pool() -> AsyncConnectionPool:
 async def close_pool() -> None:
     """Close the running event loop's pool, if one is open. Scripts call this before exiting."""
     opening = _pools.pop(asyncio.get_running_loop(), None)
-    if opening is not None and opening.done() and not opening.exception():
+    if opening is None:
+        return
+    # An opening still under way finishes first, so the pool it opens is closed too.
+    await asyncio.wait([opening])
+    if not opening.cancelled() and opening.exception() is None:
         await opening.result().close()
 
 
@@ -247,7 +255,8 @@ async def org_transaction(
 
     The org setting is local to the transaction, so it ends with it. Every
     use of a pooled connection goes through this or transaction(), which set
-    the org they need, never pool.connection() directly; the one exception is
+    the org they need, never pool.connection() directly; the exceptions are
+    the checks made when the pool opens, which read no org rows, and
     graph.OrgCheckpointer, which sets its org on every cursor. A read-only
     transaction reads one snapshot, so a profile assembled from several tables
     is never half of another session's write.
@@ -282,7 +291,8 @@ async def migrate(owner_url: str, app_role: str) -> list[str]:
     Apply the migrations not yet applied, as the owner role, and grant the app's role its rights.
 
     LangGraph's checkpoint tables come first, since the first migration puts
-    row-level security on them. Concurrent runs wait for each other.
+    row-level security on them. Concurrent runs wait for each other, for at
+    most MIGRATION_LOCK_TIMEOUT_MS, as does any lock the migration needs.
 
     Args:
         owner_url: Connection string of the role that owns the schema.
@@ -296,7 +306,11 @@ async def migrate(owner_url: str, app_role: str) -> list[str]:
 
     applied: list[str] = []
     async with await AsyncConnection.connect(
-        owner_url, autocommit=True, row_factory=dict_row
+        owner_url,
+        autocommit=True,
+        row_factory=dict_row,
+        connect_timeout=CONNECT_TIMEOUT_S,
+        options=f"-c lock_timeout={MIGRATION_LOCK_TIMEOUT_MS}",
     ) as conn:
         await conn.execute("SELECT pg_advisory_lock(%s)", (MIGRATION_LOCK_KEY,))
         await AsyncPostgresSaver(conn).setup()
@@ -331,5 +345,5 @@ def role_of(url: str) -> str:
     """
     user = conninfo_to_dict(url).get("user")
     if not user:
-        raise DatabaseError("MACKIE_DATABASE_URL must name the user Mackie connects as.")
+        raise DatabaseError("A database URL must name the user it connects as (user@host).")
     return str(user)

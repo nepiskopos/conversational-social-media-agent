@@ -18,6 +18,7 @@ Exit code is 0 on success, 1 if something is missing or fails.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import secrets
@@ -26,13 +27,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).parent.parent / ".env")
+from agent.config import load_settings  # noqa: E402 - needs the path set above
+
+load_settings(Path(__file__).parent.parent / ".env")
 
 import psycopg
 
-from agent import accounts, db  # after load_dotenv and the path change
+from agent import accounts, db  # after load_settings and the path change
 
 DEFAULT_USERNAME: str = "admin"
 # Bytes of randomness in a generated default password (24 URL-safe characters).
@@ -67,6 +69,14 @@ async def ensure_default_user() -> str:
     return f"Created the default account {username} with the password in MACKIE_DEFAULT_PASSWORD."
 
 
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    """No options: parsing makes --help print usage instead of running the migration."""
+    parser = argparse.ArgumentParser(
+        description="Create or update Mackie's database schema, and the default account."
+    )
+    return parser.parse_args(argv)
+
+
 async def run() -> int:
     """Apply the migrations and print what was done; return the exit code."""
     owner_url = os.getenv("MACKIE_MIGRATION_URL", "").strip()
@@ -98,5 +108,6 @@ async def run() -> int:
 if __name__ == "__main__":
     from agent.logs import configure_logging
 
+    parse_args(sys.argv[1:])
     configure_logging("INFO")  # account changes are on record
     sys.exit(asyncio.run(run()))

@@ -5,7 +5,6 @@ as JSON, and moving the old data/ folders into the database). The account and
 storage rules themselves are owned by test_accounts.py and test_memory.py.
 """
 
-import importlib.util
 import io
 import json
 from pathlib import Path
@@ -13,45 +12,38 @@ from unittest.mock import patch
 
 import pytest
 
-SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
-
-
-def _load(name: str):
-    """Import scripts/<name>.py as a module."""
-    spec = importlib.util.spec_from_file_location(f"mackie_{name}", SCRIPTS_DIR / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from tests.conftest import load_script
 
 
 @pytest.fixture(scope="module")
 def migrate():
-    return _load("migrate")
+    return load_script("migrate")
 
 
 @pytest.fixture(scope="module")
 def users():
-    return _load("users")
+    return load_script("users")
 
 
 @pytest.fixture(scope="module")
 def export_profile():
-    return _load("export_profile")
+    return load_script("export_profile")
 
 
 @pytest.fixture(scope="module")
 def import_profiles():
-    return _load("import_profiles")
-
-
-@pytest.fixture(autouse=True)
-def cheap_hashing():
-    """scrypt at a tiny cost: these tests are about the scripts, not hashing."""
-    with patch("agent.accounts.SCRYPT_N", 2**4):
-        yield
+    return load_script("import_profiles")
 
 
 # --- migrate.py --------------------------------------------------------------------
+
+
+def test_migrate_help_prints_usage_instead_of_migrating(migrate, capsys):
+    with pytest.raises(SystemExit) as stopped:
+        migrate.parse_args(["--help"])
+    assert stopped.value.code == 0
+    assert "usage: " in capsys.readouterr().out
+    assert migrate.parse_args([]) is not None
 
 
 async def test_migrate_needs_the_owner_connection_string(migrate, capsys):
@@ -241,11 +233,19 @@ async def test_export_then_import_round_trips_an_edited_profile(
     assert [post["id"] for post in profile["post_ledger"]] == ["post_001", "post_002"]
 
 
-async def test_export_writes_to_stdout_and_refuses_a_non_name(export_profile, database, capsys):
+async def test_export_writes_to_stdout_and_refuses_a_non_name_or_an_unknown_org(
+    export_profile, database, capsys
+):
+    from agent import memory as mem
+
+    await mem.fill_org_details("new-org", "New Org")
     assert await export_profile.export("New Org", None) == 0
     assert json.loads(capsys.readouterr().out)["org_id"] == "new-org"
     assert await export_profile.export("!!!", None) == 1
     assert "not an organization name" in capsys.readouterr().err
+    # A typo would export an empty profile, and importing that would create a new org.
+    assert await export_profile.export("New Orgg", None) == 1
+    assert "nothing is stored for new-orgg" in capsys.readouterr().err
 
 
 async def test_import_moves_the_old_data_folders(import_profiles, database, tmp_path, capsys):

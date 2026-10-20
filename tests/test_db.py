@@ -59,12 +59,20 @@ def test_role_of_reads_the_user_from_a_connection_string():
         role_of("postgresql://db/mackie")
 
 
-def test_migration_files_are_numbered_and_in_order():
-    from agent.db import migration_files
+def test_migration_files_are_the_numbered_sql_files_in_order(tmp_path):
+    from agent import db
 
-    names = [path.name for path in migration_files()]
-    assert names[0] == "001_initial.sql"
-    assert names == sorted(names)
+    for name in ("010_later.sql", "002_next.sql", "1_unnumbered.sql", "README.md", "003_x.txt"):
+        (tmp_path / name).write_text("")
+    with patch("agent.db.MIGRATIONS_DIR", tmp_path):
+        assert [path.name for path in db.migration_files()] == ["002_next.sql", "010_later.sql"]
+
+
+def test_shipped_migrations_have_unique_versions_from_one():
+    from agent.db import _migration_version, migration_files
+
+    versions = [_migration_version(path) for path in migration_files()]
+    assert versions == list(range(1, len(versions) + 1))
 
 
 async def test_the_pool_sets_timeouts_on_every_connection(database):
@@ -158,6 +166,51 @@ async def test_close_pool_without_a_pool_does_nothing(fresh_pool):
     from agent import db
 
     await db.close_pool()
+    assert asyncio.get_running_loop() not in db._pools
+
+
+async def test_close_pool_closes_a_pool_that_was_still_opening(fresh_pool, monkeypatch):
+    """Dropping a pending opening would leave the pool it then opened with no one to close it."""
+    from agent import db
+
+    may_open = asyncio.Event()
+    pool = AsyncMock()
+
+    async def slow_open():
+        await may_open.wait()
+        return pool
+
+    monkeypatch.setattr(db, "_open_pool", slow_open)
+    getting = asyncio.ensure_future(db.get_pool())
+    await asyncio.sleep(0)
+    closing = asyncio.ensure_future(db.close_pool())
+    await asyncio.sleep(0)
+    may_open.set()
+    assert await getting is pool
+    await closing
+    pool.close.assert_awaited_once()
+
+
+async def test_close_pool_after_a_pool_that_failed_to_open_does_nothing(fresh_pool, monkeypatch):
+    """A script that couldn't reach the database still exits cleanly."""
+    from agent import db
+
+    may_fail = asyncio.Event()
+
+    async def failing_open():
+        await may_fail.wait()
+        raise db.DatabaseError("MACKIE_DATABASE_URL is not set.")
+
+    monkeypatch.setattr(db, "_open_pool", failing_open)
+    getting = asyncio.ensure_future(db.get_pool())
+    await asyncio.sleep(0)
+    closing = asyncio.ensure_future(db.close_pool())
+    await asyncio.sleep(0)
+    may_fail.set()
+    with pytest.raises(db.DatabaseError):
+        await getting
+    await asyncio.wait_for(closing, 5)  # returns, rather than raising the opening's error
+    assert asyncio.get_running_loop() not in db._pools
 
 
 async def test_org_transaction_is_scoped_to_its_org_and_ends_with_it(database):
@@ -296,3 +349,16 @@ async def test_a_failed_transaction_rolls_back_and_returns_its_connection(fresh_
     async with db.org_transaction("org-a", read_only=True) as conn:
         row = await (await conn.execute("SELECT name FROM orgs")).fetchone()
     assert row == {"name": "Original"}
+
+
+async def test_migrate_gives_up_on_a_connect_or_a_lock_instead_of_waiting_forever(monkeypatch):
+    """A migrate run hung on another's lock left the Compose stack waiting with no output."""
+    from agent import db
+
+    connect = AsyncMock(side_effect=RuntimeError("stop after connecting"))
+    monkeypatch.setattr(db.AsyncConnection, "connect", connect)
+    with pytest.raises(RuntimeError):
+        await db.migrate("postgresql://owner@db/mackie", "mackie_app")
+    settings = connect.await_args.kwargs
+    assert settings["connect_timeout"] == db.CONNECT_TIMEOUT_S
+    assert f"lock_timeout={db.MIGRATION_LOCK_TIMEOUT_MS}" in settings["options"]

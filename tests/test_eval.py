@@ -8,26 +8,17 @@ The judge and the assistant are mocked, so no LLM or network is used.
 """
 
 import asyncio
-import importlib.util
 import json
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-EVAL_PATH = Path(__file__).parent.parent / "scripts" / "eval.py"
+from tests.conftest import load_script
 
 
 @pytest.fixture(scope="module")
 def eval_module():
-    """Import scripts/eval.py without loading the real .env into the test process."""
-    spec = importlib.util.spec_from_file_location("mackie_eval", EVAL_PATH)
-    module = importlib.util.module_from_spec(spec)
-    with patch("dotenv.load_dotenv"):
-        spec.loader.exec_module(module)
-    sys.modules.pop("mackie_eval", None)
-    return module
+    return load_script("eval")
 
 
 def _post(post_id: str, title: str, source_url: str = "https://org.example/about", **extra) -> dict:

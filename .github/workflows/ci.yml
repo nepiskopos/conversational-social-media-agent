@@ -6,10 +6,20 @@ on:
   pull_request:
     branches: [main]
 
+# The jobs only read the repository.
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request supersedes a run still going.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         # Throwaway database server; tests/conftest.py creates a database per run (and its
@@ -20,7 +30,8 @@ jobs:
         ports:
           - 55432:5432
         options: >-
-          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+          --health-cmd "pg_isready -h 127.0.0.1" --health-interval 2s --health-timeout 5s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
 
@@ -50,6 +61,7 @@ jobs:
   browser:
     name: Browser tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         # Throwaway database server; tests/conftest.py creates a database per run (and its
@@ -60,7 +72,8 @@ jobs:
         ports:
           - 55432:5432
         options: >-
-          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+          --health-cmd "pg_isready -h 127.0.0.1" --health-interval 2s --health-timeout 5s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
 
@@ -74,11 +87,12 @@ jobs:
 
       - name: Run browser tests
         # The real web UI in headless Chromium, with a scripted model: no API keys needed.
-        run: pytest -m browser -v
+        run: MACKIE_BROWSER_REQUIRED=1 pytest -m browser -v
 
   deploy:
     name: Docker deployment
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # Its own project name, so the stack can never be mistaken for, or reuse the database
       # volume of, a real deployment on the same Docker host (e.g. when run locally with act).
@@ -95,10 +109,12 @@ jobs:
         run: pip install -r requirements-dev.txt && playwright install --with-deps chromium
 
       - name: Write a .env with throwaway secrets
-        # Placeholder model keys: the check never calls a model.
+        # Placeholder model and search keys: the check never calls a model or searches.
         run: |
-          grep -vE '^(POSTGRES_PASSWORD|MACKIE_OWNER_PASSWORD|MACKIE_APP_PASSWORD|MACKIE_DEFAULT_PASSWORD|CHAINLIT_AUTH_SECRET)=' .env.example > .env
+          grep -vE '^(POSTGRES_PASSWORD|MACKIE_OWNER_PASSWORD|MACKIE_APP_PASSWORD|MACKIE_DEFAULT_PASSWORD|CHAINLIT_AUTH_SECRET|ANTHROPIC_API_KEY|TAVILY_API_KEY)=' .env.example > .env
           {
+            echo "ANTHROPIC_API_KEY=sk-ant-placeholder"
+            echo "TAVILY_API_KEY=tvly-placeholder"
             echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)"
             echo "MACKIE_OWNER_PASSWORD=$(openssl rand -hex 16)"
             echo "MACKIE_APP_PASSWORD=$(openssl rand -hex 16)"
@@ -107,7 +123,7 @@ jobs:
           } >> .env
 
       - name: Start the stack
-        run: docker compose up --build --detach --wait mackie
+        run: docker compose up --build --detach --wait --wait-timeout 300 mackie
 
       - name: Check the deployment's settings
         # Each value is captured before it is compared, so a failed command fails the step

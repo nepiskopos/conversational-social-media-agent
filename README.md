@@ -6,20 +6,20 @@ Mackie is a conversational social media manager for nonprofit marketing teams. I
 - **Create:** posts for LinkedIn, Instagram and Facebook, plus supporter email, in your own voice, each with an idea for the visual.
 - **Optimize:** tell Mackie how posts performed and it suggests what to post next based on what worked.
 
-Like a teammate, Mackie doesn't wait to be asked: each session opens with what needs you (drafts to approve, posts to publish, planned posts due this week, results to report). Nothing goes live without your approval. It researches your organization first, learns your voice from feedback, and keeps a ledger of every post and its status. Your team still publishes the posts and makes the final graphics.
+Like a teammate, Mackie doesn't wait to be asked: each session opens with what needs you (drafts to approve, posts to publish, planned posts due this week, results to report). Nothing is approved without you, and your team still publishes the posts and makes the final graphics.
 
 ## Features
 
-- **Research before writing.** Reads your homepage and up to three About/Programs-style pages, runs three web searches in parallel, and keeps a short cited org brief for every session. Every suggestion names its source.
-- **Platform-aware drafts.** Each platform's tone, length and hashtag rules live in a YAML file. Length, hashtag and visual rules are enforced in code on finished drafts, and checked again before a post is approved or marked posted; rough ideas are exempt. Email (subject, preview text, one call to action) is a platform too. Instagram and Facebook drafts must describe the photo or graphic to pair with them.
-- **Content types, formats and pillars.** Donation appeals, volunteer calls and event announcements follow a defined structure. Each post format plays its own role, and Mackie picks the one that fits: feed posts are the lasting record, carousels teach step by step, stories keep followers close, and reels reach new people. Story frames, carousel slides and reel shot lists are written out in full. Five editorial pillars frame suggestions. All three are editable YAML.
-- **Learns from feedback.** Corrections are saved in your own words, a sentence or two each. Approved and pasted posts become voice examples. Ask "what have you learned about us?" or "forget that rule" at any time. All of it carries over to future sessions.
-- **Post ledger.** Every suggestion and draft is tracked with a title, status (`suggested`, `draft`, `approved`, `posted`, `planned`, `rejected`), versions and dates, so "what did we work on this week?" has an answer. If a reply shows posts the model forgot to save, Mackie saves them and lists their ledger ids underneath.
-- **Content calendar.** A dated four-week plan for any month, two posts a week by default (one to three), mixing platforms and formats, generated in parallel and saved to the ledger. Each week is tied to an awareness day, giving day or org event when one falls in it, serves the campaign you name ("plan November around our year-end appeal"), and builds on your best-performing posts.
-- **Learns what works.** Report results in plain words ("the volunteer post got 240 likes and 30 shares", "that email raised $400") and Mackie records them on the post. Your best performers are shown to Mackie on every turn, so "what should we post next?" is answered from evidence.
-- **Any LLM provider.** Ten built-in providers plus anything LiteLLM supports. Extra configured providers act as automatic fallbacks.
-- **Accounts.** Each person logs in, and sees only the organizations they belong to. Each org's data is kept apart by the database itself.
-- **No-code changes.** Add a platform, content type or format by dropping in a YAML file; it applies from the next message. Edit what Mackie learned in an exported JSON file and import it back. A broken skill file is skipped and reported, and an edited export with a mistake is refused; neither stops Mackie.
+- **Research before writing.** Reads your homepage and up to three About/Programs-style pages, runs three web searches, and keeps a short cited org brief for every session. Every suggestion names its source.
+- **Platform-aware drafts.** Each platform's tone, length and hashtag rules live in a YAML file and are enforced on finished drafts, and again before a post is approved; rough ideas are exempt. Instagram and Facebook drafts must describe the photo or graphic to pair with them. Email (subject, preview text, one call to action) is a platform too.
+- **Content types, formats and pillars.** Donation appeals, volunteer calls and event announcements follow a defined structure. Mackie picks the format that fits (feed posts are the lasting record, carousels teach step by step, stories keep followers close, reels reach new people) and writes out story frames, carousel slides and reel shot lists in full. Five editorial pillars frame suggestions.
+- **Learns from feedback.** Corrections are saved in your own words, a sentence or two each, and approved or pasted posts become voice examples. Only what you type or approve is learned, so a web page Mackie reads can't teach it anything. Ask "what have you learned about us?" or "forget that rule" at any time. All of it carries over to future sessions.
+- **Post ledger.** Every suggestion and draft is tracked with a title, status (`suggested`, `draft`, `approved`, `posted`, `planned`, `rejected`), versions and dates, so "what did we work on this week?" has an answer.
+- **Content calendar.** A dated four-week plan for any month, two posts a week by default (one to three), mixing platforms and formats. Each week is tied to an awareness day, giving day or org event when one falls in it, serves the campaign you name ("plan November around our year-end appeal"), and builds on your best-performing posts.
+- **Learns what works.** Report results in plain words ("the volunteer post got 240 likes and 30 shares", "that email raised $400") and Mackie records them, so "what should we post next?" is answered from evidence.
+- **Any LLM provider.** Ten built-in providers plus anything LiteLLM supports; extra configured providers act as automatic fallbacks.
+- **Accounts.** Each person logs in and sees only the organizations they belong to; the database itself keeps each org's data apart.
+- **No-code changes.** Add a platform, content type or format by dropping in a YAML file; it applies from the next message. Edit what Mackie learned in an exported JSON file and import it back. A broken file is reported, never fatal.
 
 ## Quick Start
 
@@ -27,49 +27,62 @@ You need a [Tavily](https://tavily.com) API key (free tier available), a key for
 
 ### Docker
 
-```bash
-cp .env.example .env   # set TAVILY_API_KEY, one provider key, the three database passwords,
-                       # MACKIE_DEFAULT_PASSWORD and CHAINLIT_AUTH_SECRET (see the file's comments)
-docker compose up --build -d   # http://localhost:8000: log in as admin with MACKIE_DEFAULT_PASSWORD
-```
+1. `cp .env.example .env`, then set in `.env`:
+   - `TAVILY_API_KEY` and one provider key, such as `ANTHROPIC_API_KEY`;
+   - `POSTGRES_PASSWORD`, `MACKIE_OWNER_PASSWORD` and `MACKIE_APP_PASSWORD`: letters and digits, e.g. the output of `openssl rand -hex 24`, one each;
+   - `MACKIE_DEFAULT_PASSWORD`: the password of the `admin` account, 12 characters or more;
+   - `CHAINLIT_AUTH_SECRET`: e.g. the output of `openssl rand -hex 32`.
 
-Compose starts PostgreSQL (reachable only by Mackie's containers), creates or updates the schema, makes sure the default account exists, then starts Mackie.
+   Leave `MACKIE_DATABASE_URL` and `MACKIE_MIGRATION_URL` as they are: Compose builds both from the passwords.
+2. Start it:
+
+   ```bash
+   docker compose up --build -d
+   ```
+
+3. Open http://localhost:8000 and log in as `admin` with `MACKIE_DEFAULT_PASSWORD`.
+
+Compose starts PostgreSQL (reachable only by Mackie's containers), creates or updates the schema, makes sure the default account exists, then starts Mackie. Compose refuses to start while any of the passwords or the secret is missing. The web UI answers only on this machine; see [Running it for your team](#running-it-for-your-team).
 
 ### Local (Python 3.12; Linux, macOS, or WSL on Windows)
 
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt   # runtime + test dependencies
-cp .env.example .env                  # set the keys, the two database URLs and CHAINLIT_AUTH_SECRET
-python scripts/migrate.py             # create or update the schema, and the default account
+1. Create the database and Mackie's two roles once, as a PostgreSQL superuser (e.g. `psql -U postgres`). Mackie connects as `mackie_app`, which can only read and write rows; `mackie_owner` owns the schema and is used only for migrations. Neither may be a superuser, since that would bypass the per-org protection. Use passwords of letters and digits (e.g. `openssl rand -hex 24`), as they go into connection URLs:
 
-chainlit run app.py   # web UI at http://localhost:8000
-python main.py        # or the terminal version
-```
+   ```sql
+   CREATE ROLE mackie_owner LOGIN PASSWORD 'owner-password';
+   CREATE ROLE mackie_app LOGIN PASSWORD 'app-password';
+   CREATE DATABASE mackie OWNER mackie_owner;
+   REVOKE ALL ON DATABASE mackie FROM PUBLIC;
+   GRANT CONNECT ON DATABASE mackie TO mackie_app;
+   \c mackie
+   REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+   ALTER SCHEMA public OWNER TO mackie_owner;
+   ```
 
-`scripts/migrate.py` makes sure a default account exists, so there is always someone who can log in: `MACKIE_DEFAULT_USERNAME` (`admin` unless set) with the password `MACKIE_DEFAULT_PASSWORD`. Without a password set, it makes a random one and prints it once. An existing account is never changed, so a password changed with `scripts/users.py passwd` stays changed.
+2. Install Mackie and configure it:
 
-The database needs two roles, neither a superuser: an owner for the schema (`MACKIE_MIGRATION_URL`) and the role Mackie connects as (`MACKIE_DATABASE_URL`). `docker/postgres-init.sh` shows how to create them. Mackie refuses to start as a superuser, since that would bypass the per-org protection.
+   ```bash
+   python3.12 -m venv .venv              # any Python 3.12
+   source .venv/bin/activate             # the commands below assume this; or call .venv/bin/python
+   pip install -r requirements.txt       # requirements-dev.txt instead to run the tests
+   cp .env.example .env
+   ```
 
-### Users and access
+   In `.env`, put the two passwords into `MACKIE_DATABASE_URL` and `MACKIE_MIGRATION_URL` (in place of `CHANGE_ME`), and set `TAVILY_API_KEY`, one provider key, `CHAINLIT_AUTH_SECRET` (e.g. the output of `openssl rand -hex 32`) and `MACKIE_DEFAULT_PASSWORD` (12 characters or more).
 
-```bash
-python scripts/users.py add alice@example.org                # asks for a password (12+ characters)
-python scripts/users.py grant alice@example.org "BRCA Strong"
-python scripts/users.py revoke alice@example.org "BRCA Strong"
-python scripts/users.py passwd alice@example.org             # also unlocks the account
-python scripts/users.py remove alice@example.org
-python scripts/users.py list
-```
+3. Create the schema and the default account, then start Mackie:
 
-In Docker, prefix each command with `docker compose run --rm mackie`. A user who starts a new organization becomes its member; an existing one needs a `grant`. Five wrong passwords in a row lock an account for 15 minutes. A `revoke` or `remove` also ends chats that are already open: their next message is refused.
+   ```bash
+   python scripts/migrate.py   # safe to run again after every update
+   chainlit run app.py         # web UI at http://localhost:8000
+   python main.py              # or the terminal version
+   ```
 
-### First run
+   Log in as `admin` with `MACKIE_DEFAULT_PASSWORD`. Without it, `migrate.py` makes a random password and prints it this once.
 
-Log in, then tell Mackie your organization's name and website and confirm. The first time you ask for content, it researches the org, which takes about 5–20 seconds. The research is saved, so later sessions skip this step. New orgs are invited to paste 2–3 recent posts so Mackie can learn their voice.
+## Using Mackie
 
-Your conversation with an organization carries on where it left off, after a refresh or on another day: the web UI shows the last few messages again and offers **Start a new conversation**; the terminal says it is carrying on, and `reset` starts afresh. Either way, what Mackie learned is kept. Each person has their own conversation; the web UI and the terminal have one each. In the terminal, `quit` exits.
+Log in, then tell Mackie your organization's name, and its website if it has one (the web UI asks at every visit, waits two minutes for an answer and asks you to confirm). Mackie reads only the website given here, never one a web page or the conversation suggests; a website typed for an org that has none yet is added, and changing one is done in an [exported profile](#edit-what-mackie-learned). The first time you ask for content, it researches the org, which takes about 5–20 seconds. The research is saved, so later sessions skip this step; ask Mackie to update its research when your site or news changes. In the web UI, new orgs are invited to paste 2–3 recent posts so Mackie can learn their voice.
 
 A typical conversation:
 
@@ -83,46 +96,69 @@ Which posts have we worked on so far, and what's the status of each?
 Suggest another post for next month.
 ```
 
-The voice correction ("warm and grassroots") applies to every later post, in this session and in future ones. The last suggestion avoids ideas that are already in the ledger.
+The voice correction ("warm and grassroots") applies to every later post, in this session and in future ones, and the last suggestion avoids ideas that are already in the ledger.
 
-### Moving from the data/ folder
+Everything happens in chat, approvals included: say "approve post_003", "drop the second idea" or "we posted it on Friday", and Mackie updates the ledger. Mackie approves only a post it has shown you, so a draft from an earlier conversation is shown in full first. A draft that breaks its platform's rules (too long, wrong hashtag count, no visual where one is needed) can't be approved until it is fixed.
 
-Earlier versions kept each org in `data/{org-id}/profile.json`. Import them once:
+Your conversation with an organization carries on where it left off, after a refresh or on another day: the web UI shows the last few messages again and offers **Start a new conversation**; the terminal says it is carrying on, and `reset` starts afresh. Either way, what Mackie learned is kept. Each person has their own conversation, one in the web UI and one in the terminal. In the terminal, `quit` exits. A message can be up to 20,000 characters; sent messages can't be edited, so send a new one instead.
+
+## Users and access
+
+`scripts/migrate.py` makes sure a default account exists, so there is always someone who can log in: `MACKIE_DEFAULT_USERNAME` (`admin` unless set) with the password `MACKIE_DEFAULT_PASSWORD`. An existing account is never changed, so a password changed with `passwd` stays changed. `admin` is an ordinary account: accounts and access are managed only with these commands, by whoever runs the server.
 
 ```bash
-python scripts/import_profiles.py data/*/profile.json
-docker compose run --rm -v ./data:/app/data:ro mackie sh -c 'python scripts/import_profiles.py data/*/profile.json'
+python scripts/users.py add alice@example.org                # asks for a password (12+ characters)
+python scripts/users.py grant alice@example.org "BRCA Strong"
+python scripts/users.py revoke alice@example.org "BRCA Strong"
+python scripts/users.py passwd alice@example.org             # also unlocks the account
+python scripts/users.py remove alice@example.org
+python scripts/users.py list
 ```
 
-The old files have no time zone, so their times are read in the importing machine's: in Docker, add `-e TZ=Europe/Athens` (your zone) after `run --rm`. Posts, preferences, voice examples and research move over. Conversation history (`data/checkpoints.db`) does not: chats start fresh. Then `grant` each user the orgs they work on.
+In Docker, prefix each command with `docker compose run --rm mackie` (`-T` after `run` when you pipe a password in). `add` and `passwd` also take `--password-stdin`, which reads the password from one line of input, for scripts.
+
+- A user who starts a new organization becomes its member; anyone else needs a `grant`.
+- Five wrong passwords in a row lock an account for 15 minutes.
+- `revoke`, `remove` and `passwd` also end chats that are already open: their next message is refused.
+
+## Running it for your team
+
+- **Serve it over HTTPS.** Compose publishes the web UI on `127.0.0.1:8000` only. Put a reverse proxy with TLS (Caddy, nginx, Traefik) in front of it for other machines, have it mark cookies `Secure`, limit request bodies to 1 MB (Mackie refuses larger ones itself), and rate-limit `/login` there: Mackie's lockout is per account, so it doesn't slow down one password tried against many accounts.
+- **Rename the default account** with `MACKIE_DEFAULT_USERNAME` before the first start, so `admin` isn't a known target.
+- **Several organizations on one server?** Set `MACKIE_USERS_CREATE_ORGS=false`, so nobody can claim an organization's name, and set its website, before its team arrives. `grant` then creates each one, and the first member to open it types its website.
+- **Back up the database**, which holds everything (org memory, accounts, conversations): `docker compose exec -T postgres pg_dump -U postgres mackie > mackie-backup.sql`. To restore it into a fresh stack, start only the database (`docker compose up -d --wait postgres`), run `docker compose exec -T postgres psql -U postgres mackie < mackie-backup.sql`, then `docker compose up -d`.
+- **Update** with `git pull`, then `docker compose up --build -d`, which also updates the schema. Locally: `pip install -r requirements.txt`, `python scripts/migrate.py`, and restart Mackie.
+- **Watch the log** (`docker compose logs mackie`) for refused logins, lockouts and failures; passwords, keys and what users write are never logged.
 
 ## Configuration
 
-All settings live in `.env`; `.env.example` lists every variable with its default.
+All runtime settings live in `.env`; `.env.example` lists each one with notes on its use.
 
 | Variable | Purpose |
 |---|---|
 | `MACKIE_DATABASE_URL` | **Required.** The PostgreSQL role Mackie connects as. It must not own the schema or be a superuser. Add `?sslmode=verify-full` for a database on another machine. |
-| `MACKIE_MIGRATION_URL` | The schema owner's role, used only by `scripts/migrate.py`. |
-| `MACKIE_DATABASE_POOL_SIZE` | Optional: database connections per Mackie process (10 unless set). A turn holds one only while a query runs, so 10 serves many simultaneous chats. |
-| `CHAINLIT_AUTH_SECRET` | **Required** for the web UI: signs login sessions. Generate one with `chainlit create-secret`. |
-| `POSTGRES_PASSWORD`, `MACKIE_OWNER_PASSWORD`, `MACKIE_APP_PASSWORD` | Docker only: passwords for the database container's superuser and Mackie's two roles. Use letters and digits. |
-| `MACKIE_DEFAULT_USERNAME`, `MACKIE_DEFAULT_PASSWORD` | The account `scripts/migrate.py` makes sure exists (`admin` unless set). The password is required with Docker. |
-| `MACKIE_LOG_LEVEL` | Optional: `DEBUG`, `INFO`, `WARNING` or `ERROR`. Unset, the web UI logs from `INFO` (logins, refused access, failures) and the terminal from `WARNING`. Passwords, keys and what users write are never logged. |
-| `TZ` | Your time zone, e.g. `Europe/Athens`: what "today" means for the agenda. Unset, the server's (UTC in Docker). |
+| `MACKIE_MIGRATION_URL` | **Required** for `scripts/migrate.py`: the schema owner's role, used for nothing else. Docker sets both URLs itself. |
+| `MACKIE_DATABASE_POOL_SIZE` | Optional: database connections per Mackie process (10 unless set); 10 serves many simultaneous chats. |
+| `CHAINLIT_AUTH_SECRET` | **Required** for the web UI: signs login sessions. |
+| `POSTGRES_PASSWORD`, `MACKIE_OWNER_PASSWORD`, `MACKIE_APP_PASSWORD` | Docker only: passwords for the database container's superuser and Mackie's two roles. |
+| `MACKIE_USERS_CREATE_ORGS` | Optional: `false` (or `0`, `no`, `off`) lets only `scripts/users.py grant` create organizations (see [Running it for your team](#running-it-for-your-team)). Unset, any logged-in user can start one. |
+| `MACKIE_DEFAULT_USERNAME`, `MACKIE_DEFAULT_PASSWORD` | The default account (see [Users and access](#users-and-access)). The password is required with Docker. |
+| `MACKIE_LOG_LEVEL` | Optional: `DEBUG`, `INFO`, `WARNING` or `ERROR`. Unset, the web UI, `users.py` and `migrate.py` log from `INFO`, the terminal and the export, import and eval scripts from `WARNING`; `validate.py` prints only its report. |
+| `TZ` | Your time zone, e.g. `Europe/Athens`: what "today" means for the agenda and date searches. Unset, the server's (UTC in Docker). |
 | `TAVILY_API_KEY` | **Required.** Web search. |
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` | A provider is used when its key is set. |
-| `QWEN_BASE_URL` + `QWEN_API_KEY` | Qwen on a self-hosted vLLM server. Both are required. From Docker, a server on the host is `http://host.docker.internal:PORT/v1`. |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`, `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` | A provider is used when its key is set. Leave the others blank: any value, even a placeholder, counts as set. |
+| `OPENCODE_BASE_URL` | Optional: OpenCode Zen's endpoint, `https://opencode.ai/zen/v1` unless set. |
+| `QWEN_BASE_URL` + `QWEN_API_KEY` | Qwen on a self-hosted vLLM server; both are required. From Docker, a server on the host is `http://host.docker.internal:PORT/v1`. |
 | `LLM_MODEL` (+ `LLM_API_BASE`, `LLM_API_KEY`) | Any other model LiteLLM supports, as a full model string, e.g. `ollama_chat/llama3.1` with `http://localhost:11434`. |
-| `{PROVIDER}_MODEL` | Optional model override for a provider, e.g. `ANTHROPIC_MODEL=claude-sonnet-5-5`. Unset, each provider uses the default in `.env.example`; Anthropic's is `claude-haiku-5-5`. |
-| `LLM_PROVIDER` | Optional. Which configured provider to use first: `custom`, `anthropic`, `openai`, `xai`, `google`, `mistral`, `groq`, `deepseek`, `openrouter`, `opencode` or `qwen`. |
-| `FAST_MODEL` | Optional. A cheaper model for background work: conversation summaries, the org brief and calendar plans. |
-| `JUDGE_MODEL` | Optional. The judge for `scripts/eval.py`. Pick a different provider, or at least a different model family, from the assistant's, so it doesn't grade its own model's work. With only an OpenCode Zen key, use a Chat Completions model such as `openai/deepseek-v4-pro`; Zen's Claude, GPT and Gemini models don't work through this path. With an OpenAI key set too, `openai/…` models go to OpenAI unless `JUDGE_PROVIDER=opencode` (otherwise Mackie prints a warning). |
-| `FAST_PROVIDER`, `JUDGE_PROVIDER` | Optional. The provider id for `FAST_MODEL` or `JUDGE_MODEL`, needed when two configured providers accept the same model string (OpenAI and OpenCode Zen both take `openai/…`). Set without a model, that provider's own model is used. |
+| `ANTHROPIC_MODEL`, `OPENAI_MODEL`, `GEMINI_MODEL`, … | Optional model for a provider, named after its key (`GEMINI_MODEL` for Google). `.env.example` shows each default; Anthropic's is `claude-haiku-5-5`. |
+| `LLM_PROVIDER` | Optional: which configured provider to use first, by id (listed in `.env.example`). |
+| `FAST_MODEL` | Optional: a cheaper model for background work (conversation summaries, the org brief, calendar plans). |
+| `JUDGE_MODEL` | Optional: the judge for `scripts/eval.py`; pick another provider, or at least another model family, than the assistant's. |
+| `FAST_PROVIDER`, `JUDGE_PROVIDER` | Optional: only needed when two configured providers accept the same model name. OpenAI and OpenCode Zen both take `openai/…`, which goes to OpenAI unless this says `opencode`. Set alone, it uses that provider's own model. |
 
-With several providers configured, the first one in this order is the main model, unless `LLM_PROVIDER` says otherwise: custom (`LLM_MODEL`), Anthropic, OpenAI, xAI, Google, Mistral, Groq, DeepSeek, OpenRouter, OpenCode Zen, Qwen. The others become fallbacks: if a request to the main model fails to start (outage, rate limit, bad key) and one retry fails too, the next one is tried.
+With several providers configured, the first one in this order is the main model, unless `LLM_PROVIDER` says otherwise: custom (`LLM_MODEL`), Anthropic, OpenAI, xAI, Google, Mistral, Groq, DeepSeek, OpenRouter, OpenCode Zen, Qwen. The others are fallbacks: if a request to the main model fails to start (outage, rate limit, bad key) and one retry fails too, the next one is tried.
 
-OpenCode Zen's free models (the `-free` ones and `big-pickle`) currently answer only requests from the OpenCode app itself. Through Mackie they return "OpenCode's free tier can only be used from within OpenCode", so Mackie's default is `glm-5.3-flash`, the cheapest paid model on Zen's Chat Completions endpoint ($0.15 in / $0.50 out per million tokens). Your OpenCode account needs credit; without it every request fails with "Insufficient account funds". Any other Chat Completions model works through `OPENCODE_MODEL`.
+**OpenCode Zen** needs an account with credit. Its free models answer only the OpenCode app, so Mackie defaults to the paid `glm-5.3-flash`; the errors "can only be used from within OpenCode" and "Insufficient account funds" mean what they say.
 
 ## Customizing Without Code
 
@@ -140,9 +176,10 @@ hashtag_style: minimal, only if natural
 format_hints: |
   - Short and punchy
   - Put the call to action in the text; there are no link previews
+needs_visual: false
 ```
 
-`id`, `name` and a whole-number `max_length` are required. Write a multi-line field with `|`, as `format_hints` does above. Mackie uses the new platform from the next message on.
+`id` (lowercase letters, digits and `_`), `name` and a whole-number `max_length` are required. Write a multi-line field with `|`, as `format_hints` does above. With `needs_visual: true`, a finished post must describe its photo or graphic, as on Instagram and Facebook. Mackie uses the new platform from the next message on.
 
 ### Add a content type
 
@@ -150,7 +187,7 @@ Copy `skills/donation_appeal.yaml` (its comments explain each field) to a new fi
 
 ### Add a format
 
-Copy `skills/carousel.yaml` (`skills/feed_post.yaml` explains each field) to a new file, keep `kind: format`, and give it a unique `id`, a `name`, a `purpose` (the role it plays) and a `structure`. List the platforms it exists on under `platforms`, or leave that out for all. Add `has_caption: false` for a format without a caption, such as a story, so the platform's hashtag rule doesn't apply.
+Copy `skills/feed_post.yaml` (its comments explain each field) to a new file, keep `kind: format`, and give it a unique `id`, a `name`, a `purpose` (the role it plays) and a `structure`. List the platforms it exists on under `platforms`, or leave that out for all. Add `has_caption: false` for a format without a caption, such as a story, so the platform's hashtag rule doesn't apply.
 
 ### Edit content pillars
 
@@ -158,84 +195,80 @@ Edit `skills/content_pillars.yaml`. To override the pillars for one org, set `"c
 
 ### Edit what Mackie learned
 
-Export the org to a JSON file, edit it in any text editor, then import it:
+Export the org to a JSON file, edit it in any text editor (saved as UTF-8), then import it:
 
 ```bash
 python scripts/export_profile.py "BRCA Strong" -o brca-strong.json
 python scripts/import_profiles.py brca-strong.json   # replaces what is stored for the org
+
+# Docker: the file is written to, and read from, this machine
+docker compose run --rm -T mackie python scripts/export_profile.py "BRCA Strong" > brca-strong.json
+docker compose run --rm -v ./brca-strong.json:/app/brca-strong.json:ro mackie \
+  python scripts/import_profiles.py brca-strong.json
 ```
 
-The file holds:
+The file holds the post ledger with any results you reported (`performance`), preferences with when and in what words each was learned (`preference_notes`), voice examples, the website, the org brief and the research.
 
-- the post ledger, including any results you reported (`performance`);
-- preferences, with when and in what words each was learned (`preference_notes`);
-- voice examples;
-- the org brief and the research.
-
-Set `"research": null` to make Mackie research the org again next session. A post you add without an `id` gets the next free one. A file with a mistake (a formatting error, with its line and column, or an unknown status) is refused and nothing changes. Import with `--check` to only check it. You can also ask in chat: "what have you learned about us?" or "forget the LinkedIn voice rule".
+- Set `"research": null` to make Mackie research the org again next session, and change `"website"` to have it read another site: research reads only the org's own website.
+- A post you add without an `id` gets the next free one.
+- A file with a mistake (a formatting error, with its line and column, an unknown status, a `scheduled_for` date that isn't `YYYY-MM-DD`) is refused and nothing changes. [Check it](#check-your-edits) first: the check names each file's first mistake without importing anything.
+- Importing an org that doesn't exist yet creates it with no members: `grant` the people who work on it.
 
 ### Check your edits
 
 ```bash
-python scripts/validate.py                               # skills/
-python scripts/validate.py brca-strong.json              # skills/ and an edited export
-docker compose exec mackie python scripts/validate.py    # Docker
+python scripts/validate.py                    # skills/
+python scripts/validate.py brca-strong.json   # skills/ and an edited export
+docker compose run --rm mackie python scripts/validate.py   # Docker (skills/ only)
 ```
 
 It lists the platforms, content types and formats it found, plus every problem in `skills/` (the content pillars file included) and in any profile file you name. It changes nothing and exits with code 1 if anything is wrong. The web UI also reports a broken skill file with a **Heads-up** at the start of each chat.
 
+## Upgrading from the data/ folder
+
+Earlier versions kept each org in `data/{org-id}/profile.json`. Import them once:
+
+```bash
+python scripts/import_profiles.py data/*/profile.json
+docker compose run --rm -v ./data:/app/data:ro mackie sh -c 'python scripts/import_profiles.py data/*/profile.json'
+```
+
+The old files have no time zone, so their times are read in the importing machine's (`TZ` in `.env`, or the server's). Posts, preferences, voice examples and research move over; conversation history (`data/checkpoints.db`) and the old tool traces (`trace.jsonl`) don't, so chats start fresh. The imported organizations have no members yet: `grant` each user the ones they work on.
+
 ## Tests and Evaluation
 
-The tests need a disposable PostgreSQL server; each run creates its own database and roles there and drops the database afterwards:
+The tests need a disposable PostgreSQL server; each run creates its own database there and drops it afterwards. Nothing calls an API or the outside network.
 
 ```bash
 docker run -d --name mackie-test-db -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=mackie \
   --tmpfs /var/lib/postgresql/data postgres:17-alpine -c fsync=off   # once; or set TEST_DATABASE_URL
-pytest                                  # no API calls, no outside network, under 30 seconds
+pytest                                  # must finish within 30 seconds
 ruff check . && ruff format --check .   # lint and formatting (settings in ruff.toml)
+pytest --cov=agent --cov=scripts --cov=app --cov=main --cov-branch --cov-fail-under=95   # as CI
+
+playwright install --with-deps chromium   # once, for the two opt-in suites below
+pytest -m browser             # the real web UI in headless Chromium, with a scripted model
+MACKIE_DEPLOYED_PASSWORD=... pytest -m deployed   # a running Compose stack (MACKIE_DEPLOYED_URL, _USERNAME)
 ```
 
-Besides a test file per module, these files cover concerns that cut across modules:
+CI runs all of these on every push and pull request to `main`, the last against a stack it builds from `.env.example`. CLAUDE.md lists what each test file covers.
 
-- `tests/test_security.py`: SSRF bypasses, malformed tool arguments, hostile org ids, org isolation (row-level security on every table, an app role that can't change the schema or switch the policies off, SQL that is stored and never run), prompt injection end to end.
-- `tests/test_performance.py`: parallel research, calendar and judge calls; responsiveness (streaming, timeouts, a slow session not stalling others); scale (prompt size that stays flat as an org's memory grows, 20,000-post ledgers); linear-time parsing.
-- `tests/test_ui.py`: the web and terminal UIs, and UX details such as streaming and error wording.
-- `tests/test_logging.py`: what is logged (logins, refused access, every absorbed failure) and what never is (secrets, what users write), and forged log lines.
-- `tests/test_errors.py`: what users are told when the database or the AI service fails, with no raw error text on screen.
-- `tests/test_sessions.py`: many people at once: concurrent sessions, two people on one org, interleaved replies, separate processes writing to one org.
+`scripts/eval.py` runs the conversation above against an org with the configured models, and saves to that org's memory like a normal chat, so use a test org; it costs API calls. It reports three kinds of checks:
 
-`tests/test_deploy.py` checks deployment settings and makes one real offline LiteLLM tool call that catches a broken LiteLLM install. A run that takes longer than 30 seconds fails (60 on CI, set with `MACKIE_TEST_BUDGET_S`).
+- **LLM judge.** Each reply is scored 0–3 on source attribution, voice consistency and not repeating earlier ideas: 21 judge calls, for a total out of 63 (70% or more is a pass).
+- **Saved data.** What the run saved, with no LLM: a preference learned by step 3, new posts in step 7, and a source on every suggestion.
+- **Memory.** A date mentioned at the start of a long conversation must survive into the summary and be recalled much later.
 
 ```bash
-pytest --cov=agent --cov=scripts --cov=app --cov=main --cov-branch   # branch coverage
+python scripts/eval.py --org "BRCA Strong eval" --url https://brcastrong.org
 ```
-
-Browser tests (`tests/browser/`) drive the real web UI in headless Chromium with a scripted model (no API calls): the login, onboarding, an org the user may not open, streaming, tool steps, a phone-width layout and two users on one org. They take about 30 seconds, so a plain `pytest` skips them:
-
-```bash
-playwright install chromium   # once
-pytest -m browser
-```
-
-CI runs lint, the tests, a 95% branch-coverage floor and the browser tests on every push and pull request, and deploys the Docker Compose stack: the migration must run cleanly and create the default account, the app must not run as root or reach the database as a privileged role, the database must not be published, and the default account must log in and onboard an organization in a browser (`tests/deployed/`, `pytest -m deployed` against a running stack).
-
-`scripts/eval.py` runs the conversation above against a real org with the configured models (this costs API calls). It reports three kinds of checks:
-
-- **LLM judge.** Each reply is scored 0–3 on source attribution, voice consistency and not repeating earlier ideas: 21 judge calls, run in parallel, for a total out of 63 (70% or more is a pass).
-- **Saved data.** Checks what the run saved, with no LLM: a preference learned by step 3, new posts in step 7, and a source on every suggestion.
-- **Memory.** A date mentioned at the start of a long conversation must survive into the summary's open requests and dates, and Mackie must recall it when asked much later. The long conversation is stored, not chatted, so this costs one summary call and one answer.
-
-```bash
-python scripts/eval.py --org "BRCA Strong" --url https://brcastrong.org
-```
-
-The eval saves to the org's real memory in the database, the same as a normal chat.
 
 ## Project Structure
 
 ```
 app.py              Web UI (Chainlit), with the login
 main.py             Terminal UI, with the login
+chainlit.md         The web UI's welcome screen
 agent/
   config.py         Provider registry and model selection
   assistant.py      System prompt and chat entry point
@@ -253,7 +286,7 @@ skills/             Platforms, content types, formats, content pillars (YAML)
 migrations/         Database schema, applied in order by scripts/migrate.py
 docker/             The database container's first-start script (roles, database)
 scripts/
-  migrate.py        Creates or updates the schema
+  migrate.py        Creates or updates the schema and the default account
   users.py          Accounts and their org access
   export_profile.py / import_profiles.py   An org's memory as an editable JSON file
   validate.py       Checks skills/ and profile files
@@ -261,17 +294,15 @@ scripts/
 tests/              Tests; tests/browser/ drives the real web UI, tests/deployed/ a running Compose stack
 ```
 
-The `tool_calls` table logs every tool call with its input, a result preview and its latency.
-
 See [design_doc.md](design_doc.md) for the architecture and the reasons behind each design choice.
 
 ## Known Limitations
 
-- **Password logins only.** No single sign-on (OAuth) and no self-service password reset; an admin runs `scripts/users.py`. Removing someone's access stops their open chats at the next message; a reply already being written finishes.
-- **One conversation per person, organization and screen.** Two browser tabs of the same person on one organization share their conversation and take turns; two terminals (separate processes), or two servers, don't, and replies sent at the same moment can overwrite each other's history.
-- **Serve it over HTTPS.** Put Mackie behind a reverse proxy with TLS, or passwords and session cookies cross the network in the clear.
-- **No publishing.** Mackie drafts posts but does not publish them. `posted` is only a status in the ledger.
-- **Results are entered by hand.** Mackie doesn't connect to platform analytics; you tell it the numbers in chat. It doesn't run paid ads.
+- **Password logins only.** No single sign-on (OAuth) and no self-service password reset; an admin runs `scripts/users.py`. A reply already being written when someone's access is removed still finishes.
+- **A misspelled organization name starts a new organization.** Check `scripts/users.py list` before granting access to one.
+- **One conversation per person, organization and interface (web or terminal).** Two browser tabs of the same person share their conversation and take turns; two terminals, or two servers, don't, and replies sent at the same moment can overwrite each other's history.
+- **No publishing.** Mackie drafts posts but does not publish them; `posted` is only a status in the ledger.
+- **Results are entered by hand.** Mackie doesn't connect to platform analytics and doesn't run paid ads.
 - **Static websites only.** Sites rendered by JavaScript yield little text.
 - **No image generation.** Mackie describes the visual for each post; your team makes it.
 

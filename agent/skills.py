@@ -13,6 +13,7 @@ rendered into the prompt (assistant.py) or used by tools (tools.py).
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,8 @@ TEXT_FIELDS: tuple[str, ...] = (
 )
 LIST_FIELDS: tuple[str, ...] = ("must_include", "avoid", "platforms")
 BOOL_FIELDS: tuple[str, ...] = ("has_caption", "needs_visual")
+# Ids, and the platform ids a format lists, are compared with what the model sends, lowercased.
+ID_PATTERN: re.Pattern[str] = re.compile(r"[a-z0-9_]+")
 
 logger = logging.getLogger(__name__)
 # Skill-file problems already logged by this process.
@@ -87,12 +90,14 @@ def _skill_problem(skill: Any, file_name: str) -> str | None:
     if not isinstance(skill, dict):
         return f"{file_name}: expected 'field: value' lines, found something else"
     kind = skill.get("kind", "platform")
-    if kind not in REQUIRED_FIELDS:
+    if not isinstance(kind, str) or kind not in REQUIRED_FIELDS:
         return f"{file_name}: kind must be one of {', '.join(REQUIRED_FIELDS)} (found {kind!r})"
     missing = [name for name in REQUIRED_FIELDS[kind] if not skill.get(name)]
     if missing:
         return f"{file_name}: missing required field(s) {', '.join(missing)}"
-    if kind == "platform" and not isinstance(skill["max_length"], int):
+    max_length = skill.get("max_length")
+    # bool is a kind of int in Python, but "max_length: true" is no length.
+    if kind == "platform" and (isinstance(max_length, bool) or not isinstance(max_length, int)):
         return f"{file_name}: max_length must be a whole number (found {skill['max_length']!r})"
     for name in TEXT_FIELDS:
         if name in skill and not isinstance(skill[name], str):
@@ -101,6 +106,14 @@ def _skill_problem(skill: Any, file_name: str) -> str | None:
         value = skill.get(name, [])
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             return f"{file_name}: {name} must be a list of '- ' lines"
+    if "platforms" in skill and not skill["platforms"]:
+        return f"{file_name}: list the platforms under platforms, or leave it out for all"
+    for value in [skill["id"], *skill.get("platforms", [])]:
+        if not ID_PATTERN.fullmatch(value):
+            return (
+                f"{file_name}: {value!r} must be written in lowercase letters, digits and "
+                "underscores only (e.g. feed_post)"
+            )
     for name in BOOL_FIELDS:
         if name in skill and not isinstance(skill[name], bool):
             return f"{file_name}: {name} must be true or false"
@@ -176,8 +189,9 @@ def load_content_pillars(profile: dict[str, Any]) -> list[dict[str, Any]]:
     Return the content pillars for an org.
 
     A per-org "content_pillars" list in the profile replaces the defaults in
-    skills/content_pillars.yaml. Entries without a name are dropped; an
-    unreadable pillars file yields no pillars rather than an error.
+    skills/content_pillars.yaml. Entries without a name are dropped; a
+    missing, unreadable or malformed pillars file yields no pillars rather
+    than an error (load_skills reports what is wrong with it).
 
     Args:
         profile: Already-loaded org profile dict.
@@ -188,14 +202,13 @@ def load_content_pillars(profile: dict[str, Any]) -> list[dict[str, Any]]:
     pillars = profile.get("content_pillars")
     if not pillars:
         path = SKILLS_DIR / PILLARS_FILE
-        try:
-            pillars = (_load_yaml(path.read_text(encoding="utf-8")) or {}).get("pillars", [])
-        except (OSError, UnicodeDecodeError, yaml.YAMLError, AttributeError) as e:
-            logger.warning("Could not read %s — %s", PILLARS_FILE, e)
-            return []
+        data = _read_yaml(path)[0] if path.exists() else None
+        pillars = data.get("pillars") if isinstance(data, dict) else None
+    if not isinstance(pillars, list):
+        return []
     return [
         {"name": p["name"], "description": p.get("description", "")}
-        for p in pillars or []
+        for p in pillars
         if isinstance(p, dict) and p.get("name")
     ]
 
@@ -208,6 +221,8 @@ def hashtag_range(skill: dict[str, Any]) -> tuple[int, int] | None:
     checks are skipped rather than wrong.
     """
     value = skill.get("hashtag_count")
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int):
         return value, value
     if not isinstance(value, str):

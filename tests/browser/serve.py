@@ -46,7 +46,7 @@ def _scripted_model(data_dir: Path):
     """An acompletion stand-in that answers each session from its own messages."""
     from tests.llm_fakes import text_stream, tool_call_stream  # importable once main() set the path
 
-    async def gated_stream():
+    async def stream_until_released():
         async for chunk in text_stream(FIRST_SENTENCE):
             if chunk.choices[0].finish_reason:
                 break
@@ -65,7 +65,7 @@ def _scripted_model(data_dir: Path):
             post = {"platform": "general", "content": said, "title": said.removeprefix("save ")}
             return tool_call_stream("tc-save", "save_post", json.dumps(post))
         if said == "stream slowly":
-            return gated_stream()
+            return stream_until_released()
         return text_stream(f"You said: {said}. Messages I can see: {len(user_messages)}.")
 
     return model
@@ -89,12 +89,10 @@ def main() -> None:
     os.chdir(REPO_ROOT)
     sys.path.insert(0, str(REPO_ROOT))
 
-    import agent.accounts as accounts
     import agent.graph as graph
     import agent.tools as tools
 
     asyncio.run(_create_users())
-    accounts.SCRYPT_N = 2**4
     graph.litellm.acompletion = tools.litellm.acompletion = _scripted_model(data_dir)
 
     os.environ.update(CHAINLIT_HOST="127.0.0.1", CHAINLIT_PORT=port)

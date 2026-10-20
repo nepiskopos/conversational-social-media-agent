@@ -111,8 +111,9 @@ def configure_logging(default_level: str) -> None:
     filter, so every library's lines are masked as well. Otherwise a stderr
     handler is added. The web UI logs from INFO, so logins and access changes
     are recorded, and so do scripts/users.py and scripts/migrate.py; the
-    terminal UI and the other scripts from WARNING, so their screens stay
-    readable. Safe to call more than once. An unknown level falls back to
+    terminal UI and the export, import and eval scripts from WARNING, so their
+    screens stay readable (scripts/validate.py silences the skill problems it
+    reports itself). Safe to call more than once. An unknown level falls back to
     default_level, and says so.
     """
     root = logging.getLogger()
