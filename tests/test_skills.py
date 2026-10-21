@@ -4,7 +4,8 @@ Unit tests for agent/skills.py: loading and validating skills/*.yaml.
 Owns: load_skills (sorting files into platforms, content types and formats;
 skipping and reporting a missing or wrongly typed field, bad YAML, a non-UTF-8
 or unreadable file, a duplicate id), the content pillars (file, per-org
-override, problems), hashtag_range, the shipped skills/ files, and the same
+override, problems), the content guardrails (file, problems, blocked-term
+matching), hashtag_range, the shipped skills/ files, and the same
 result with or without PyYAML's C parser. Does not own how skills reach the
 prompt (test_assistant.py) or the validate.py report (test_validate.py).
 """
@@ -160,6 +161,111 @@ def test_per_org_pillars_that_are_not_a_list_mean_no_pillars(skills_dir):
     assert load_content_pillars({"content_pillars": 5}) == []
 
 
+def test_an_edited_skill_file_is_read_on_the_next_load_and_a_changed_copy_is_not_kept(skills_dir):
+    """Each version of a file is parsed once, as the files are read on every model call."""
+    from agent.skills import load_skills
+
+    (skills_dir / "test.yaml").write_text(PLATFORM_YAML)
+    load_skills().platforms[0]["max_length"] = 1  # a caller changing what it got
+    assert load_skills().platforms[0]["max_length"] == 500
+    (skills_dir / "test.yaml").write_text(PLATFORM_YAML.replace("500", "800"))
+    assert load_skills().platforms[0]["max_length"] == 800
+
+
+def test_a_quick_same_size_edit_is_read_whatever_the_file_times_say(skills_dir):
+    """
+    Regression: the cache was keyed by the file's times and size, which Linux often
+    records to a few milliseconds, and a copy can keep (cp -p): the old guardrails stayed.
+    """
+    import os
+
+    from agent.skills import load_guardrails
+
+    path = skills_dir / "guardrails.yaml"
+    path.write_text("blocked_terms:\n  - damn\n")
+    before = path.stat()
+    assert load_guardrails().blocked_terms == ("damn",)
+    path.write_text("blocked_terms:\n  - crap\n")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert load_guardrails().blocked_terms == ("crap",)
+
+
+def test_a_skill_file_gone_before_it_is_read_is_reported_not_raised(skills_dir):
+    """Deleted while the folder is listed (here, a link to nothing): a problem, not a crash."""
+    from agent.skills import load_skills
+
+    (skills_dir / "gone.yaml").symlink_to(skills_dir / "missing.yaml")
+    assert load_skills().problems == ["gone.yaml: can't be read (No such file or directory)"]
+
+
+def test_load_guardrails_reads_rules_and_blocked_terms(skills_dir):
+    from agent.skills import Guardrails, load_guardrails, load_skills
+
+    (skills_dir / "guardrails.yaml").write_text(
+        "rules:\n  - Be kind.\n  - Keep politics out.\nblocked_terms:\n  - damn*\n  - vote for\n"
+    )
+    assert load_guardrails() == Guardrails(
+        ("Be kind.", "Keep politics out."), ("damn*", "vote for")
+    )
+    assert load_skills().problems == []  # not read as a platform file
+
+
+@pytest.mark.parametrize(
+    "text, rules, terms, problem",
+    [
+        (None, (), (), None),  # no file: no guardrails, and nothing to fix
+        ("rules: [unclosed\n", (), (), "not valid YAML"),
+        ("- Be kind.\n", (), (), "expected 'rules:' and 'blocked_terms:' lists"),
+        ("rules: Be kind.\n", (), (), "rules must be a list of '- ' lines"),
+        # One typo doesn't switch the other guardrails off.
+        ("rules:\n  - Be kind.\n  - 5\nblocked_terms:\n  - damn\n", ("Be kind.",), ("damn",), "rules must be"),
+        # A lone * would block every word.
+        ("blocked_terms:\n  - '*'\n  - ' '\n  - crap\n", (), ("crap",), "blocked_terms must be"),
+        (NOT_UTF8, (), (), "not saved as UTF-8"),
+    ],
+)  # fmt: skip
+def test_a_broken_guardrails_file_keeps_what_is_usable_and_is_reported(
+    skills_dir, text, rules, terms, problem
+):
+    from agent.skills import Guardrails, load_guardrails, load_skills
+
+    if text is not None:
+        _write(skills_dir / "guardrails.yaml", text)
+    assert load_guardrails() == Guardrails(rules, terms)
+    problems = load_skills().problems
+    if problem is None:
+        assert problems == []
+    else:
+        assert len(problems) == 1
+        assert problems[0].startswith("guardrails.yaml: ") and problem in problems[0]
+
+
+@pytest.mark.parametrize(
+    "text, term",
+    [
+        ("Well, DAMN it", "damn*"),
+        ("We were damned lucky", "damn*"),
+        ("See you in Amsterdam", None),  # whole words only
+        ("A crappy day", None),  # no * on crap
+        ("What the ｃｒａｐ", "crap"),  # fullwidth letters
+        ("Please vote\n  for us", "vote for"),  # any spacing
+        ("Voters for change", None),
+        ("", None),
+        ("Dámn it", "damn*"),  # accents
+        ("D\u0333amn it", "damn*"),  # a mark under a letter doesn't split the word
+        ("\U0001d403\U0001d41a\U0001d426\U0001d427", "damn*"),  # mathematical bold letters
+        ("Vote\u00a0for us", "vote for"),  # a no-break space
+        ("a.b", "a.b"),  # a term is text, not a pattern
+        ("axb", None),
+    ],
+)
+def test_a_blocked_term_is_found_as_a_whole_word_in_any_case_or_spacing(text, term):
+    from agent.skills import Guardrails
+
+    terms = ("damn*", "crap", "vote for", "a.b")
+    assert Guardrails(blocked_terms=terms).blocked_term(text) == term
+
+
 @pytest.mark.parametrize(
     "value, expected",
     [
@@ -179,13 +285,15 @@ def test_hashtag_range_parses_common_forms(value, expected):
 
 def test_shipped_skill_files_are_all_valid():
     """Guards the real skills/ folder: every shipped file must load cleanly."""
-    from agent.skills import load_skills
+    from agent.skills import load_guardrails, load_skills
 
     skills = load_skills()
     assert skills.problems == []
     assert {"linkedin", "instagram", "facebook", "email"} <= {s["id"] for s in skills.platforms}
     assert len(skills.content_types) >= 3
     assert {"feed_post", "carousel", "story", "reel"} <= {f["id"] for f in skills.formats}
+    guardrails = load_guardrails()
+    assert len(guardrails.rules) >= 5 and "fuck*" in guardrails.blocked_terms
 
 
 @pytest.mark.parametrize(
@@ -225,7 +333,9 @@ def test_skills_read_the_same_with_or_without_pyyamls_c_parser():
     from agent import skills
 
     with_c = skills.load_skills()
+    skills._parse_yaml.cache_clear()  # parse again, not from the cache
     with patch("agent.skills._YAML_LOADER", yaml.SafeLoader):
         without_c = skills.load_skills()
+    skills._parse_yaml.cache_clear()
     assert with_c == without_c and with_c.platforms
     assert skills._YAML_LOADER in (getattr(yaml, "CSafeLoader", None), yaml.SafeLoader)

@@ -24,6 +24,21 @@ from psycopg import errors, sql
 from tests.llm_fakes import completion, text_chunk, text_stream, tool_call_stream
 
 
+async def test_a_reply_has_room_for_a_reasoning_model_to_think_first(database):
+    """
+    Regression: at 4,096 tokens, every live reply to a request that broke the content
+    guardrails was cut off; the model spent about 3,000 weighing it. 8,192 is the most
+    some providers accept.
+    """
+    from agent.assistant import Assistant
+    from agent.graph import REPLY_MAX_TOKENS
+
+    model = AsyncMock(return_value=text_stream("Here's a kinder version."))
+    with patch("agent.graph.litellm.acompletion", new=model):
+        await Assistant("org").chat("Write a post that swears at the mayor")
+    assert model.call_args.kwargs["max_tokens"] == REPLY_MAX_TOKENS == 8192
+
+
 def test_text_said_before_a_tool_call_stays_in_the_history_sent_to_the_model():
     """Sent as None, the model would forget what it had told the user."""
     from agent.graph import _to_litellm

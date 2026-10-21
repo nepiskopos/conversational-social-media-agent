@@ -43,10 +43,11 @@ User ──► login ──► app.py (Chainlit web UI)  or  main.py (terminal)
               ▼
          LiteLLM ──► main provider, then fallbacks (agent/config.py)
               │
-              └─ 12 tools (agent/tools.py):
+              └─ 13 tools (agent/tools.py):
                    research_org, refresh_research, web_search      → agent/research.py
-                   save_post, update_post_status, search_ledger,
-                   show_post, record_performance, save_preference,
+                   save_post, edit_post, update_post_status,
+                   search_ledger, show_post, record_performance,
+                   save_preference,
                    forget_preference, save_voice_example           → agent/memory.py
                    generate_calendar                               → 4 parallel LLM calls
 
@@ -286,7 +287,7 @@ The caps are checked inside the transaction that saves, with the org locked, so 
 
 **What.**
 
-- `save_preference(key, value, quote, append)` keeps `preferences[key]` a plain value, or a list with `append` (e.g. `banned_topics`). It stores the date and the user's own words in `preference_notes`. Keys can be scoped to a platform, e.g. `linkedin_voice`.
+- `save_preference(key, value, quote, append)` keeps `preferences[key]` a plain value, or a list with `append` (e.g. `banned_topics`). It stores the date and the user's own words in `preference_notes`. Keys can be scoped to a platform, e.g. `linkedin_voice`. A preference is a rule for future posts, said as one ("we say neighbours", "from now on"); a change to one post is not, and the prompt says to ask when it's unclear. A live model saved the edit request "change 'volunteers' to 'neighbours'" as the org's `voice`, replacing it: the quote check passed, since the user typed those words, and no check in code can tell an edit from a rule. So the prompt also says to give a narrower preference its own key, and a save that replaces a different value says which one in its result, so the model tells the user, who can put it back.
 - `forget_preference(key, value?)` removes a key, one item of a list, or a string preference only when the value matches, ignoring case.
 - A post becomes a voice example when it is first approved (once, however often it is approved), and so does a post the user pastes. Marking a post `posted`, or reporting its results, doesn't make it one, as the text may have been changed before it went out; a post the user pastes as posted does, being their own text. The newest 5 are kept, and 3 appear in the prompt as "match their voice, not their topics".
 - Ideas the user turns down get the status `rejected`.
@@ -298,7 +299,9 @@ The caps are checked inside the transaction that saves, with the org locked, so 
 
 **What.** `save_post` requires a platform, the content and a title. It optionally takes a pillar, content type, `format`, `visual`, `parent_id` (the post this is a version of), `scheduled_for`, `source_url` and `source_summary`. The statuses are `suggested`, `draft`, `approved`, `posted`, `planned` and `rejected` (`memory.POST_STATUSES`). Suggestions are shown with their ledger id (`**2. Volunteer spotlight** · post_003`), so "the second one" still resolves after a summary or in a new session. `search_ledger` filters by status, platform, date range and text, and lists titles; `show_post` gives one post in full, so a draft from an earlier conversation is shown before it is approved (a live run approved one it couldn't show). A draft is shown as saved, hashtags included.
 
-**Why.** Users ask "what did we work on this week?", which needs dates and a query beyond the 20 posts in the prompt. Versions link a LinkedIn draft, its rewrite and its Instagram version.
+`edit_post` makes an exact change the user names ("replace X with Y", "cut the last sentence"): it replaces one phrase of the copy and saves the result as a new version, through `save_post`'s checks. It refuses a phrase that isn't in the copy exactly or appears more than once (overlaps count). An edited idea stays an idea; any other post becomes a `draft`, which must be shown before it is approved.
+
+**Why.** Users ask "what did we work on this week?", which needs dates and a query beyond the 20 posts in the prompt. Versions link a LinkedIn draft, its rewrite and its Instagram version. Asked to swap one phrase, a model rewriting the whole post can change other words too, so an exact change is made in code. Approval still rests on `show_post`, which displays the whole new version.
 
 ### Checks enforced in code
 
@@ -309,14 +312,17 @@ The caps are checked inside the transaction that saves, with the org locked, so 
 | Longer than the platform's `max_length` | Not saved; the model is told to fix it and save again. |
 | Hashtag count outside `hashtag_count` (skipped for a format without a caption, such as a story) | Not saved, same as above. |
 | No `visual` on a platform with `needs_visual` (Instagram, Facebook) | Not saved, same as above. |
+| A *Visual:* line in the copy (any platform; not checked again on approval, so older drafts stay approvable) | Not saved: the copy is what staff post, so the line would go out as text. The visual goes only in `visual`, which `show_post` displays under the copy. |
 | A `format` that doesn't exist, or not on this platform (a LinkedIn story, an email feed post) | Not saved, same as above. |
 | `parent_id` that isn't in the ledger | Not saved. |
 | A suggestion with no `source_url` while research sources exist | Not saved: every idea must cite its source. |
 | `source_url` that isn't a known research source | Saved, with a warning. |
 
+`edit_post`'s versions keep their post's source as it was, so the two source checks don't apply to them: `edit_post` can't change a source, and an idea saved before research found any could otherwise never be edited (found by the concurrency test).
+
 `record_performance` marks a post `posted` without these checks: by the time results come in, the post is already live. Tools that take a status or a date (`save_post`, `update_post_status`, `search_ledger`) reject a status outside `POST_STATUSES` and a date that isn't `YYYY-MM-DD`, with a message the model can act on. Platforms not defined in `skills/` (e.g. `general`) skip the platform checks. The platform is stored in lowercase, as skill ids are, so "LinkedIn" and "linkedin" are one platform. Research sources typed into an imported profile as plain URLs instead of `{...}` entries are skipped rather than breaking `save_post` and `web_search`.
 
-**Found live.** Applying the rules to ideas made a live run add hashtags to rough suggestions, retry four rejected saves, take 67 seconds over one answer and tell the user "three posts need hashtag fixes". The same run showed a *Visual:* line in every Instagram reply but never saved one, so the visual is now required in code rather than asked for in the prompt.
+**Found live.** Applying the rules to ideas made a live run add hashtags to rough suggestions, retry four rejected saves, take 67 seconds over one answer and tell the user "three posts need hashtag fixes". The same run showed a *Visual:* line in every Instagram reply but never saved one, so the visual is now required in code rather than asked for in the prompt. The prompt also asked for that *Visual:* line in the copy itself; a later live run approved a Facebook draft with it, shown twice and headed for the post, so the prompt now says to keep it out and `save_post` refuses it.
 
 **Why.** Models miscount characters and don't always follow the tool schema:
 
@@ -363,9 +369,15 @@ A *wrong* source only gets a warning, because whether a source is good enough is
 - **`kind: content_type`**: `id`, `name`, `purpose` and `structure` are required; `must_include` and `avoid` are optional.
 - **`kind: format`**: `id`, `name`, `purpose` and `structure` are required; `platforms` (a list) and `has_caption` (true or false) are optional.
 
-`skills/content_pillars.yaml` holds the default pillars, and a `content_pillars` list in an org's profile (set through an export and import) overrides them for one org. Everything is loaded on every turn by `agent/skills.py`, so no restart is needed.
+`skills/content_pillars.yaml` holds the default pillars, and a `content_pillars` list in an org's profile (set through an export and import) overrides them for one org. Everything is loaded on every turn by `agent/skills.py`, so no restart is needed; each file's text is parsed once, since the files are read on every prompt build and tool call. The cache is keyed by the text, not the file's timestamps: Linux often records those to a few milliseconds, and a copy can keep the old ones (`cp -p`), so a quick same-size edit would have gone unread.
 
 **Why.** Platforms and editorial policy are data, not code. One directory and one file format mean there is only one thing to learn.
+
+### Content guardrails
+
+**What.** `skills/guardrails.yaml` holds two lists for every org. The `rules` (honest, kind, inclusive, no politics, never dismissive or aggressive, no cursing, no fear or guilt appeals, privacy) are a Content Guardrails section of the stable prompt and of the calendar's week prompt. The `blocked_terms` are checked in code by `Guardrails.blocked_term`: whole words, ignoring case, spacing, accents and other combining marks (a mark under a letter would otherwise split the word) and look-alike forms (NFKC), with a trailing `*` for any ending. `save_post` and `edit_post` refuse a post whose title, copy, visual or source note has one (ideas too, since they are shown; not a post the user says already went out, which is recorded as it was), approval re-checks the stored post, and the calendar leaves such an idea out with a row saying so. A broken entry is skipped and reported, and the rest still apply; a missing file means no guardrails.
+
+**Why.** "Be honest" or "keep politics out" can't be checked by matching text, so those are instructions, and the user's approval of a displayed draft is the check. Words that must never appear can be, and the model doesn't always follow a prompt. One global file keeps the policy in the place non-engineers already edit; an org's own rules are its preferences, learned from chat. Rejected: an LLM review of every saved post, which would add a model call and seconds to every draft and is still a model judging a model; and matching inside words, which would block "Amsterdam" for "damn".
 
 **Broken files.** Invalid YAML, missing or wrongly typed fields, unknown kinds and duplicate ids are skipped and reported in plain English:
 
@@ -394,7 +406,7 @@ A broken pillars file (invalid YAML, no `pillars:` list) means no pillars, not a
 
 **Why.** The tool-call message is checkpointed before the tool runs. A raised exception left that call unanswered, and providers reject every later request in that thread. Returning the error keeps the thread valid and lets the model recover.
 
-**Cut-off replies.** A reply stream that ends at the length limit, or without a finish reason, fails the turn (`graph.ReplyCutOff`) with a message to send it again; what was already streamed stays on screen. A stream a provider cuts off early can't be caught: LiteLLM ends every stream with "stop", and a live run saved "Happy to! It's" as a whole reply that way.
+**Cut-off replies.** A reply stream that ends at the length limit, or without a finish reason, fails the turn (`graph.ReplyCutOff`) with a message to send it again; what was already streamed stays on screen. A stream a provider cuts off early can't be caught: LiteLLM ends every stream with "stop", and a live run saved "Happy to! It's" as a whole reply that way. The limit (`graph.REPLY_MAX_TOKENS`) is 8,192 tokens, reasoning included: at 4,096, every live reply to a request that broke the content guardrails was cut off, as the model spent about 3,000 tokens weighing it. Some providers accept no more (DeepSeek's chat model); it is a ceiling, so a short reply costs no more.
 
 **Lost results.** A turn can still stop between the tool call and its saved result, for example when the database drops its connections at that moment. The thread is then left with an unanswered call, which every provider rejects. Before each model call, `_answer_lost_tool_calls()` gives such a call the result "interrupted; it may or may not have run; check with search_ledger before doing it again", so the conversation carries on and the model doesn't save the post twice.
 
@@ -405,7 +417,7 @@ A broken pillars file (invalid YAML, no `pillars:` list) means no pillars, not a
 - **Browser** (`tests/browser/`, opt-in with `pytest -m browser`): the real Chainlit server and frontend in headless Chromium, with a scripted model (`serve.py`) and the run's test database: the login (a wrong password refused), onboarding, an org belonging to another user refused, a reply visible while it is still streaming, a tool step and the ledger after a reload, the layout at phone width (390 px, no sideways scrolling), two users on one org keeping their conversations apart, and images from other sites blocked. It starts a real server, so it is a separate CI job outside the time budget; there `MACKIE_BROWSER_REQUIRED=1` turns a missing Playwright into a failure, not a green job that ran nothing.
 - **Deployment** (`tests/deployed/`, opt-in with `pytest -m deployed`, and its own CI job): CI builds and starts the Docker Compose stack from `.env.example` with throwaway secrets, checks that the migration exited cleanly and created the default account, that the app isn't root, that the database isn't published and that the app's role can't bypass row-level security, then logs in with the default account in a browser and onboards an org. No model is called. The Compose file, the init script and the migrate service are checked nowhere else. The job runs under its own Compose project name (`mackie-ci`) and always removes its containers and database volume, even after a failure, so a local run with `act` can't leave a stack behind or reuse a real deployment's volume.
 
-`conftest.py` fails a run that takes more than 30 seconds (not under coverage or for the opt-in tests); CI allows 60 through `MACKIE_TEST_BUDGET_S`, since a shared runner took 28 seconds for a run that takes about 18 to 25 locally. Every test runs against a real database with row-level security (about 0.3 ms per query through Docker); mocking it in most tests would be faster, at the cost of tests that no longer exercise the real policies. The objects LiteLLM, Chainlit and LangGraph create at import are frozen out of the garbage collector after collection (`gc.freeze()`), which saves over a second, and passwords are hashed at a low scrypt cost (`cheap_hashing`). Every setting `.env` defines is blanked and the time zone set to UTC, so a developer's `.env` can't change a run. CI also requires 95% branch coverage.
+`conftest.py` fails a run that takes more than 30 seconds (not under coverage or for the opt-in tests); CI allows 60 through `MACKIE_TEST_BUDGET_S`, since shared runners vary. The suite runs in four worker processes (pytest-xdist, `-n 4` in `pytest.ini`), each with its own database, as `test_database` names it by process id: run in one process, it had grown to 34 seconds, and four workers take about 19 (more were slower, as each worker imports LiteLLM and Chainlit; CI runners have four cores). The budget check reads the opt-in markers from the test reports, since under xdist only the workers see the collected tests. Every test runs against a real database with row-level security (about 0.3 ms per query through Docker); mocking it in most tests would be faster, at the cost of tests that no longer exercise the real policies. The objects LiteLLM, Chainlit and LangGraph create at import are frozen out of the garbage collector after collection (`gc.freeze()`), which saves over a second, and passwords are hashed at a low scrypt cost (`cheap_hashing`). Every setting `.env` defines is blanked and the time zone set to UTC, so a developer's `.env` can't change a run. CI also requires 95% branch coverage.
 
 **Why.** Parallelism is proven with `ConcurrencyProbe`, a stand-in that returns only once N calls are in flight together. A sequential loop times out instead, so a lost `asyncio.gather` fails a test, and no wall-clock timing is involved that could flake on a slow runner. Fuzzing every tool from its schema means a new tool is covered without a new test. Writing these tests found real problems, each now with a regression test: NAT64, IPv4-compatible, percent-encoded and fullwidth hosts passed the SSRF guard; the agenda section had no size limit; `slugify("!!!")` created an org; LLM calls had no timeout; checkpoint storage grew quadratically with conversation length (see Context management); separate processes overwrote each other's posts before the org lock; an import with two posts lacking an id was refused as "duplicate ids"; and Chainlit took Mackie's `DATABASE_URL` as its own chat-history database (hence the `MACKIE_` names).
 

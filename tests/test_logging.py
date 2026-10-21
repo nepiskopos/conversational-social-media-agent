@@ -4,7 +4,7 @@ Cross-cutting tests of what Mackie logs and what it never logs, across modules.
 Owns: that each event the logging policy names (logins, refused logins and
 lockouts, refused or revoked org access, account changes, a blocked fetch,
 and failures of a tool, a model, a page fetch, a search, the summary, the org
-brief, a calendar week, the trace, the database, a login, a session start,
+brief, a calendar week, a planned post left out by the guardrails, the trace, the database, a login, a session start,
 the recap at a session's start, a turn on the web or in the terminal, a
 reset, a terminal session, pruning, and a skill file skipped) is logged once,
 by the module that handles it, at the right level, naming the user, org or
@@ -331,6 +331,30 @@ async def test_a_failed_calendar_week_is_logged(database, logs):
             "Could not plan week 2 of August 2026 for food-bank: TimeoutError: 'timed out'",
         )
     ]
+
+
+async def test_a_planned_post_left_out_by_the_guardrails_is_logged_without_its_text(database, logs):
+    from agent.skills import Guardrails
+    from agent.tools import handle_tool_call
+
+    week = json.dumps({"platform": "linkedin", "angle": "Damn the council", "pillar": "Impact"})
+    ok = MagicMock(choices=[MagicMock(message=MagicMock(content=week))])
+    with (
+        patch("agent.tools.litellm.acompletion", new=AsyncMock(return_value=ok)),
+        patch(
+            "agent.tools.skills.load_guardrails", return_value=Guardrails(blocked_terms=("damn",))
+        ),
+    ):
+        await handle_tool_call(
+            "generate_calendar", {"month_year": "August 2026", "posts_per_week": 1}, "food-bank"
+        )
+    assert (
+        _records(logs, "agent.tools")
+        == [
+            (logging.WARNING, "Left a planned post with a blocked term out of food-bank's calendar")
+        ]
+        * 4
+    )
 
 
 # --- Graph ------------------------------------------------------------------------------

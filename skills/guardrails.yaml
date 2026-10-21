@@ -1,0 +1,49 @@
+# Content guardrails: what every post, idea and calendar plan Mackie writes must respect.
+#
+# Safe to edit: add, change or remove lines here without any code changes. They apply to
+# every organization, from the next message on. Run `python scripts/validate.py` after editing.
+#
+# rules:          Plain-English rules Mackie follows when it writes (they are part of its
+#                 instructions). Write each as one short instruction.
+# blocked_terms:  Words and phrases no post may contain. Unlike the rules, these are checked
+#                 by Mackie's code, so a post that contains one is never saved or approved.
+#                 Matched as whole words, ignoring case, spacing and accents: "damn" doesn't block
+#                 "Amsterdam". End a term with * to also block longer words starting with it
+#                 ("swear*" blocks "swearing").
+#
+# Each organization can add its own rules in chat ("never mention our old name"); Mackie saves
+# them as that org's preferences. A broken line is skipped and reported, and the rest still apply.
+
+rules:
+  - Be objective and honest. State only facts from the research, the organization brief or the user; never invent numbers, quotes, stories, results or endorsements, and label an estimate as one.
+  - Be kind and warm. Write about people with dignity and respect, never with pity, shame or blame.
+  - Use inclusive, respectful language. Put people first ("people experiencing homelessness"), avoid stereotypes, and don't single out any group, belief or identity.
+  - Keep politics out. Take no side on parties, candidates, elections, governments, legislation or other contested political issues, and don't hint at one.
+  - Never be dismissive. Don't belittle anyone's experience, question, need or point of view.
+  - Never be aggressive. No attacks, threats, mockery or sarcasm aimed at people or other organizations.
+  - Don't curse, and avoid crude or vulgar language, even softened or with symbols in place of letters.
+  - Don't use fear, guilt or shock to ask for support; give people a positive reason to act.
+  - Protect privacy. Don't name or describe a person the organization serves unless the user says they agreed to it.
+
+blocked_terms:
+  - fuck*
+  - motherfuck*
+  - shit*
+  - bullshit
+  - damn*
+  - goddamn*
+  - crap
+  - crappy
+  - bitch*
+  - bastard*
+  - asshole*
+  - piss
+  - pissed
+  - wtf
+  - stfu
+  - retard
+  - retarded
+  # Political terms can be blocked the same way, for example:
+  # - vote for
+  # - pro-life
+  # - pro-choice

@@ -30,6 +30,9 @@ def skills_dir(tmp_path):
     folder = tmp_path / "skills"
     folder.mkdir()
     (folder / "test.yaml").write_text(PLATFORM_YAML)
+    (folder / "guardrails.yaml").write_text(
+        "rules:\n  - Be kind.\nblocked_terms:\n  - damn\n  - crap\n"
+    )
     with patch("agent.skills.SKILLS_DIR", folder):
         yield folder
 
@@ -44,6 +47,7 @@ def test_validate_passes_valid_files_and_changes_nothing(
     assert validate_module.main([str(profile)]) == 0
     out = capsys.readouterr().out
     assert "Platforms:     test" in out
+    assert "Guardrails:    1 rule(s), 2 blocked term(s)" in out
     assert "All files are valid." in out
     assert sorted(tmp_path.rglob("*")) == before
     assert profile.read_text() == GOOD_PROFILE
@@ -60,6 +64,7 @@ def test_validate_help_prints_usage_instead_of_checking_a_file_named_help(valida
 def test_validate_reports_every_broken_file(validate_module, skills_dir, tmp_path, capsys, caplog):
     (skills_dir / "broken.yaml").write_text("id: x\nname: X\nmax_length: lots\n")
     (skills_dir / "content_pillars.yaml").write_text("pillars:\n  - description: no name\n")
+    (skills_dir / "guardrails.yaml").write_text("rules: Be kind.\n")
     profiles = {
         "comma.json": '{"name": "Org",}',
         "list.json": "[]",
@@ -71,12 +76,13 @@ def test_validate_reports_every_broken_file(validate_module, skills_dir, tmp_pat
         (tmp_path / name).write_text(text)
     assert validate_module.main([str(tmp_path / name) for name in profiles]) == 1
     out = capsys.readouterr().out
-    assert "6 problem(s):" in out
+    assert "7 problem(s):" in out
     # Regression: the skills module's log repeated each skill problem; logging is back on after.
     assert caplog.records == []
     assert not logging.root.manager.disable
     assert "broken.yaml: max_length must be a whole number" in out
     assert "content_pillars.yaml: every pillar needs a name" in out
+    assert "guardrails.yaml: rules must be a list of '- ' lines" in out
     assert "comma.json has a formatting error at line 1" in out
     assert "list.json must be a JSON object" in out
     assert "status.json: post 1 has status 'maybe'" in out

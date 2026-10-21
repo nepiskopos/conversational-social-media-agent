@@ -13,6 +13,7 @@ Like a teammate, Mackie doesn't wait to be asked: each session opens with what n
 - **Research before writing.** Reads your homepage and up to three About/Programs-style pages, runs three web searches, and keeps a short cited org brief for every session. Every suggestion names its source.
 - **Platform-aware drafts.** Each platform's tone, length and hashtag rules live in a YAML file and are enforced on finished drafts, and again before a post is approved; rough ideas are exempt. Instagram and Facebook drafts must describe the photo or graphic to pair with them. Email (subject, preview text, one call to action) is a platform too.
 - **Content types, formats and pillars.** Donation appeals, volunteer calls and event announcements follow a defined structure. Mackie picks the format that fits (feed posts are the lasting record, carousels teach step by step, stories keep followers close, reels reach new people) and writes out story frames, carousel slides and reel shot lists in full. Five editorial pillars frame suggestions.
+- **Content guardrails.** Every post is honest, kind and inclusive, takes no political side, and is never dismissive, aggressive or crude. The rules, and a list of words no post may ever contain (checked in code, so a post with one is never saved or approved), live in one file you can edit.
 - **Learns from feedback.** Corrections are saved in your own words, a sentence or two each, and approved or pasted posts become voice examples. Only what you type or approve is learned, so a web page Mackie reads can't teach it anything. Ask "what have you learned about us?" or "forget that rule" at any time. All of it carries over to future sessions.
 - **Post ledger.** Every suggestion and draft is tracked with a title, status (`suggested`, `draft`, `approved`, `posted`, `planned`, `rejected`), versions and dates, so "what did we work on this week?" has an answer.
 - **Content calendar.** A dated four-week plan for any month, two posts a week by default (one to three), mixing platforms and formats. Each week is tied to an awareness day, giving day or org event when one falls in it, serves the campaign you name ("plan November around our year-end appeal"), and builds on your best-performing posts.
@@ -98,7 +99,7 @@ Suggest another post for next month.
 
 The voice correction ("warm and grassroots") applies to every later post, in this session and in future ones, and the last suggestion avoids ideas that are already in the ledger.
 
-Everything happens in chat, approvals included: say "approve post_003", "drop the second idea" or "we posted it on Friday", and Mackie updates the ledger. Mackie approves only a post it has shown you, so a draft from an earlier conversation is shown in full first. A draft that breaks its platform's rules (too long, wrong hashtag count, no visual where one is needed) can't be approved until it is fixed.
+Everything happens in chat, approvals included: say "approve post_003", "drop the second idea" or "we posted it on Friday", and Mackie updates the ledger. Mackie approves only a post it has shown you, so a draft from an earlier conversation is shown in full first. To change a draft, say what to change ("make it warmer") or name the exact words ("replace 'our helpers' with 'our volunteers'", "cut the last sentence"): an exact change swaps just those words, and Mackie says so if they aren't in the post, or appear more than once. Either way you get a new version, shown in full for approval; earlier versions stay in the ledger. A draft that breaks its platform's rules (too long, wrong hashtag count, no visual where one is needed) can't be approved until it is fixed.
 
 Your conversation with an organization carries on where it left off, after a refresh or on another day: the web UI shows the last few messages again and offers **Start a new conversation**; the terminal says it is carrying on, and `reset` starts afresh. Either way, what Mackie learned is kept. Each person has their own conversation, one in the web UI and one in the terminal. In the terminal, `quit` exits. A message can be up to 20,000 characters; sent messages can't be edited, so send a new one instead.
 
@@ -193,6 +194,15 @@ Copy `skills/feed_post.yaml` (its comments explain each field) to a new file, ke
 
 Edit `skills/content_pillars.yaml`. To override the pillars for one org, set `"content_pillars": [{"name": "...", "description": "..."}]` in that org's exported profile and import it (below).
 
+### Edit the content guardrails
+
+Edit `skills/guardrails.yaml`; it applies to every organization from the next message. It has two lists, and its comments explain both:
+
+- `rules`: plain-English rules Mackie follows whenever it writes (ideas, drafts, rewrites, calendar plans), e.g. "Keep politics out."
+- `blocked_terms`: words and phrases no post may contain. These are checked in code: a post, edit or calendar idea with one is never saved, and an older post with one can't be approved. They match whole words, ignoring case, spacing and accents ("damn" doesn't block "Amsterdam"); end a term with `*` to block every word that starts with it (`swear*`).
+
+Delete a line to drop a guardrail, or empty a list to turn that part off. For rules that apply to one organization only, tell Mackie in chat ("never mention our old name"): it saves them as that org's preferences.
+
 ### Edit what Mackie learned
 
 Export the org to a JSON file, edit it in any text editor (saved as UTF-8), then import it:
@@ -222,7 +232,7 @@ python scripts/validate.py brca-strong.json   # skills/ and an edited export
 docker compose run --rm mackie python scripts/validate.py   # Docker (skills/ only)
 ```
 
-It lists the platforms, content types and formats it found, plus every problem in `skills/` (the content pillars file included) and in any profile file you name. It changes nothing and exits with code 1 if anything is wrong. The web UI also reports a broken skill file with a **Heads-up** at the start of each chat.
+It lists the platforms, content types and formats it found and how many guardrail rules and blocked terms it read, plus every problem in `skills/` (the content pillars and guardrails files included) and in any profile file you name. It changes nothing and exits with code 1 if anything is wrong. The web UI also reports a broken skill file with a **Heads-up** at the start of each chat.
 
 ## Upgrading from the data/ folder
 
@@ -237,12 +247,13 @@ The old files have no time zone, so their times are read in the importing machin
 
 ## Tests and Evaluation
 
-The tests need a disposable PostgreSQL server; each run creates its own database there and drops it afterwards. Nothing calls an API or the outside network.
+The tests need a disposable PostgreSQL server; each run creates its own databases there (one per worker: the suite runs in four processes) and drops them afterwards. Nothing calls an API or the outside network.
 
 ```bash
 docker run -d --name mackie-test-db -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=mackie \
   --tmpfs /var/lib/postgresql/data postgres:17-alpine -c fsync=off   # once; or set TEST_DATABASE_URL
 pytest                                  # must finish within 30 seconds
+pytest -n 0 tests/test_tools.py -k edit # one process: quicker for a few tests, and for a debugger
 ruff check . && ruff format --check .   # lint and formatting (settings in ruff.toml)
 pytest --cov=agent --cov=scripts --cov=app --cov=main --cov-branch --cov-fail-under=95   # as CI
 
@@ -282,7 +293,7 @@ agent/
   research.py       Website scraping (with SSRF protection) and Tavily search
   skills.py         Loads and validates skills/*.yaml
   untrusted.py      Tags that mark third-party text as data (prompt-injection defense)
-skills/             Platforms, content types, formats, content pillars (YAML)
+skills/             Platforms, content types, formats, content pillars, guardrails (YAML)
 migrations/         Database schema, applied in order by scripts/migrate.py
 docker/             The database container's first-start script (roles, database)
 scripts/
@@ -305,5 +316,6 @@ See [design_doc.md](design_doc.md) for the architecture and the reasons behind e
 - **Results are entered by hand.** Mackie doesn't connect to platform analytics and doesn't run paid ads.
 - **Static websites only.** Sites rendered by JavaScript yield little text.
 - **No image generation.** Mackie describes the visual for each post; your team makes it.
+- **Guardrail rules guide the model; only blocked terms are enforced.** A model can still miss a rule such as "keep politics out", so read every draft before approving it. Blocked terms are matched ignoring case, spacing, accents and look-alike forms such as fullwidth letters, but a misspelling, symbols in place of letters ("d@mn") or a look-alike letter from another alphabet (a Cyrillic "а") gets through.
 
 The design doc's Roadmap describes how each would be addressed.

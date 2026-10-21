@@ -11,7 +11,8 @@ The project uses Python 3.12 with a virtualenv in `.venv`. There is no bare `pyt
 ```bash
 docker run -d --name mackie-test-db -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=mackie \
   --tmpfs /var/lib/postgresql/data postgres:17-alpine -c fsync=off   # test database, once
-.venv/bin/python -m pytest                 # full suite, no outside network
+.venv/bin/python -m pytest                 # full suite on 4 workers (pytest-xdist), no outside network
+.venv/bin/python -m pytest -n 0 tests/test_tools.py   # one process: a few tests, or a debugger
 .venv/bin/python -m pytest --cov=agent --cov=scripts --cov=app --cov=main --cov-branch --cov-fail-under=95   # coverage, as CI
 .venv/bin/python -m pytest -m browser      # real web UI in headless Chromium, scripted model, ~30s
 MACKIE_DEPLOYED_PASSWORD=... .venv/bin/python -m pytest -m deployed   # a running `docker compose` stack
@@ -25,7 +26,7 @@ MACKIE_DEPLOYED_PASSWORD=... .venv/bin/python -m pytest -m deployed   # a runnin
 docker compose up --build
 ```
 
-`requirements.txt` holds the runtime dependencies and `requirements-dev.txt` adds pytest, pytest-asyncio, pytest-cov, ruff (pinned exactly, so CI formats as you do) and playwright (`playwright install --with-deps chromium` once). CI (`.github/workflows/ci.yml`, read-only token, a timeout per job) runs ruff, the tests (within the time budget), a branch-coverage floor of 95%, the browser tests, and a deployment job (builds and starts the Compose stack, checks its settings, logs in with the default account) on every push and pull request to `main`.
+`requirements.txt` holds the runtime dependencies and `requirements-dev.txt` adds pytest, pytest-asyncio, pytest-cov, pytest-xdist, ruff (pinned exactly, so CI formats as you do) and playwright (`playwright install --with-deps chromium` once). CI (`.github/workflows/ci.yml`, read-only token, a timeout per job) runs ruff, the tests (within the time budget), a branch-coverage floor of 95%, the browser tests, and a deployment job (builds and starts the Compose stack, checks its settings, logs in with the default account) on every push and pull request to `main`.
 
 ## Code Map
 
@@ -35,7 +36,7 @@ docker compose up --build
 | `agent/config.py` | Provider registry `PROVIDERS` and model selection: `resolve_model`, `resolve_fallbacks`, `resolve_fast_model`, `resolve_judge_model` (`FAST_PROVIDER`, `JUDGE_PROVIDER`), `connection_kwargs`, `background_kwargs`; `LLM_TIMEOUT_S`, `BACKGROUND_RETRIES` |
 | `agent/assistant.py` | System prompt as (stable, per-turn) blocks; `Assistant.for_user` (the per-user thread) / `chat` / `achat_stream` / `recent_exchanges` / `clear_history`, `MAX_MESSAGE_CHARS`; `agenda_summary` and `count_noun` for the greetings |
 | `agent/graph.py` | LangGraph `summarize → agent ⇄ tools` loop plus `save_check` (unsaved post ids), at most `MAX_TOOL_ROUNDS` per turn, sliding window, running summary, streaming, provider fallback, `OrgCheckpointer` (PostgreSQL checkpoints limited to one org's threads; `prune_history` keeps one checkpoint per thread) |
-| `agent/tools.py` | `TOOL_DEFINITIONS` (OpenAI format, `show_post` among them), `handle_tool_call` / `_dispatch`, `save_post` checks, argument validation (incl. `record_performance` counts), research only of the org's stored website (`_research_url`), `Turn` (what the user typed and was shown) for preferences, voice examples and approvals, org brief, calendar, the tool-call trace |
+| `agent/tools.py` | `TOOL_DEFINITIONS` (OpenAI format, `show_post` and `edit_post` among them), `handle_tool_call` / `_dispatch`, `save_post` checks (`_store_post`, which `edit_post` shares), argument validation (incl. `record_performance` counts), research only of the org's stored website (`_research_url`), `Turn` (what the user typed and was shown) for preferences, voice examples and approvals, org brief, calendar, the tool-call trace |
 | `agent/db.py` | Connection pool per event loop (timeouts; refuses a superuser role or an old schema), `org_transaction` (row-level security scope), `migrate`, `check_org_id` |
 | `agent/memory.py` | Org memory in PostgreSQL (database calls `async`): the profile dict (`load_profile`, `save_profile`), `profile_problem` / `read_profile_file` (`ProfileError`) for edited exports, `slugify`, `is_date` / `is_count`, ledger, post results (`record_performance`, `top_performing`), preferences, voice examples, research, trace |
 | `agent/accounts.py` | Users (scrypt passwords, lockout, `User.session_key`, which a password change renews), memberships, `open_org` (`MACKIE_USERS_CREATE_ORGS`), `has_access`, `ensure_user` |
@@ -43,7 +44,7 @@ docker compose up --build
 | `agent/logs.py` | `configure_logging` (`MACKIE_LOG_LEVEL`), `RedactSecrets`, `safe` for user-supplied values in log lines |
 | `migrations/*.sql` | Schema, applied in order by `db.migrate`; row-level security on every org table |
 | `agent/research.py` | `website_url` (what counts as a typed website), `scrape_site` with the SSRF guard (`_is_safe_url`, `_resolves_to_internal`, manual redirects) and a time and size limit per page, Tavily `search_web`, `research_org` |
-| `agent/skills.py` | Loads and validates `skills/*.yaml` (platforms, content types, formats) and the content pillars file; never raises on a bad file |
+| `agent/skills.py` | Loads and validates `skills/*.yaml` (platforms, content types, formats), the content pillars file and the content guardrails (`load_guardrails`, `Guardrails.blocked_term`); each file text parsed once; never raises on a bad file |
 | `agent/untrusted.py` | `wrap_untrusted`: trust-boundary tags around third-party text |
 | `scripts/validate.py` | Plain-English check of the files non-engineers edit |
 | `scripts/migrate.py`, `users.py`, `export_profile.py`, `import_profiles.py` | Schema, accounts and access, an org's memory as editable JSON (also moves old `data/`) |
@@ -71,6 +72,7 @@ docker compose up --build
 ## Extending
 
 - **Platform, content type or format:** add a YAML file to `skills/` (see the README). No code change.
+- **Content guardrail:** edit `skills/guardrails.yaml` (`rules` for the prompt, `blocked_terms` checked in code by `tools._blocked_term`). No code change. A new way to save posts must check `_blocked_term`, as `_check_post` and the calendar do.
 - **Tool:**
   1. Add a schema to `TOOL_DEFINITIONS`.
   2. Add a branch to `_dispatch()` in `agent/tools.py`; validate arguments the model might get wrong.
@@ -96,5 +98,5 @@ docker compose up --build
   - security fixes get a regression test;
   - each behavior has one owner: details live with their module's tests, cross-cutting checks in their own file (below). Before adding a test, search for one that already covers it; add a case to an existing parametrized test rather than a near-copy, and test at another layer only when that layer can break on its own (e.g. `test_ui.py` with a fake Chainlit and `tests/browser/` with the real one);
   - cross-cutting checks have their own files: `test_security.py` (SSRF bypasses, every tool fuzzed with malformed arguments, hostile org ids through every entry point, org isolation incl. row-level security and the app role's limits, SQL injection, injection end to end, trace contents), `test_performance.py` (parallel I/O, responsiveness, scale: prompt size that doesn't grow with memory, linear-time parsing), `test_ui.py` (`app.py` and `main.py`, UX), `test_logging.py` (what every module logs and never logs; `test_logs.py` unit-tests `agent/logs.py`), `test_errors.py` (what users are told when something fails), `test_sessions.py` (concurrent sessions, users on one org, interleaved streams, concurrent writers, separate processes), `tests/browser/` (opt-in `-m browser`: the real web UI in Chromium, scripted by `serve.py`; login, phone layout, streaming, two users), `tests/deployed/` (opt-in `-m deployed`: a running Compose stack) and `test_deploy.py` (deployment and CI settings, and one real offline LiteLLM tool call). A new tool is fuzzed automatically; a new `asyncio.gather` gets a `concurrency_probe` test.
-- **Offline tests.** Autouse fixtures in `tests/conftest.py` fail any unmocked LLM call or HTTP request and stub DNS. Mock `agent.graph.litellm.acompletion` with an async generator of stream chunks (`text_stream` / `tool_call_stream` / `completion` in `tests/llm_fakes.py`). Mock `agent.research.httpx.AsyncClient` as an async context manager whose `stream()` serves the page (`_fake_client` in `test_research.py`). Every setting `.env` defines is blanked for the run, and passwords are hashed at a low cost (`cheap_hashing`). Import a script with `tests.conftest.load_script`. The suite must stay under 30 seconds (it runs every test against a real PostgreSQL): `conftest.py` fails a slower run, 60 s on CI through `MACKIE_TEST_BUDGET_S`, since shared runners vary; runs under coverage or with the opt-in browser or deployed tests are exempt. Prove parallelism with the `concurrency_probe` fixture, never with wall-clock timing.
+- **Offline tests.** Autouse fixtures in `tests/conftest.py` fail any unmocked LLM call or HTTP request and stub DNS. Mock `agent.graph.litellm.acompletion` with an async generator of stream chunks (`text_stream` / `tool_call_stream` / `completion` in `tests/llm_fakes.py`). Mock `agent.research.httpx.AsyncClient` as an async context manager whose `stream()` serves the page (`_fake_client` in `test_research.py`). Every setting `.env` defines is blanked for the run, and passwords are hashed at a low cost (`cheap_hashing`). Import a script with `tests.conftest.load_script`. The suite must stay under 30 seconds (it runs every test against a real PostgreSQL, in four worker processes with a database each): `conftest.py` fails a slower run, 60 s on CI through `MACKIE_TEST_BUDGET_S`, since shared runners vary; runs under coverage or with the opt-in browser or deployed tests are exempt. Prove parallelism with the `concurrency_probe` fixture, never with wall-clock timing.
 - **Docs:** when behavior changes, update `README.md` (user-facing) and `design_doc.md` (decisions: what, why, trade-offs) in the same change. Keep both concise.

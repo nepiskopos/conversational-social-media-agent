@@ -2,8 +2,8 @@
 Unit tests for agent/tools.py.
 
 Owns: each tool's handler; the save_post checks (platform and format rules,
-visuals, parent ids, citing a source) and their re-check before a post goes
-live; argument validation (statuses, dates, counts, required arguments, null
+visuals, the guardrails' blocked terms, parent ids, citing a source) and their
+re-check before a post goes live; edit_post's exact replacements; argument validation (statuses, dates, counts, required arguments, null
 or empty optional ones); the preference size caps; research, its summary and
 the org brief; web_search and the research sources; the content calendar
 (weeks, dates, cadence, formats, parsing the model's reply); and that
@@ -154,6 +154,22 @@ FACEBOOK_DRAFT = {
             True,
             id="facebook-draft-with-a-visual",
         ),
+        # The copy is posted as it is; a visual written into it would be posted too.
+        *(
+            pytest.param(
+                {**FACEBOOK_DRAFT, "visual": "Boxes", "content": f"Drive #a\n\n{line} Boxes"},
+                "Not saved: the copy has a 'Visual:' line",
+                False,
+                id=f"visual-line-in-the-copy-{n}",
+            )
+            for n, line in enumerate(("Visual:", "**Visual idea:**", "_visual description_ :"))
+        ),
+        pytest.param(
+            {**FACEBOOK_DRAFT, "visual": "Boxes", "content": "Visual storytelling works #a"},
+            "Saved",
+            True,
+            id="visual-as-a-word-in-the-copy",
+        ),
         pytest.param(
             {**FACEBOOK_DRAFT, "platform": "linkedin", "content": "Drive #a #b #c"},
             "Saved",
@@ -218,6 +234,7 @@ async def test_going_live_re_checks_the_stored_post(database, platform, status, 
     [
         ("update_post_status", {"post_id": "post_999", "status": "approved"}),
         ("record_performance", {"post_id": "post_999", "reactions": 1}),
+        ("edit_post", {"post_id": "post_999", "find": "Ana"}),
     ],
 )
 async def test_tools_report_an_unknown_post_id(database, tool, args):
@@ -722,9 +739,10 @@ def test_turn_knows_what_the_user_typed_was_shown_and_hasnt_seen():
         # Regression: a pasted post saved as posted was "new", so its results were refused.
         tool("save_post", "Saved to ledger as post_004 (status: posted)"),
         tool("web_search", "Saved to ledger as post_009"),
+        tool("edit_post", "Saved to ledger as post_005 (status: draft)"),
     ]
     turn = Turn.from_messages(messages, is_user_turn)
-    assert turn.new_post_ids == {"post_002", "post_003"}
+    assert turn.new_post_ids == {"post_002", "post_003", "post_005"}
     assert turn.shown_posts == ("Post: post_001\nTitle: Spotlight\n\nCopy:\nMeet Ana",)
     assert turn.user_text == "Write a post\nApprove it, and write another"
 
@@ -1206,6 +1224,28 @@ async def test_save_preference_saves_only_a_quote_the_user_typed(database):
 
 
 @pytest.mark.parametrize(
+    "value, append, result",
+    [
+        ("warm", False, "Preference saved: voice = warm"),  # unchanged
+        ("plain", False, "Preference saved: voice = plain (replaced 'warm'; tell the user)"),
+        ("plain", True, "Preference saved: voice = plain"),  # kept, as a list with the old one
+    ],
+)
+async def test_save_preference_says_which_value_it_replaced(database, value, append, result):
+    """
+    Regression: a live model saved an edit request as the org's voice, over the old one,
+    and the result didn't say; told, the model tells the user, who can put it back.
+    """
+    from agent.memory import save_preference
+    from agent.tools import Turn, handle_tool_call
+
+    await save_preference("test-org", "voice", "warm")
+    pref = {"key": "voice", "value": value, "quote": "warm", "append": append}
+    turn = Turn(user_text="Keep it warm, no, plain")
+    assert await handle_tool_call("save_preference", pref, "test-org", turn) == result
+
+
+@pytest.mark.parametrize(
     "change, refusal",
     [
         # Regression: any quoted word let a fooled model save any instruction as the value.
@@ -1255,6 +1295,161 @@ async def test_show_post_gives_a_saved_post_in_full(database):
     )
     missing = await handle_tool_call("show_post", {"post_id": "post_009"}, "test-org")
     assert missing == "Post post_009 not found in ledger"
+
+
+EDITED_POST = {
+    "platform": "linkedin",
+    "content": "Meet Ana, our helper of the year. #a #b #c",
+    "title": "Spotlight",
+    "format": "feed_post",
+    "source_url": "https://org.example/ana",
+}
+
+
+@pytest.mark.parametrize(
+    "status, edit, content, new_status",
+    [
+        ("draft", {"find": "helper", "replace": "volunteer"}, "Meet Ana, our volunteer of the year. #a #b #c", "draft"),
+        ("draft", {"find": " of the year"}, "Meet Ana, our helper. #a #b #c", "draft"),  # deleted
+        ("suggested", {"find": "Ana", "replace": "Ana R."}, "Meet Ana R., our helper of the year. #a #b #c", "suggested"),
+        ("approved", {"find": "helper", "replace": "hero"}, "Meet Ana, our hero of the year. #a #b #c", "draft"),
+    ],
+)  # fmt: skip
+async def test_edit_post_saves_a_version_with_only_the_phrase_replaced(
+    database, status, edit, content, new_status
+):
+    from agent.memory import add_post, get_post
+    from agent.tools import Turn, _format_post, handle_tool_call
+
+    await add_post("test-org", {**EDITED_POST, "status": status})
+    original = await get_post("test-org", "post_001")
+    result = await handle_tool_call("edit_post", {"post_id": "post_001", **edit}, "test-org")
+    assert result.startswith(f"Saved to ledger as post_002 (status: {new_status})")
+    assert ("call show_post for post_002" in result) == (new_status == "draft")
+    version = await get_post("test-org", "post_002")
+    assert version["content"] == content
+    assert version["parent_id"] == "post_001"
+    assert version["status"] == new_status
+    assert {k: version[k] for k in ("title", "format", "source_url", "platform")} == {
+        k: EDITED_POST[k] for k in ("title", "format", "source_url", "platform")
+    }
+    assert await get_post("test-org", "post_001") == original
+    # Shown the post before the edit, the user hasn't read the new version.
+    approve = {"post_id": "post_002", "status": "approved"}
+    turn = Turn(user_text="looks good", shown_posts=(_format_post(original),))
+    refused = await handle_tool_call("update_post_status", approve, "test-org", turn)
+    assert refused.startswith("Not updated: Mackie hasn't shown post_002")
+
+
+async def test_edit_post_keeps_the_source_of_an_idea_saved_before_research(database):
+    """Regression: once research found sources, an unsourced idea could never be edited."""
+    from agent.memory import add_post, get_post, save_research
+    from agent.tools import handle_tool_call
+
+    await add_post("test-org", {"platform": "general", "content": "Join us", "status": "suggested"})
+    sources = [{"title": "News", "url": "https://news.example/a"}]
+    await save_research("test-org", {"sources": sources}, "")
+    edit = {"post_id": "post_001", "find": "Join", "replace": "Meet"}
+    result = await handle_tool_call("edit_post", edit, "test-org")
+    assert result == "Saved to ledger as post_002 (status: suggested)"
+    assert "source_url" not in await get_post("test-org", "post_002")
+
+
+@pytest.mark.parametrize(
+    "content, edit, expected",
+    [
+        ("Meet Ana #a #b #c", {"find": "ana", "replace": "Bo"}, "Not edited: the copy of post_001 doesn't contain 'ana' exactly"),
+        ("Meet Ana #a #b #c", {"find": "Meet  Ana", "replace": "Bo"}, "Not edited: the copy of post_001 doesn't contain"),
+        ("Ana met Ana #a #b #c", {"find": "Ana", "replace": "Bo"}, "Not edited: 'Ana' appears more than once"),
+        ("Go aaa #a #b #c", {"find": "aa", "replace": "b"}, "Not edited: 'aa' appears more than once"),  # overlaps count
+        ("Meet Ana #a #b #c", {"find": "Ana", "replace": "Ana"}, "Not edited: find and replace are the same"),
+        ("Meet Ana #a #b #c", {"find": "Ana", "replace": "Ana" + "!" * 3000}, "Not saved: 3,017 characters exceeds LinkedIn's"),
+        ("Meet Ana #a #b #c", {"find": "Ana", "replace": "Ana\u2060"}, "Error: replace has a character readers can't see (U+2060)"),
+        ("Meet Ana #a #b #c", {"find": "Ana", "replace": ["Bo"]}, "Error: find and replace must be text."),
+        ("Meet Ana #a #b #c", {"find": "", "replace": "Bo"}, "Error: edit_post needs find"),
+    ],
+)  # fmt: skip
+async def test_edit_post_changes_nothing_unless_the_phrase_is_there_once(
+    database, content, edit, expected
+):
+    from agent.memory import add_post, get_ledger
+    from agent.tools import handle_tool_call
+
+    await add_post("test-org", {"platform": "linkedin", "content": content, "status": "draft"})
+    result = await handle_tool_call("edit_post", {"post_id": "post_001", **edit}, "test-org")
+    assert result.startswith(expected)
+    assert [p["content"] for p in await get_ledger("test-org")] == [content]
+
+
+GUARDRAILS = {"blocked_terms": ("damn*", "vote for")}
+
+
+@pytest.mark.parametrize(
+    "args, saved",
+    [
+        ({"content": "Damn, what a day! #a #b #c"}, False),
+        ({"content": "A day! #a #b #c", "title": "Vote for change"}, False),
+        ({"content": "Damn, a day! #a #b #c", "status": "suggested"}, False),  # ideas are shown too
+        ({"content": "A day! #a #b #c", "visual": "A sign: DAMNED good"}, False),
+        ({"content": "A day in Amsterdam! #a #b #c"}, True),
+        # Already out, as the user typed it: recorded as it was.
+        ({"content": "Damn, what a day! #a #b #c", "status": "posted"}, True),
+    ],
+)
+async def test_a_post_with_a_blocked_term_is_not_saved(database, args, saved):
+    from agent.memory import get_ledger
+    from agent.skills import Guardrails
+
+    post = {"platform": "linkedin", "title": "Day", "status": "draft", **args}
+    with patch("agent.tools.skills.load_guardrails", return_value=Guardrails(**GUARDRAILS)):
+        result = await as_typed("save_post", post, "test-org")
+    assert result.startswith("Saved to ledger") == saved
+    if not saved:
+        assert result.startswith("Not saved: the post uses ")
+        assert "which the content guardrails rule out" in result
+    assert len(await get_ledger("test-org")) == saved
+
+
+async def test_an_edit_or_approval_cant_bring_in_a_blocked_term(database):
+    from agent.memory import add_post, get_ledger
+    from agent.skills import Guardrails
+
+    await add_post("test-org", {"platform": "linkedin", "content": "Join us #a #b #c"})
+    # Saved before the term was blocked, or imported.
+    await add_post("test-org", {"platform": "linkedin", "content": "Vote for us #a #b #c"})
+    edit = {"post_id": "post_001", "find": "Join", "replace": "Damn, join"}
+    approve = {"post_id": "post_002", "status": "approved"}
+    with patch("agent.tools.skills.load_guardrails", return_value=Guardrails(**GUARDRAILS)):
+        edited = await as_typed("edit_post", edit, "test-org")
+        approved = await as_typed("update_post_status", approve, "test-org")
+    assert edited.startswith("Not saved: the post uses 'damn*'")
+    assert approved.startswith(
+        "Not updated: post_002 can't be approved yet: it uses 'vote for', which the content"
+    )
+    assert [p["status"] for p in await get_ledger("test-org")] == ["suggested", "suggested"]
+
+
+async def test_an_edit_to_the_guardrails_file_applies_from_the_next_save(database, tmp_path):
+    """No restart: non-engineers edit the file while Mackie runs, as with the other skills."""
+    import shutil
+
+    from agent import skills
+    from agent.memory import get_ledger
+    from agent.tools import handle_tool_call
+
+    shutil.copytree(skills.SKILLS_DIR, tmp_path, dirs_exist_ok=True)
+    guardrails = tmp_path / skills.GUARDRAILS_FILE
+    post = {"platform": "linkedin", "title": "Team", "content": "Join the crew #a #b #c"}
+    post["status"] = "draft"
+    with patch("agent.skills.SKILLS_DIR", tmp_path):
+        assert (await handle_tool_call("save_post", post, "test-org")).startswith("Saved")
+        guardrails.write_text(guardrails.read_text() + "  - crew\n")
+        refused = await handle_tool_call("save_post", post, "test-org")
+        guardrails.unlink()  # no file: no guardrails
+        saved = await handle_tool_call("save_post", post, "test-org")
+    assert refused.startswith("Not saved: the post uses 'crew'")
+    assert saved.startswith("Saved to ledger as post_002")
+    assert len(await get_ledger("test-org")) == 2
 
 
 async def test_search_ledger_tool_formats_matches(database):
@@ -1418,6 +1613,27 @@ async def test_generate_calendar_uses_skill_platforms_and_org_pillars(database):
     assert '"facebook", "instagram", "linkedin"' in prompt
     assert '"Hope Stories"' in prompt
     assert "Community Impact" not in prompt
+    assert "Content rules every post follows:\n- " in prompt and "\n- Keep politics out." in prompt
+
+
+async def test_generate_calendar_leaves_out_a_planned_post_with_a_blocked_term(database):
+    from agent.memory import get_ledger
+    from agent.skills import Guardrails
+    from agent.tools import handle_tool_call
+
+    week = _calendar_reply(
+        {"posts": [{"platform": "linkedin", "angle": "Vote for our cause", "rationale": "r"}]}
+    )
+    with (
+        patch("agent.tools.litellm.acompletion", new=AsyncMock(return_value=week)),
+        patch("agent.tools.skills.load_guardrails", return_value=Guardrails(**GUARDRAILS)),
+    ):
+        table = await handle_tool_call(
+            "generate_calendar", {"month_year": "November 2026", "posts_per_week": 1}, "test-org"
+        )
+    assert table.count("Left out: broke the content guardrails") == 4
+    assert "0 of 4 posts saved" in table
+    assert await get_ledger("test-org") == []
 
 
 async def test_generate_calendar_names_an_org_without_a_name_generically(database):

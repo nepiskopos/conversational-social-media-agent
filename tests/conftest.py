@@ -3,8 +3,9 @@ Shared pytest fixtures for the Mackie test suite.
 
 Owns: blanking every setting .env defines, and the model settings, so .env
 never changes a run, and setting the time zone to UTC; the throwaway
-PostgreSQL database (created once per run on the server at TEST_DATABASE_URL,
-migrated as an owner role and used through an app role, as in production) and
+PostgreSQL database (created once per run and pytest-xdist worker on the server
+at TEST_DATABASE_URL, migrated as an owner role and used through an app role,
+as in production) and
 the database fixture that empties it before each test; autouse fixtures that
 hash passwords cheaply and block database access without the database
 fixture, unmocked LLM calls, HTTP requests and DNS lookups, so tests never
@@ -275,6 +276,7 @@ def no_real_http():
 DEFAULT_SUITE_TIME_BUDGET_S: float = 30.0
 SUITE_TIME_BUDGET_S: float = float(os.getenv("MACKIE_TEST_BUDGET_S") or DEFAULT_SUITE_TIME_BUDGET_S)
 _suite_started: float = 0.0
+_ran_opt_in_tests: bool = False
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -295,6 +297,18 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     gc.freeze()
 
 
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """
+    Note a browser or deployed test, which the time budget doesn't cover.
+
+    Read from the reports, not session.items: with pytest-xdist the workers
+    collect and run the tests, and only their reports reach this process.
+    """
+    global _ran_opt_in_tests
+    if "browser" in report.keywords or "deployed" in report.keywords:
+        _ran_opt_in_tests = True
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """
     Fail an otherwise green run that took longer than SUITE_TIME_BUDGET_S.
@@ -306,12 +320,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """
     elapsed = time.perf_counter() - _suite_started
     measuring_coverage = session.config.pluginmanager.hasplugin("_cov")
-    ran_browser_tests = any(
-        item.get_closest_marker("browser") or item.get_closest_marker("deployed")
-        for item in session.items
-    )
     over_budget = elapsed > SUITE_TIME_BUDGET_S
-    if exitstatus == 0 and over_budget and not (measuring_coverage or ran_browser_tests):
+    if exitstatus == 0 and over_budget and not (measuring_coverage or _ran_opt_in_tests):
         print(f"\nSuite took {elapsed:.1f}s; the budget is {SUITE_TIME_BUDGET_S:.0f}s.")
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 

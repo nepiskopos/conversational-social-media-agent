@@ -10,9 +10,10 @@ results are capped however large the research, ledger operations stay fast at
 20,000 posts, a long conversation's stored history grows linearly and what it
 sends the model stays bounded, also in real tokens, every query reads its org's
 rows through an index, a turn sends a fixed number of statements, a login flood
-leaves the pool free and a password check leaves the event loop free); and proof
-that the parsers given model or website text don't slow down sharply on hostile
-input. Does not own functional behavior (the per-module test files) or the suite
+leaves the pool free and a password check leaves the event loop free, each skill
+file is parsed once however often it is read); and proof that the parsers and
+the blocked-term check given model or website text don't slow down sharply on
+hostile input. Does not own functional behavior (the per-module test files) or the suite
 time budget (conftest.py).
 """
 
@@ -327,6 +328,24 @@ async def test_post_checks_stay_linear(database, content):
     assert isinstance(result, str)
 
 
+@pytest.mark.parametrize(
+    "text, term",
+    [
+        ("a" * HOSTILE_INPUT_CHARS, "a" * 50 + "*"),
+        ("a " * (HOSTILE_INPUT_CHARS // 2), " ".join(["a"] * 50) + " b"),
+        ("é" * HOSTILE_INPUT_CHARS, "e" * 50 + "*"),
+    ],
+)
+def test_blocked_term_matching_stays_linear(text, term):
+    """Every save checks every blocked term against the whole post."""
+    from agent.skills import Guardrails
+
+    guardrails = Guardrails(blocked_terms=tuple(f"word{n}" for n in range(200)) + (term,))
+    started = time.perf_counter()
+    guardrails.blocked_term(text)
+    assert time.perf_counter() - started < LINEAR_TIME_CEILING_S
+
+
 def test_page_text_extraction_stays_linear():
     from agent.research import _find_subpages, _page_text
 
@@ -512,6 +531,19 @@ async def test_ledger_operations_stay_fast_with_a_very_large_ledger(large_org):
 
     assert await mem.get_post(large_org, f"post_{LARGE_LEDGER_POSTS + 1}") is not None
     assert elapsed < LINEAR_TIME_CEILING_S * 3
+
+
+def test_each_skill_file_is_parsed_once_however_many_times_it_is_read():
+    """The skill files are read on every prompt build and tool call; parsing each is the cost."""
+    from agent import skills
+
+    skills._parse_yaml.cache_clear()
+    files = len(list(skills.SKILLS_DIR.glob("*.yaml")))
+    with patch("agent.skills._load_yaml", wraps=skills._load_yaml) as parse:
+        for _ in range(20):
+            skills.load_skills()
+            skills.load_guardrails()
+    assert parse.call_count == files
 
 
 async def test_a_long_conversation_stores_history_linearly_not_quadratically(database):

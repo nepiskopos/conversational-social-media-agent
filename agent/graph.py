@@ -108,8 +108,11 @@ SUMMARY_MAX_TOKENS: int = 2000
 # provider hands over quickly; the last model keeps the full retries, as nothing comes after it.
 CHAT_RETRIES_BEFORE_FALLBACK: int = 1
 CHAT_RETRIES_LAST_MODEL: int = 3
-# A ceiling, not a target, on the tokens of one reply or set of tool calls.
-REPLY_MAX_TOKENS: int = 4096
+# A ceiling, not a target, on the tokens of one reply or set of tool calls, reasoning included.
+# 4,096 cut off every live reply to a request that breaks the content guardrails: the model
+# spent about 3,000 tokens weighing it before answering. 8,192 is the most some providers
+# accept (DeepSeek's chat model), and a higher value would fail every request there.
+REPLY_MAX_TOKENS: int = 8192
 # Tool rounds (summarize → agent → tools) one turn may take. A model stuck calling tools stops
 # there with GraphRecursionError, instead of at LangGraph's default of 10,000 steps, each round
 # a paid call. A real turn takes a handful: research, then a save_post per idea.

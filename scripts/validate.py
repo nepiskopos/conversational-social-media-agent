@@ -49,11 +49,16 @@ def main(argv: list[str]) -> int:
     logging.disable(logging.WARNING)
     try:
         skill_set = skills.load_skills()
+        guardrails = skills.load_guardrails()
     finally:
         logging.disable(logging.NOTSET)
     print(f"Platforms:     {', '.join(s['id'] for s in skill_set.platforms) or '(none)'}")
     print(f"Content types: {', '.join(s['id'] for s in skill_set.content_types) or '(none)'}")
     print(f"Formats:       {', '.join(s['id'] for s in skill_set.formats) or '(none)'}")
+    print(
+        f"Guardrails:    {len(guardrails.rules)} rule(s), "
+        f"{len(guardrails.blocked_terms)} blocked term(s)"
+    )
     problems = skill_set.problems + profile_problems(paths)
     if not problems:
         print("All files are valid.")

@@ -9,6 +9,7 @@ Assistant accepts, and the access check before every message.
 Graph internals (window, summaries, fallback) are owned by test_graph.py.
 """
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -509,6 +510,9 @@ async def test_system_prompt_describes_the_job_and_the_approval_rule(database):
         "Nothing goes live without the user's approval",
         "Then call `show_post` with its id",
         'call `update_post_status` with status "approved"',
+        # A live model saved "change 'volunteers' to 'neighbours'" as the org's voice.
+        "A change to one post (an edit, a rewrite, a word swapped) is not a preference",
+        "Never replace a saved preference (such as `voice`) with something narrower",
     ):
         assert part in stable
 
@@ -554,6 +558,19 @@ async def test_system_prompt_lists_post_formats_with_their_roles(database):
     assert "### Feed Post (id: feed_post; on linkedin, instagram, facebook)" in stable
 
 
+async def test_system_prompt_lists_the_content_guardrails(database):
+    from agent.assistant import _build_system_prompt_blocks
+    from agent.skills import Guardrails
+
+    guardrails = Guardrails(rules=("Keep politics out.",), blocked_terms=("damn*", "crap"))
+    with patch("agent.assistant.skills.load_guardrails", return_value=guardrails):
+        stable, per_turn = await _build_system_prompt_blocks("org")
+    section = stable[stable.index("## Content Guardrails") :]
+    assert "\n- Keep politics out.\n" in section
+    assert 'any of these terms (\'*\': any ending): "damn*", "crap"' in section
+    assert "Guardrails" not in per_turn  # a file, the same every turn: the cached block
+
+
 async def test_agenda_section_and_summary_list_what_needs_attention(database):
     from agent.assistant import _build_system_prompt_blocks, agenda_summary
     from agent.memory import add_post
@@ -594,9 +611,9 @@ async def test_no_agenda_section_or_summary_when_nothing_needs_attention(databas
 
 
 async def test_system_prompt_leaves_out_empty_skill_sections(database):
-    """An org with no content types, formats or pillars gets no empty headings."""
+    """An org with no content types, formats, pillars or guardrails gets no empty headings."""
     from agent.assistant import _build_system_prompt_blocks
-    from agent.skills import SkillSet
+    from agent.skills import Guardrails, SkillSet
 
     bare_platform = {"id": "x", "name": "X", "max_length": 100}
     with (
@@ -604,10 +621,17 @@ async def test_system_prompt_leaves_out_empty_skill_sections(database):
             "agent.assistant.skills.load_skills", return_value=SkillSet(platforms=[bare_platform])
         ),
         patch("agent.assistant.skills.load_content_pillars", return_value=[]),
+        patch("agent.assistant.skills.load_guardrails", return_value=Guardrails()),
     ):
         stable, _ = await _build_system_prompt_blocks("org")
 
-    for heading in ("## Content Types", "## Post Formats", "## Content Pillars", "Format notes"):
+    for heading in (
+        "## Content Types",
+        "## Post Formats",
+        "## Content Pillars",
+        "## Content Guardrails",
+        "Format notes",
+    ):
         assert heading not in stable
     assert "### X (id: x)" in stable and "- Hashtags: none" in stable
 
@@ -746,6 +770,51 @@ async def test_recent_exchanges_show_the_posts_mackie_displayed(database):
     [user, display, reply] = await assistant.recent_exchanges(10)
     assert display[0] == "assistant" and display[1].startswith(post_display("Post: post_001"))
     assert "Meet Ana" in display[1] and reply == ("assistant", "Approve this draft?")
+
+
+async def test_an_edit_the_guardrails_refused_then_shown_and_approved_through_the_agent_loop(
+    database,
+):
+    """
+    The edit flow end to end, through the graph and its checkpoints: the refusal reaches the
+    model, which edits again, shows the new version, and the user's next message approves it.
+    """
+    from agent.assistant import Assistant
+    from agent.memory import add_post, get_ledger
+    from agent.skills import Guardrails
+
+    await add_post("org", {"platform": "general", "content": "Meet our helper", "status": "draft"})
+    edit = {"post_id": "post_001", "find": "helper"}
+    model = AsyncMock(
+        side_effect=[
+            tool_call_stream("tc_1", "edit_post", json.dumps({**edit, "replace": "damn hero"})),
+            tool_call_stream("tc_2", "edit_post", json.dumps({**edit, "replace": "hero"})),
+            tool_call_stream("tc_3", "show_post", '{"post_id": "post_002"}'),
+            text_stream("I changed it. Approve?"),
+            tool_call_stream(
+                "tc_4", "update_post_status", '{"post_id": "post_002", "status": "approved"}'
+            ),
+            text_stream("Approved."),
+        ]
+    )
+    assistant = Assistant("org")
+    guardrails = Guardrails(blocked_terms=("damn*",))
+    with (
+        patch("agent.graph.litellm.acompletion", new=model),
+        patch("agent.tools.skills.load_guardrails", return_value=guardrails),
+    ):
+        shown = await assistant.chat("Change 'helper' to 'damn hero'")
+        assert await assistant.chat("Approve it") == "Approved."
+
+    assert "Meet our hero" in shown and shown.endswith("I changed it. Approve?")
+
+    after_refusal = json.dumps(model.call_args_list[1].kwargs["messages"])
+    assert "which the content guardrails rule out" in after_refusal
+    ledger = await get_ledger("org")
+    assert [(p["id"], p["content"], p["status"]) for p in ledger] == [
+        ("post_001", "Meet our helper", "draft"),
+        ("post_002", "Meet our hero", "approved"),
+    ]
 
 
 async def test_an_overlong_message_is_refused_before_it_reaches_the_model_or_history(database):

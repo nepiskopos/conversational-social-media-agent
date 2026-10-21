@@ -3,8 +3,9 @@ Loading and validation of the non-engineer-editable files in skills/.
 
 Owns: reading skills/*.yaml into platform, content-type and format skills,
 reading the content pillars (skills/content_pillars.yaml or a per-org override
-in the profile), and reporting problems in those files as plain-English
-messages.
+in the profile), reading the content guardrails (skills/guardrails.yaml: rules
+for the prompt, and blocked terms with Guardrails.blocked_term to find them),
+and reporting problems in those files as plain-English messages.
 A broken file is skipped and reported, never raised, so one typo by a
 non-engineer cannot take every conversation down. Does not own how skills are
 rendered into the prompt (assistant.py) or used by tools (tools.py).
@@ -12,8 +13,11 @@ rendered into the prompt (assistant.py) or used by tools (tools.py).
 
 from __future__ import annotations
 
+import copy
+import functools
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +29,9 @@ SKILLS_DIR: Path = Path(__file__).parent.parent / "skills"
 # wheels) reads them about 7x faster than the pure-Python one, with the same result.
 _YAML_LOADER: type = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 PILLARS_FILE: str = "content_pillars.yaml"
+GUARDRAILS_FILE: str = "guardrails.yaml"
+# The two lists guardrails.yaml may have; each is a list of '- ' text lines.
+GUARDRAIL_LISTS: tuple[str, ...] = ("rules", "blocked_terms")
 
 # Fields each kind of skill must define; everything else is optional.
 REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
@@ -64,15 +71,30 @@ def _read_yaml(path: Path) -> tuple[Any, str]:
 
     Besides bad YAML, a file saved in another encoding than UTF-8 (Windows
     editors do) or a folder named *.yaml is a problem to report, not a crash.
+    The files are read on every prompt build and tool call, so each text is
+    parsed once (_parse_yaml); keyed by the text, not the file's timestamps,
+    an edit is read on the next load however soon it follows the last one.
+    Callers get a copy, so changing it can't change the cache.
     """
     try:
-        return _load_yaml(path.read_text(encoding="utf-8")), ""
-    except yaml.YAMLError as e:
-        return None, f"{path.name}: not valid YAML ({e})"
+        text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return None, f"{path.name}: not saved as UTF-8 text; save it again as UTF-8"
     except OSError as e:
         return None, f"{path.name}: can't be read ({e.strerror})"
+    data, problem = _parse_yaml(text)
+    if problem:
+        return None, f"{path.name}: {problem}"
+    return copy.deepcopy(data), ""
+
+
+@functools.lru_cache(maxsize=256)
+def _parse_yaml(text: str) -> tuple[Any, str]:
+    """_read_yaml's parse of one file's text: the data and "", or None and the problem."""
+    try:
+        return _load_yaml(text), ""
+    except yaml.YAMLError as e:
+        return None, f"not valid YAML ({e})"
 
 
 @dataclass
@@ -141,6 +163,99 @@ def _pillars_problem() -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class Guardrails:
+    """The org-wide content guardrails from skills/guardrails.yaml."""
+
+    rules: tuple[str, ...] = ()  # plain-English rules every post follows (the prompt)
+    blocked_terms: tuple[str, ...] = ()  # words and phrases no post may contain (checked in code)
+
+    def blocked_term(self, text: str) -> str | None:
+        """
+        The first blocked term in text, as written in the file, or None.
+
+        Matched as whole words, ignoring case, spacing, accents and look-alike
+        forms (NFKC: fullwidth letters, ligatures); a term ending in * also
+        matches longer words that start with it.
+        """
+        folded = _folded(text)
+        return next(
+            (term for term in self.blocked_terms if _term_pattern(term).search(folded)), None
+        )
+
+
+def _folded(text: str) -> str:
+    """
+    Text as blocked terms are compared: NFKC-normalized, without combining marks, case-folded.
+
+    Without the marks, an accent ("dámn") or a mark drawn over or under a
+    letter, which would otherwise split the word in two, hides no term.
+    """
+    decomposed = unicodedata.normalize("NFKD", text)
+    unmarked = "".join(char for char in decomposed if not unicodedata.combining(char))
+    return unicodedata.normalize("NFKC", unmarked).casefold()
+
+
+@functools.lru_cache(maxsize=1024)
+def _term_pattern(term: str) -> re.Pattern[str]:
+    """The pattern for one blocked term: whole words, any spacing, a trailing * for any ending."""
+    stem, any_ending = (term[:-1], True) if term.endswith("*") else (term, False)
+    words = r"\s+".join(re.escape(word) for word in _folded(stem).split())
+    return re.compile(rf"(?<!\w){words}{r'\w*' if any_ending else ''}(?!\w)")
+
+
+def _guardrail_entries(data: Any) -> tuple[dict[str, tuple[str, ...]], str | None]:
+    """
+    The usable rules and blocked terms in parsed guardrails.yaml, and its first problem or None.
+
+    A wrong entry (not text, or blank) is skipped and reported, and the rest
+    still apply: one typo must not switch every guardrail off.
+    """
+    if not isinstance(data, dict):
+        return {name: () for name in GUARDRAIL_LISTS}, (
+            f"{GUARDRAILS_FILE}: expected 'rules:' and 'blocked_terms:' lists of '- ' lines"
+        )
+    entries: dict[str, tuple[str, ...]] = {}
+    problem = None
+    for name in GUARDRAIL_LISTS:
+        value = data.get(name) or []
+        items = value if isinstance(value, list) else []
+        # A blank entry, or a lone "*" (which would block every word), is no entry.
+        entries[name] = tuple(
+            item.strip() for item in items if isinstance(item, str) and item.strip("* \t\n")
+        )
+        all_usable = isinstance(value, list) and len(entries[name]) == len(value)
+        if problem is None and not all_usable:
+            problem = (
+                f"{GUARDRAILS_FILE}: {name} must be a list of '- ' lines of text "
+                "(entries that aren't are skipped)"
+            )
+    return entries, problem
+
+
+def _read_guardrails() -> tuple[Guardrails, str | None]:
+    """The guardrails in skills/guardrails.yaml and the file's problem, if any; none if it's missing."""
+    path = SKILLS_DIR / GUARDRAILS_FILE
+    if not path.exists():
+        return Guardrails(), None
+    data, problem = _read_yaml(path)
+    if problem:
+        return Guardrails(), problem
+    entries, problem = _guardrail_entries(data)
+    return Guardrails(**entries), problem
+
+
+def load_guardrails() -> Guardrails:
+    """
+    Load the content guardrails from skills/guardrails.yaml.
+
+    A missing file means no guardrails. A broken one yields whatever entries
+    are usable (none for a file that isn't valid YAML); load_skills reports
+    and logs what is wrong with it.
+    """
+    return _read_guardrails()[0]
+
+
 def load_skills() -> SkillSet:
     """
     Load every skill file in skills/, and check the content pillars file.
@@ -160,7 +275,7 @@ def load_skills() -> SkillSet:
         "format": skills.formats,
     }
     for path in sorted(SKILLS_DIR.glob("*.yaml")):
-        if path.name == PILLARS_FILE:
+        if path.name in (PILLARS_FILE, GUARDRAILS_FILE):
             continue
         skill, problem = _read_yaml(path)
         if problem:
@@ -174,8 +289,9 @@ def load_skills() -> SkillSet:
             continue
         seen_ids.add(skill["id"])
         skills_of_kind[skill.get("kind", "platform")].append(skill)
-    if pillars_problem := _pillars_problem():
-        skills.problems.append(pillars_problem)
+    for problem in (_pillars_problem(), _read_guardrails()[1]):
+        if problem:
+            skills.problems.append(problem)
     for problem in skills.problems:
         # Skills load on every model call: each problem is logged once, not per call.
         if problem not in _logged_problems:

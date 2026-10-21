@@ -6,7 +6,7 @@ Owns: regression tests for SSRF bypasses beyond the basics in test_research.py
 malformed model arguments, NUL characters included (tools must never raise or
 corrupt memory); hostile org ids refused by every entry point that takes one,
 before anything is stored; isolation between orgs (prompts, tool arguments,
-checkpoints); prompt injection carried end to end through the agent loop, the
+edits, checkpoints); blocked terms disguised with invisible or look-alike text; prompt injection carried end to end through the agent loop, the
 model-written org brief and summary kept inside their tags, and the security
 policy last in the stable prompt; what the trace may record; and the database as
 an attacker who gets SQL into the app's connection meets it: row-level security
@@ -246,6 +246,49 @@ async def test_a_model_naming_another_org_in_tool_arguments_still_writes_to_its_
     assert [p["title"] for p in await get_ledger("attacker-org")] == ["Injected"]
     victim = database["cleaner"].execute("SELECT count(*) FROM orgs WHERE org_id = 'victim-org'")
     assert victim.fetchone() == (0,)
+
+
+async def test_edit_post_cannot_reach_another_orgs_post(database):
+    """Post ids repeat across orgs; the org's own row-level scope decides which one is edited."""
+    from agent.memory import add_post, get_ledger
+    from agent.tools import handle_tool_call
+
+    await add_post("victim-org", {"platform": "general", "content": "Victim draft"})
+    edit = {"post_id": "post_001", "find": "Victim", "replace": "Hacked"}
+    assert await handle_tool_call("edit_post", edit, "attacker-org") == (
+        "Post post_001 not found in ledger"
+    )
+    assert [p["content"] for p in await get_ledger("victim-org")] == ["Victim draft"]
+    assert await get_ledger("attacker-org") == []
+
+
+@pytest.mark.parametrize(
+    "disguised, refusal",
+    [
+        ("D\u200bamn, a day", "Error: content has a character readers can't see (U+200B)"),
+        ("D\u00adamn, a day", "Error: content has a character readers can't see (U+00AD)"),
+        ("D\u0333amn, a day", "Not saved: the post uses 'damn*'"),
+        ("Dámn, a day", "Not saved: the post uses 'damn*'"),
+        ("ＤＡＭＮ, a day", "Not saved: the post uses 'damn*'"),
+        ("\U0001d403\U0001d41a\U0001d426\U0001d427, a day", "Not saved: the post uses 'damn*'"),
+        ("Vote\u00a0for us", "Not saved: the post uses 'vote for'"),
+        ("Vote\u2003\n for us", "Not saved: the post uses 'vote for'"),
+    ],
+)
+async def test_a_disguised_blocked_term_never_reaches_the_ledger(database, disguised, refusal):
+    """A fooled model can't slip a term past the guardrails with invisible or look-alike text."""
+    from agent.memory import get_ledger
+    from agent.skills import Guardrails
+    from agent.tools import handle_tool_call
+
+    post = {"platform": "linkedin", "title": "Day", "status": "draft"}
+    guardrails = Guardrails(blocked_terms=("damn*", "vote for"))
+    with patch("agent.tools.skills.load_guardrails", return_value=guardrails):
+        for field in ("content", "title"):
+            args = {**post, "content": "A day #a #b #c", field: f"{disguised} #a #b #c"}
+            result = await handle_tool_call("save_post", args, "test-org")
+            assert result.startswith(refusal.replace("content has", f"{field} has"))
+    assert await get_ledger("test-org") == []
 
 
 async def test_checkpointer_cannot_read_or_write_another_orgs_thread(database):

@@ -6,7 +6,7 @@ starting at once on one connection pool (also more sessions than connections),
 two people on the same org (also the CLI and the web UI), two tabs of one user
 taking turns on one conversation (also a new conversation started during a
 turn), a profile read while another session writes it, every kind of org write
-at once (also from separate processes, through the database, and research that
+at once (edits of one post among them; also from separate processes, through the database, and research that
 finishes after another session saved), and streams interleaving. The model is
 mocked with scripts that answer each session by the content of its own messages,
 so a reply or a tool write routed to the wrong session fails the test. Does not
@@ -305,6 +305,7 @@ async def test_every_kind_of_org_write_at_once_loses_no_update(database):
     from agent.tools import handle_tool_call
 
     await _seed_org_for_writers()
+    await mem.add_post("org", {"platform": "general", "content": "Join us", "title": "Edited"})
     search = [{"title": "t", "snippet": "s", "url": "https://news.example/a"}]
     writers = [
         *(
@@ -325,6 +326,12 @@ async def test_every_kind_of_org_write_at_once_loses_no_update(database):
         mem.fill_org_details("org", "Org", "https://org.example"),
         handle_tool_call("research_org", {"org_name": "Org"}, "org"),
         handle_tool_call("web_search", {"query": "q"}, "org"),
+        *(
+            handle_tool_call(
+                "edit_post", {"post_id": "post_002", "find": "Join", "replace": f"Meet {n}"}, "org"
+            )
+            for n in range(5)
+        ),
     ]
     with (
         patch("agent.tools.res.research_org", new=AsyncMock(return_value=dict(RESEARCH))),
@@ -335,8 +342,10 @@ async def test_every_kind_of_org_write_at_once_loses_no_update(database):
 
     profile = await mem.load_profile("org")
     ledger = profile["post_ledger"]
-    assert len(ledger) == 11 and len({post["id"] for post in ledger}) == 11
-    assert "performance" in ledger[0]
+    assert len(ledger) == 17 and len({post["id"] for post in ledger}) == 17
+    assert "performance" in ledger[0] and ledger[1]["content"] == "Join us"
+    versions = [post for post in ledger if post.get("parent_id") == "post_002"]
+    assert sorted(post["content"] for post in versions) == [f"Meet {n} us" for n in range(5)]
     assert sorted(profile["preferences"]["banned_topics"]) == sorted(
         f"topic {n}" for n in range(10)
     )
