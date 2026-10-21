@@ -6,7 +6,8 @@ starting at once on one connection pool (also more sessions than connections),
 two people on the same org (also the CLI and the web UI), two tabs of one user
 taking turns on one conversation (also a new conversation started during a
 turn), a profile read while another session writes it, every kind of org write
-at once (edits of one post among them; also from separate processes, through the database, and research that
+at once (edits of one post among them; one post published from several
+sessions; also from separate processes, through the database, and research that
 finishes after another session saved), and streams interleaving. The model is
 mocked with scripts that answer each session by the content of its own messages,
 so a reply or a tool write routed to the wrong session fails the test. Does not
@@ -371,6 +372,38 @@ async def test_one_post_approved_in_two_sessions_at_once_is_one_voice_example(da
         WAIT_S,
     )
     assert len((await mem.load_profile("org"))["voice_examples"]) == 1
+
+
+async def test_one_post_published_from_several_sessions_at_once_goes_out_once(database):
+    """Regression guard: each session sees the post approved and unpublished; one claim wins."""
+    import agent.memory as mem
+    from agent import publishing
+    from agent.tools import Turn, handle_tool_call
+
+    await mem.add_post(
+        "org", {"platform": "linkedin", "content": "x #a #b #c", "status": "approved"}
+    )
+    account = publishing.PlatformAccount("linkedin", "page", "", ("w_organization_social",))
+    await publishing.connect_account("org", account)
+    real = publishing.DummyPublisher.publish
+    calls = []
+
+    async def counted(self, request, account):
+        calls.append(request.post_id)
+        return await real(self, request, account)
+
+    args = {"post_id": "post_001", "platforms": ["linkedin"]}
+    turn = Turn(request="Publish it to LinkedIn")
+    with patch.object(publishing.DummyPublisher, "publish", counted):
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *(handle_tool_call("publish_post", args, "org", turn) for _ in range(5))
+            ),
+            WAIT_S,
+        )
+    assert calls == ["post_001"]
+    assert sum(result.startswith("LinkedIn: published") for result in results) == 1
+    assert (await mem.get_post("org", "post_001"))["status"] == "posted"
 
 
 async def test_appends_in_parallel_sessions_cannot_take_a_list_over_its_cap(database):

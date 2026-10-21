@@ -4,7 +4,9 @@ Cross-cutting tests of what Mackie logs and what it never logs, across modules.
 Owns: that each event the logging policy names (logins, refused logins and
 lockouts, refused or revoked org access, account changes, a blocked fetch,
 and failures of a tool, a model, a page fetch, a search, the summary, the org
-brief, a calendar week, a planned post left out by the guardrails, the trace, the database, a login, a session start,
+brief, a calendar week, a planned post left out by the guardrails, publishing
+(an account connected or removed, a post published, a failed attempt), the
+trace, the database, a login, a session start,
 the recap at a session's start, a turn on the web or in the terminal, a
 reset, a terminal session, pruning, and a skill file skipped) is logged once,
 by the module that handles it, at the right level, naming the user, org or
@@ -355,6 +357,28 @@ async def test_a_planned_post_left_out_by_the_guardrails_is_logged_without_its_t
         ]
         * 4
     )
+
+
+async def test_publishing_is_logged_without_the_posts_text(database, logs):
+    from agent import memory as mem
+    from agent import publishing
+
+    await mem.fill_org_details("food-bank", "Food Bank")
+    account = publishing.PlatformAccount("linkedin", "page-1", "", ("w_organization_social",))
+    await publishing.connect_account("food-bank", account)
+    request = publishing.PublishRequest("post_001", "SECRET-COPY")
+    await publishing.publish("food-bank", request, [account])
+    failing = AsyncMock(side_effect=ConnectionError("SECRET-ERROR"))
+    with patch.object(publishing.DummyPublisher, "publish", failing):
+        await publishing.publish("food-bank", publishing.PublishRequest("post_002", "x"), [account])
+    await publishing.disconnect_account("food-bank", "linkedin")
+    assert _records(logs, "agent.publishing") == [
+        (logging.INFO, "Connected food-bank's linkedin account 'page-1'"),
+        (logging.INFO, "Published post_001 for food-bank to linkedin (simulated)"),
+        (logging.WARNING, "Publishing post_002 for food-bank to linkedin failed: ConnectionError"),
+        (logging.INFO, "Disconnected food-bank's 'linkedin' account"),
+    ]
+    assert "SECRET" not in logs.text
 
 
 # --- Graph ------------------------------------------------------------------------------

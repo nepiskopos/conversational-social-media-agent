@@ -190,7 +190,10 @@ def _folded(text: str) -> str:
 
     Without the marks, an accent ("dámn") or a mark drawn over or under a
     letter, which would otherwise split the word in two, hides no term.
+    ASCII text has none of these, and is folded at C speed.
     """
+    if text.isascii():
+        return text.casefold()
     decomposed = unicodedata.normalize("NFKD", text)
     unmarked = "".join(char for char in decomposed if not unicodedata.combining(char))
     return unicodedata.normalize("NFKC", unmarked).casefold()

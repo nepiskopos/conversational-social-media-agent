@@ -53,14 +53,6 @@ def test_load_skills_splits_platforms_content_types_and_formats(skills_dir):
     assert skills.problems == []
 
 
-def test_load_skills_ignores_content_pillars_file(skills_dir):
-    from agent.skills import load_skills
-
-    (skills_dir / "content_pillars.yaml").write_text("pillars:\n  - name: Some Pillar\n")
-    skills = load_skills()
-    assert skills.platforms == [] and skills.problems == []
-
-
 @pytest.mark.parametrize(
     "content, expected_problem",
     [
@@ -83,6 +75,19 @@ def test_load_skills_ignores_content_pillars_file(skills_dir):
             "kind: format\nid: x\nname: X\npurpose: p\nstructure: s\nplatforms: [Instagram]\n",
             "'Instagram' must be written in lowercase",
         ),
+        # The prompt builder relies on these types; a YAML list instead of a '|' block is easy
+        # to write.
+        (PLATFORM_YAML + "format_hints:\n  - Short\n  - Punchy\n", "format_hints must be text"),
+        (PLATFORM_YAML + "tone: 3\n", "tone must be text"),
+        (CONTENT_TYPE_YAML + "must_include: one link\n", "must_include must be a list"),
+        (CONTENT_TYPE_YAML + "avoid:\n  - guilt\n  - 3\n", "avoid must be a list"),
+        (STORY_YAML + "has_caption: no-thanks\n", "has_caption must be true or false"),
+        (STORY_YAML + "needs_visual: maybe\n", "needs_visual must be true or false"),
+        (STORY_YAML + "platforms: instagram\n", "platforms must be a list"),
+        # Rendered as "on all platforms" but matching none: leaving it out means all.
+        (STORY_YAML + "platforms: []\n", "list the platforms under platforms, or leave it out"),
+        # An id like [a, b] is unhashable; the duplicate-id check must not raise on it.
+        ("id: [a, b]\nname: X\nmax_length: 100\n", "id must be text"),
     ],
 )
 def test_load_skills_reports_and_skips_invalid_files(skills_dir, content, expected_problem):
@@ -207,7 +212,8 @@ def test_load_guardrails_reads_rules_and_blocked_terms(skills_dir):
     assert load_guardrails() == Guardrails(
         ("Be kind.", "Keep politics out."), ("damn*", "vote for")
     )
-    assert load_skills().problems == []  # not read as a platform file
+    (skills_dir / "content_pillars.yaml").write_text("pillars:\n  - name: Some Pillar\n")
+    assert load_skills().problems == []  # neither is read as a platform file
 
 
 @pytest.mark.parametrize(
@@ -294,36 +300,6 @@ def test_shipped_skill_files_are_all_valid():
     assert {"feed_post", "carousel", "story", "reel"} <= {f["id"] for f in skills.formats}
     guardrails = load_guardrails()
     assert len(guardrails.rules) >= 5 and "fuck*" in guardrails.blocked_terms
-
-
-@pytest.mark.parametrize(
-    "content, expected_problem",
-    [
-        # The prompt builder relies on these types; a YAML list instead of a '|' block is easy
-        # to write.
-        (PLATFORM_YAML + "format_hints:\n  - Short\n  - Punchy\n", "format_hints must be text"),
-        (PLATFORM_YAML + "tone: 3\n", "tone must be text"),
-        (CONTENT_TYPE_YAML + "must_include: one link\n", "must_include must be a list"),
-        (CONTENT_TYPE_YAML + "avoid:\n  - guilt\n  - 3\n", "avoid must be a list"),
-        (STORY_YAML + "has_caption: no-thanks\n", "has_caption must be true or false"),
-        (STORY_YAML + "needs_visual: maybe\n", "needs_visual must be true or false"),
-        (STORY_YAML + "platforms: instagram\n", "platforms must be a list"),
-        # Rendered as "on all platforms" but matching none: leaving it out means all.
-        (STORY_YAML + "platforms: []\n", "list the platforms under platforms, or leave it out"),
-        # An id like [a, b] is unhashable; the duplicate-id check must not raise on it.
-        ("id: [a, b]\nname: X\nmax_length: 100\n", "id must be text"),
-    ],
-)
-def test_load_skills_reports_and_skips_a_field_with_the_wrong_type(
-    skills_dir, content, expected_problem
-):
-    from agent.skills import load_skills
-
-    (skills_dir / "bad.yaml").write_text(content)
-    skills = load_skills()
-    assert skills.platforms == [] and skills.content_types == [] and skills.formats == []
-    assert len(skills.problems) == 1
-    assert expected_problem in skills.problems[0]
 
 
 def test_skills_read_the_same_with_or_without_pyyamls_c_parser():

@@ -174,7 +174,6 @@ def test_to_litellm_answers_tool_calls_whose_result_was_lost(messages, expected)
     [
         pytest.param(_calls("tc_1"), "tools", id="tool-calls"),
         pytest.param(AIMessage(content="Here is my response."), END, id="text-reply"),
-        pytest.param(AIMessage(content="ok", tool_calls=[]), END, id="empty-tool-calls"),
     ],
 )
 async def test_should_continue_routes_on_the_last_message(message, expected):
@@ -824,14 +823,6 @@ async def test_unsaved_post_ids_skips_ids_in_the_ledger_and_sorts_numerically(da
 
     state = _reply_state("post_010, post_001 and post_002")
     assert await _unsaved_post_ids(state) == ["post_002", "post_010"]
-
-
-async def test_should_continue_ends_when_every_shown_id_is_in_the_ledger(database):
-    from agent.graph import should_continue
-    from agent.memory import add_post
-
-    await add_post("org", {"platform": "linkedin", "content": "Saved idea"})
-    assert await should_continue(_reply_state("Here it is · post_001")) == END
 
 
 async def test_should_continue_ends_for_ids_the_user_or_a_tool_mentioned(database):

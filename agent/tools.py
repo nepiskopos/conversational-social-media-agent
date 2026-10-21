@@ -8,10 +8,13 @@ statuses, dates, text fields and their lengths, reported counts, preference
 sizes), the Turn checks that what outlasts a turn (preferences, voice
 examples, approvals, results) traces back to the user, the checks save_post
 applies (platform and format rules from skills/, the guardrails' blocked
-terms, versions, cited sources) and their re-check before a post goes live, edit_post's exact replacements, the org brief written after research,
+terms, versions, cited sources) and their re-check before a post goes live, edit_post's exact replacements,
+when publish_post may publish (an approved post, the user's request naming
+each platform, each platform's rules), the org brief written after research,
 and the content calendar.
 Does not own the conversation loop (graph.py), the prompt (assistant.py),
-fetching research (research.py) or storage (memory.py).
+fetching research (research.py), storage (memory.py) or the publishers and
+the record of what went out (publishing.py).
 """
 
 from __future__ import annotations
@@ -32,8 +35,8 @@ from urllib.parse import urlparse
 import litellm
 
 from . import memory as mem
+from . import publishing, skills
 from . import research as res
-from . import skills
 from .config import BACKGROUND_RETRIES, background_kwargs, resolve_fast_model
 from .logs import describe, safe, stack
 from .untrusted import wrap_untrusted
@@ -147,7 +150,9 @@ HIDDEN_CHARACTER_RANGES: tuple[tuple[int, int], ...] = (
     (0xFFA0, 0xFFA0),
     (0xE0000, 0xE0FFF),
 )
-VISIBLE_WHITESPACE: frozenset[str] = frozenset({"\n", "\t"})
+# Every character but printable ASCII, tab and newline: the only ones that can be hidden, so
+# _hidden_character looks at these alone (a long post is mostly ASCII, checked at C speed).
+MAYBE_HIDDEN: re.Pattern[str] = re.compile(r"[^\t\n\x20-\x7e]")
 # Joiners shape emoji and some scripts, so they are allowed between non-ASCII characters; an
 # emoji's text or emoji style selector is allowed right after a symbol. Anywhere else they
 # could carry hidden bits of text.
@@ -158,6 +163,13 @@ VISUAL_LINE: re.Pattern[str] = re.compile(
     r"^[^a-z0-9\n]*visual(?:\s+(?:idea|description))?[^a-z0-9\n]*:", re.IGNORECASE | re.MULTILINE
 )
 SHOWN_POST_PATTERN: re.Pattern[str] = re.compile(r"^Post: (post_[0-9]+)\n")
+# A request to publish in the user's own message: "publish it", "post it to", "share it on",
+# "go live". Not the noun "post", so "write a LinkedIn post" asks for nothing to go out.
+PUBLISH_REQUEST: re.Pattern[str] = re.compile(
+    r"\b(publish\w*|share|sharing|go(?:es|ing)? live|"
+    r"post (?:it|them|this|that|these|those|to|on)|put (?:it|them) (?:up|out|on))\b",
+    re.IGNORECASE,
+)
 STATUS_LINE: re.Pattern[str] = re.compile(r"^Status: [a-z]+\n", re.MULTILINE)
 SHOW_DRAFT_NEXT: str = (
     "\nNext: call show_post for {post_id}. Mackie displays it to the user exactly as saved, "
@@ -180,6 +192,7 @@ class Turn:
     """
 
     user_text: str = ""  # every message the user typed in this conversation
+    request: str = ""  # the user's latest message: what they are asking for now
     shown_posts: tuple[str, ...] = ()  # show_post results displayed before their latest message
     new_post_ids: frozenset[str] = frozenset()  # posts saved since the user's latest message
 
@@ -194,6 +207,7 @@ class Turn:
         )
         return cls(
             user_text="\n".join(str(msg.content) for msg in messages if is_user_turn(msg)),
+            request=str(messages[last_user].content) if last_user >= 0 else "",
             shown_posts=tuple(
                 str(msg.content)
                 for msg in messages[:last_user]
@@ -427,6 +441,30 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["post_id", "status"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "publish_post",
+            "description": (
+                "Publish an approved post, as it is saved, to one or more of the org's "
+                "connected social media accounts. Only when the user's latest message asks to "
+                "publish it and names each platform. Publishing is simulated for now: nothing "
+                "reaches the platform, and you must say so."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "post_id": {"type": "string"},
+                    "platforms": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": list(publishing.PUBLISHERS)},
+                        "description": 'The platforms the user named, e.g. ["linkedin", "facebook"]',
+                    },
+                },
+                "required": ["post_id", "platforms"],
             },
         },
     },
@@ -845,8 +883,12 @@ def _blocked_term(post: dict[str, Any]) -> str | None:
     return next((term for term in found if term), None)
 
 
-def _live_post_problem(post: dict[str, Any]) -> str | None:
-    """What stops a stored post being approved, or None (also for unknown platforms)."""
+def _live_post_problem(post: dict[str, Any], platform_id: str | None = None) -> str | None:
+    """
+    What stops a stored post being approved, or published on platform_id, or None.
+
+    platform_id defaults to the post's own platform; an unknown one has no rules.
+    """
     # An imported post skipped save_post's check; approving it would approve text unseen.
     if hidden := _hidden_character(str(post.get("content") or "")):
         return f"its text has a character readers can't see (U+{ord(hidden):04X})"
@@ -854,10 +896,12 @@ def _live_post_problem(post: dict[str, Any]) -> str | None:
     if term := _blocked_term(post):
         return f"it uses {term!r}, which the content guardrails rule out"
     skill_set = skills.load_skills()
-    platform = _platform_skill(skill_set, str(post.get("platform", "")))
+    platform = _platform_skill(skill_set, platform_id or str(post.get("platform", "")))
     if platform is None:
         return None
     post_format = _format_skill(skill_set, post.get("format"))
+    if post_format and platform["id"] not in post_format.get("platforms", [platform["id"]]):
+        return f"{post_format['name']} isn't a format on {platform['name']}"
     return _platform_problem(
         str(post.get("content", "")), platform, post_format, post.get("visual")
     )
@@ -1041,6 +1085,128 @@ async def _edit_post(org_id: str, tool_input: dict[str, Any]) -> str:
     return await _store_post(org_id, version, edited=True)
 
 
+def _names_platform(text: str, platform: dict[str, Any]) -> bool:
+    """Whether text names the platform by its name or id, as a whole word in any case."""
+    return any(
+        re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text, re.IGNORECASE)
+        for name in (platform["name"], platform["id"])
+    )
+
+
+async def _publish_refusal(
+    org_id: str,
+    post: dict[str, Any],
+    targets: list[dict[str, Any]],
+    accounts: dict[str, publishing.PlatformAccount],
+    turn: Turn,
+) -> str | None:
+    """
+    Why the post can't be published to these platforms (skills) and accounts, or None.
+
+    A fooled model can call any tool, and a publication can't be taken back, so
+    the user's latest message must ask to publish and name every platform; and
+    only an approved post goes out (its approval needed Mackie to show it, and
+    an approved post's text never changes). A version written for one platform
+    goes only there; a general post goes wherever it meets the rules. Everything
+    is checked before anything goes out, so a refusal leaves nothing half
+    published, and the refusal says which platforms could go out.
+    """
+    if not PUBLISH_REQUEST.search(turn.request):
+        return (
+            "Not published: the user's latest message doesn't ask to publish. Ask them, e.g. "
+            f'"Shall I publish {post["id"]} to LinkedIn?", and publish only when they say so.'
+        )
+    if unnamed := [p["name"] for p in targets if not _names_platform(turn.request, p)]:
+        return (
+            f"Not published: the user didn't name {', '.join(unnamed)} in their latest "
+            f'message. Ask them to say where it should go, e.g. "publish it to LinkedIn".'
+        )
+    status = post.get("status")
+    if status == "posted" and not await publishing.published_platforms(org_id, post["id"]):
+        return (
+            f"Not published: {post['id']} is marked posted, so it already went out without "
+            "Mackie. Publish a new version once the user approves it."
+        )
+    if status not in LIVE_STATUSES:
+        return (
+            f"Not published: {post['id']} is {status}, not approved. Show it with show_post "
+            "and ask the user to approve it first."
+        )
+    own = _platform_skill(skills.load_skills(), str(post.get("platform") or ""))
+    problems, ready, needs_version = [], [], False
+    for platform in targets:
+        account = accounts.get(platform["id"])
+        if account is None:
+            problems.append(
+                f"no {platform['name']} account is connected (an admin connects one with "
+                "scripts/platform_accounts.py)"
+            )
+        elif missing := publishing.missing_scopes(account):
+            problems.append(
+                f"the {platform['name']} account wasn't granted {', '.join(missing)}; an admin "
+                "reconnects it with that permission"
+            )
+        # A version written for one platform stays there; a general post goes where it fits.
+        elif own and own["id"] != platform["id"]:
+            problems.append(f"it was written for {own['name']}, not {platform['name']}")
+            needs_version = True
+        elif problem := _live_post_problem(post, platform["id"]):
+            problems.append(f"it isn't ready for {platform['name']}: {problem}")
+            needs_version = True
+        else:
+            ready.append(platform["name"])
+    if not problems:
+        return None
+    advice = " Tell the user why."
+    if ready:
+        advice += f" Ask whether to publish it to {', '.join(ready)} without the others."
+    if needs_version:
+        advice += (
+            " Only if they want it on a platform it isn't ready for: publish that platform's "
+            "own version, or save one (save_post with parent_id), show it and get it approved."
+        )
+    return "Not published (nothing went out): " + "; ".join(problems) + "." + advice
+
+
+async def _publish_post(org_id: str, tool_input: dict[str, Any], turn: Turn) -> str:
+    """
+    Publish an approved post to the platforms the user named; return the tool result.
+
+    The text is the stored post's, never the model's. Each platform is published
+    to at most once (publishing.publish); a post newly published anywhere is
+    marked posted.
+    """
+    requested = tool_input["platforms"]
+    if not isinstance(requested, list) or not all(isinstance(p, str) for p in requested):
+        return 'Error: platforms must be a list of platform ids, e.g. ["linkedin", "facebook"].'
+    platform_ids = list(dict.fromkeys(p.strip().lower() for p in requested))  # distinct, in order
+    if unknown := [p for p in platform_ids if p not in publishing.PUBLISHERS]:
+        return (
+            f"Not published: Mackie can't publish to {', '.join(map(repr, unknown[:5]))}; "
+            f"it publishes to {', '.join(publishing.PUBLISHERS)}."
+        )
+    if not platform_ids:
+        return "Error: platforms is empty; pass the platforms the user named."
+    post = await mem.get_post(org_id, tool_input["post_id"])
+    if post is None:
+        return f"Post {tool_input['post_id']} not found in ledger"
+    skill_set = skills.load_skills()
+    targets = [
+        _platform_skill(skill_set, p) or {"id": p, "name": p.capitalize()} for p in platform_ids
+    ]
+    accounts = await publishing.get_accounts(org_id)
+    if refusal := await _publish_refusal(org_id, post, targets, accounts, turn):
+        return refusal
+    request = publishing.PublishRequest(
+        post["id"], str(post.get("content") or ""), str(post.get("visual") or "")
+    )
+    outcomes = await publishing.publish(org_id, request, [accounts[p] for p in platform_ids])
+    if any(outcome.published for outcome in outcomes) and post.get("status") == "approved":
+        await mem.update_post_status(org_id, post["id"], "posted")
+    names = {platform["id"]: platform["name"] for platform in targets}
+    return "\n".join(f"{names[outcome.platform]}: {outcome.message}" for outcome in outcomes)
+
+
 async def _remember_search_sources(org_id: str, results: list[dict[str, Any]]) -> None:
     """
     Add web_search result URLs to the research sources so they can be cited and checked.
@@ -1108,9 +1274,8 @@ def _hidden_character(text: str) -> str | None:
     control code, a tag character, variation selectors after an emoji, which
     can spell out a hidden instruction) would be approved unread.
     """
-    for i, char in enumerate(text):
-        if char in VISIBLE_WHITESPACE:
-            continue
+    for match in MAYBE_HIDDEN.finditer(text):
+        i, char = match.start(), match[0]
         before, after = text[i - 1 : i], text[i + 1 : i + 2]
         if char in JOINERS and before and after and not (before + after).isascii():
             continue
@@ -1299,6 +1464,7 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str, tur
         "search_ledger",
         "record_performance",
         "show_post",
+        "publish_post",
     )
     if validated and (error := _invalid_arguments(tool_input)):
         return error
@@ -1362,6 +1528,9 @@ async def _dispatch(tool_name: str, tool_input: dict[str, Any], org_id: str, tur
         if status == "approved" and previous not in LIVE_STATUSES and post and post.get("content"):
             await mem.add_voice_example(org_id, post["content"], f"approved {post_id}")
         return f"Updated {post_id} → {status}"
+
+    elif tool_name == "publish_post":
+        return await _publish_post(org_id, tool_input, turn)
 
     elif tool_name == "save_preference":
         if not _typed_by_user(tool_input["quote"], turn.user_text):

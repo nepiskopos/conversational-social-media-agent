@@ -153,11 +153,13 @@ async def test_a_failed_pool_opening_is_retried_by_the_next_caller(fresh_pool):
 async def test_an_out_of_date_schema_is_refused_until_migrated(fresh_pool, tmp_path):
     from agent import db
 
-    for name in ("001_initial.sql", "002_next.sql"):
-        (tmp_path / name).write_text("SELECT 1;")
+    current = len(list(db.MIGRATIONS_DIR.glob("*.sql")))  # what the test database has
+    for number in range(1, current + 2):
+        (tmp_path / f"{number:03d}_step.sql").write_text("SELECT 1;")
+    needs = f"version {current}; this Mackie needs {current + 1}.*migrate.py"
     with (
         patch("agent.db.MIGRATIONS_DIR", tmp_path),
-        pytest.raises(db.DatabaseError, match="version 1; this Mackie needs 2.*migrate.py"),
+        pytest.raises(db.DatabaseError, match=needs),
     ):
         await db.get_pool()
 
@@ -252,8 +254,11 @@ async def test_a_failing_migration_leaves_nothing_behind(database, tmp_path):
 
     from .conftest import TEST_APP_ROLE
 
-    (tmp_path / "001_initial.sql").write_text((db.MIGRATIONS_DIR / "001_initial.sql").read_text())
-    (tmp_path / "002_bad.sql").write_text("CREATE TABLE half_done (x int); SELECT 1/0;")
+    applied = sorted(db.MIGRATIONS_DIR.glob("*.sql"))
+    for path in applied:
+        (tmp_path / path.name).write_text(path.read_text())
+    bad = tmp_path / f"{len(applied) + 1:03d}_bad.sql"
+    bad.write_text("CREATE TABLE half_done (x int); SELECT 1/0;")
     with (
         patch("agent.db.MIGRATIONS_DIR", tmp_path),
         pytest.raises(psycopg.errors.DivisionByZero),
@@ -261,7 +266,9 @@ async def test_a_failing_migration_leaves_nothing_behind(database, tmp_path):
         await db.migrate(database["owner"], TEST_APP_ROLE)
     cleaner = database["cleaner"]
     assert cleaner.execute("SELECT to_regclass('half_done')").fetchone() == (None,)
-    assert cleaner.execute("SELECT max(version) FROM schema_migrations").fetchone() == (1,)
+    assert cleaner.execute("SELECT max(version) FROM schema_migrations").fetchone() == (
+        len(applied),
+    )
 
 
 async def test_after_the_database_drops_its_connections_only_one_request_fails(

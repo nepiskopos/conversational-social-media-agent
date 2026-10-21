@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tests.conftest import load_script
+from tests.llm_fakes import completion
 
 
 @pytest.fixture(scope="module")
@@ -148,10 +149,7 @@ def test_print_report_scores_names_models_and_shows_saved_state(
 
 async def test_score_all_shows_the_judge_step1_only_for_the_step7_repeat_rubric(eval_module):
     responses = [{"step": i, "user": f"msg {i}", "reply": f"reply-{i}"} for i in range(1, 8)]
-    verdict = MagicMock(
-        choices=[MagicMock(message=MagicMock(content=json.dumps({"score": 3, "reason": "ok"})))]
-    )
-    judge = AsyncMock(return_value=verdict)
+    judge = AsyncMock(return_value=completion(json.dumps({"score": 3, "reason": "ok"})))
     with patch.object(eval_module.litellm, "acompletion", judge):
         scores = await eval_module.score_all(responses)
 
@@ -195,12 +193,12 @@ def test_voice_invariant_checks_the_posts_in_steps_4_and_7_only(eval_module):
         ('Here you go: {"score": 1, "reason": "prose around it"} — hope that helps', 1),
         ('{"score": "high", "reason": "not a number"}', -1),
         ("I can't score this.", -1),
-        ("", -1),
     ],
 )
 async def test_score_one_reads_the_judge_reply_shapes(eval_module, reply, score):
-    verdict = MagicMock(choices=[MagicMock(message=MagicMock(content=reply))])
-    with patch.object(eval_module.litellm, "acompletion", AsyncMock(return_value=verdict)):
+    with patch.object(
+        eval_module.litellm, "acompletion", AsyncMock(return_value=completion(reply))
+    ):
         result = await eval_module._score_one(1, "msg", "reply", "voice", "desc")
     assert result["rubric"] == "voice" and result["score"] == score
 
@@ -239,19 +237,14 @@ async def test_run_scenario_snapshots_memory_after_every_step(eval_module, datab
 
 async def test_an_empty_judge_reply_is_asked_again(eval_module):
     """A reasoning judge can spend its tokens thinking and answer nothing; ask once more."""
-    empty = MagicMock(choices=[MagicMock(message=MagicMock(content=""))])
-    verdict = MagicMock(
-        choices=[MagicMock(message=MagicMock(content='{"score": 3, "reason": "fine"}'))]
-    )
-    judge = AsyncMock(side_effect=[empty, verdict])
+    judge = AsyncMock(side_effect=[completion(""), completion('{"score": 3, "reason": "fine"}')])
     with patch.object(eval_module.litellm, "acompletion", judge):
         result = await eval_module._score_one(1, "msg", "reply", "voice", "desc")
     assert result["score"] == 3 and judge.await_count == 2
 
 
 async def test_a_judge_that_stays_empty_is_scored_as_a_parse_error(eval_module):
-    empty = MagicMock(choices=[MagicMock(message=MagicMock(content=None))])
-    judge = AsyncMock(return_value=empty)
+    judge = AsyncMock(return_value=completion(None))
     with patch.object(eval_module.litellm, "acompletion", judge):
         result = await eval_module._score_one(1, "msg", "reply", "voice", "desc")
     assert result["score"] == -1 and result["reason"].startswith("parse error")

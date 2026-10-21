@@ -1,6 +1,6 @@
 """
 Tests for the admin scripts: migrate.py (schema and grants), users.py (accounts
-and access), export_profile.py and import_profiles.py (editing an org's memory
+and access), platform_accounts.py (an org's social media accounts), export_profile.py and import_profiles.py (editing an org's memory
 as JSON, and moving the old data/ folders into the database). The account and
 storage rules themselves are owned by test_accounts.py and test_memory.py.
 """
@@ -23,6 +23,11 @@ def migrate():
 @pytest.fixture(scope="module")
 def users():
     return load_script("users")
+
+
+@pytest.fixture(scope="module")
+def platform_accounts():
+    return load_script("platform_accounts")
 
 
 @pytest.fixture(scope="module")
@@ -204,6 +209,51 @@ async def test_users_reports_a_missing_database(users, capsys):
     with patch("agent.db.get_pool", side_effect=DatabaseError("not set")):
         assert await _users(users, ["list"]) == 1
     assert "not set" in capsys.readouterr().out
+
+
+# --- platform_accounts.py --------------------------------------------------------------
+
+
+async def test_platform_accounts_connect_list_and_disconnect(platform_accounts, database, capsys):
+    from agent import memory as mem
+    from agent import publishing
+
+    await mem.fill_org_details("brca-strong", "BRCA Strong")
+    connect = ["connect", "BRCA Strong", "LinkedIn", "urn:li:organization:9", "--name", "BRCA"]
+    assert await platform_accounts.main(connect) == 0
+    partial = ["connect", "brca-strong", "instagram", "17841", "--scopes", "instagram_basic"]
+    assert await platform_accounts.main(partial) == 0
+    assert await platform_accounts.main(["list", "brca-strong"]) == 0
+    out = capsys.readouterr().out
+    assert "linkedin: urn:li:organization:9 (BRCA); permissions: w_organization_social\n" in out
+    assert (
+        "instagram: 17841; permissions: instagram_basic; can't publish without "
+        "instagram_content_publish" in out
+    )
+    assert await platform_accounts.main(["disconnect", "brca-strong", "instagram"]) == 0
+    assert list(await publishing.get_accounts("brca-strong")) == ["linkedin"]
+
+
+@pytest.mark.parametrize(
+    "argv, message",
+    [
+        (["connect", "org-a", "tiktok", "1"], "can't publish to 'tiktok'"),
+        (["connect", "org-a", "linkedin", "my page"], "without spaces"),
+        (["connect", "nobody", "linkedin", "1"], "There is no organization nobody"),
+        (["connect", "!!!", "linkedin", "1"], "not an organization name"),
+        (["disconnect", "org-a", "facebook"], "org-a has no facebook account connected"),
+        (["list", "org-a"], "org-a has no accounts connected"),
+    ],
+)
+async def test_platform_accounts_explains_what_went_wrong(
+    platform_accounts, database, capsys, argv, message
+):
+    from agent import memory as mem
+
+    await mem.fill_org_details("org-a", "A")
+    code = await platform_accounts.main(argv)
+    assert code == (0 if argv[0] == "list" else 1)
+    assert message in capsys.readouterr().out
 
 
 # --- export_profile.py and import_profiles.py ---------------------------------------

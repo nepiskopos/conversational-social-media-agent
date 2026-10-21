@@ -43,7 +43,6 @@ from tests.llm_fakes import text_stream
 
 USERNAME = "sam@food.example"
 PASSWORD = "correct horse battery"
-# Hashing at the production cost takes about 50 ms; the stored hash records its own cost.
 # The driver's own message names the server; none of it may reach the screen.
 DRIVER_DOWN = 'connection to server at "10.0.0.5", port 5432 failed: Connection refused'
 

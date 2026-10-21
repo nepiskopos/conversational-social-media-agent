@@ -681,20 +681,20 @@ SHOWN_POST = {"id": "post_001", "platform": "linkedin", "content": "Our warm pos
 
 
 @pytest.mark.parametrize(
-    "shown, typed, approved",
+    "shown, typed, status, approved",
     [
         # Regression: a draft the model saved, unshown, could be approved on the next turn.
-        (None, "write a post and approve it", False),
-        # Regression: a reply can seem to show a post while its Markdown hides the text (seven
-        # ways were found), so only Mackie's own display counts, never the model's reply.
-        (None, "looks good", False),
-        (SHOWN_POST, "looks good", True),
-        ({**SHOWN_POST, "content": "Our earlier text"}, "looks good", False),  # changed since
-        (None, "We posted: Our warm post #a #b #c", True),  # they wrote it
+        # And a reply can seem to show a post while its Markdown hides the text (seven ways
+        # were found), so only Mackie's own display counts, never the model's reply.
+        (None, "looks good", "approved", False),
+        (None, "looks good", "posted", False),  # nor marked as gone out
+        (SHOWN_POST, "looks good", "approved", True),
+        ({**SHOWN_POST, "content": "Our earlier text"}, "looks good", "approved", False),  # changed
+        (None, "We posted: Our warm post #a #b #c", "approved", True),  # they wrote it
     ],
 )
 async def test_only_a_post_mackie_displayed_to_the_user_can_be_approved(
-    database, shown, typed, approved
+    database, shown, typed, status, approved
 ):
     from agent.memory import add_post, get_post
     from agent.tools import Turn, _format_post, handle_tool_call
@@ -703,14 +703,14 @@ async def test_only_a_post_mackie_displayed_to_the_user_can_be_approved(
     stored = await get_post("test-org", "post_001")
     displayed = (_format_post({**stored, **shown}),) if shown else ()
     turn = Turn(user_text=typed, shown_posts=displayed)
-    approve = {"post_id": "post_001", "status": "approved"}
-    result = await handle_tool_call("update_post_status", approve, "test-org", turn)
-    status = (await get_post("test-org", "post_001"))["status"]
+    change = {"post_id": "post_001", "status": status}
+    result = await handle_tool_call("update_post_status", change, "test-org", turn)
+    stored_status = (await get_post("test-org", "post_001"))["status"]
     if approved:
-        assert result == "Updated post_001 → approved" and status == "approved"
+        assert result == f"Updated post_001 → {status}" and stored_status == status
     else:
         assert result.startswith("Not updated: Mackie hasn't shown post_001")
-        assert status == "suggested"
+        assert stored_status == "suggested"
 
 
 def test_turn_knows_what_the_user_typed_was_shown_and_hasnt_seen():
@@ -745,6 +745,7 @@ def test_turn_knows_what_the_user_typed_was_shown_and_hasnt_seen():
     assert turn.new_post_ids == {"post_002", "post_003", "post_005"}
     assert turn.shown_posts == ("Post: post_001\nTitle: Spotlight\n\nCopy:\nMeet Ana",)
     assert turn.user_text == "Write a post\nApprove it, and write another"
+    assert turn.request == "Approve it, and write another"  # their latest message only
 
 
 def test_mackies_display_keeps_each_line_and_quotes_it():
@@ -824,16 +825,6 @@ async def test_a_post_shown_then_approved_can_be_marked_posted_and_given_results
     )
     results = await call("record_performance", {"reactions": 40}, "it got 40 likes")
     assert results.startswith("Recorded results for post_001")
-
-
-async def test_an_unseen_post_cant_be_marked_posted(database):
-    from agent.memory import add_post
-    from agent.tools import Turn, handle_tool_call
-
-    await add_post("test-org", {"platform": "general", "content": "Meet Ana"})
-    posted = {"post_id": "post_001", "status": "posted"}
-    result = await handle_tool_call("update_post_status", posted, "test-org", Turn(user_text="ok"))
-    assert result.startswith("Not updated: Mackie hasn't shown post_001")
 
 
 async def test_an_imported_post_with_hidden_characters_cant_be_approved(database):
@@ -1103,6 +1094,8 @@ async def test_forget_preference_needs_the_user_to_name_it(database, forget, typ
         ("thanks", "thanks"),
         ("谢谢大家", "谢谢大家"),  # without spaces, counted in characters
         ("🎉🎉", "🎉🎉 great"),  # no words at all
+        # Regression: a short post the user did paste was told to be copied exactly.
+        ("Donate now 💗", "Donate now 💗"),
     ],
 )
 async def test_save_voice_example_needs_a_post_not_a_word(database, content, typed):
@@ -1149,17 +1142,6 @@ def test_a_post_is_long_enough_to_learn_a_voice_from(text, short):
     from agent.tools import _too_short_for_a_post
 
     assert _too_short_for_a_post(text) is short
-
-
-async def test_a_short_post_is_refused_as_too_short_not_as_untyped(database):
-    """Regression: a short post the user did paste was told to be copied exactly."""
-    from agent.tools import Turn, handle_tool_call
-
-    post = "Donate now 💗"
-    result = await handle_tool_call(
-        "save_voice_example", {"content": post}, "test-org", Turn(user_text=post)
-    )
-    assert result.startswith("Not saved: that is too short")
 
 
 async def test_forget_preference_says_so_when_nothing_matches(database):
@@ -1450,6 +1432,130 @@ async def test_an_edit_to_the_guardrails_file_applies_from_the_next_save(databas
     assert refused.startswith("Not saved: the post uses 'crew'")
     assert saved.startswith("Saved to ledger as post_002")
     assert len(await get_ledger("test-org")) == 2
+
+
+# --- publish_post -------------------------------------------------------------------
+
+# Fits LinkedIn (3-5 hashtags) and Facebook (1-3, and a visual), not Instagram (10-20).
+PUBLISHABLE = {
+    "platform": "general",
+    "title": "Thanks",
+    "content": "Thank you, neighbours! #a #b #c",
+    "visual": "Volunteers packing boxes",
+    "status": "approved",
+}
+ALL_SCOPES = {
+    "linkedin": ("w_organization_social",),
+    "facebook": ("pages_manage_posts",),
+    "instagram": ("instagram_basic", "instagram_content_publish"),
+}
+ASKED = "Publish post_001 to LinkedIn and Facebook, please"
+
+
+async def _publishable(post: dict | None = None, accounts: dict | None = None) -> None:
+    """post_001 (PUBLISHABLE, changed by post) and the accounts {platform: scopes}."""
+    from agent import publishing
+    from agent.memory import add_post
+
+    await add_post("test-org", {**PUBLISHABLE, **(post or {})})
+    connected = ALL_SCOPES if accounts is None else accounts
+    for platform, scopes in connected.items():
+        account = publishing.PlatformAccount(platform, f"{platform}-page", "Page", scopes)
+        await publishing.connect_account("test-org", account)
+
+
+async def _publish(platforms: list, request: str = ASKED, post_id: str = "post_001") -> str:
+    from agent.tools import Turn, handle_tool_call
+
+    args = {"post_id": post_id, "platforms": platforms}
+    return await handle_tool_call("publish_post", args, "test-org", Turn(request=request))
+
+
+async def test_publish_post_publishes_an_approved_post_to_each_platform_named(database):
+    from agent import publishing
+    from agent.memory import get_post
+
+    await _publishable()
+    result = await _publish(["LinkedIn", "facebook", "linkedin"])  # distinct, any case
+    assert result.splitlines() == [
+        "LinkedIn: published (simulated: publishing is a dummy for now, so nothing was sent; "
+        "id simulated-linkedin-linkedin-page-post_001)",
+        "Facebook: published (simulated: publishing is a dummy for now, so nothing was sent; "
+        "id simulated-facebook-facebook-page-post_001)",
+    ]
+    assert (await get_post("test-org", "post_001"))["status"] == "posted"
+    assert await publishing.published_platforms("test-org", "post_001") == ["facebook", "linkedin"]
+
+
+async def test_a_post_mackie_published_goes_to_another_platform_but_never_twice(database):
+    from agent import publishing
+
+    await _publishable()
+    assert "published (simulated" in await _publish(["linkedin"], "Post it to LinkedIn")
+    again = await _publish(["linkedin", "facebook"], "Now share it on LinkedIn and Facebook")
+    assert again.splitlines()[0].startswith("LinkedIn: already published on ")
+    assert again.splitlines()[1].startswith("Facebook: published (simulated")
+    assert await publishing.published_platforms("test-org", "post_001") == ["facebook", "linkedin"]
+
+
+@pytest.mark.parametrize(
+    "request_text, platforms, post, accounts, expected",
+    [
+        ("Looks great, thanks", ["linkedin"], {}, None, "Not published: the user's latest message doesn't ask to publish"),
+        # The noun: a request to write is no request to publish.
+        ("Write a LinkedIn post about our gala", ["linkedin"], {}, None, "Not published: the user's latest message doesn't ask to publish"),
+        ("Publish it to LinkedIn", ["linkedin", "facebook"], {}, None, "Not published: the user didn't name Facebook"),
+        ("Publish it to Facebookish", ["facebook"], {}, None, "Not published: the user didn't name Facebook"),
+        (ASKED, ["email"], {}, None, "Not published: Mackie can't publish to 'email'; it publishes to linkedin, facebook, instagram."),
+        (ASKED, ["linkedin"], {"status": "draft"}, None, "Not published: post_001 is draft, not approved"),
+        (ASKED, ["linkedin"], {"status": "posted"}, None, "Not published: post_001 is marked posted"),
+        (ASKED, ["linkedin", "facebook"], {}, {"linkedin": ALL_SCOPES["linkedin"]}, "Not published (nothing went out): no Facebook account is connected"),
+        ("Publish to Instagram", ["instagram"], {}, {"instagram": ("instagram_basic",)}, "Not published (nothing went out): the Instagram account wasn't granted instagram_content_publish"),
+        # All or nothing: LinkedIn would pass, but nothing goes out.
+        ("Publish to LinkedIn and Instagram", ["linkedin", "instagram"], {}, None, "Not published (nothing went out): it isn't ready for Instagram: 3 hashtag(s)"),
+        (ASKED, ["linkedin"], {"content": "Join us! #a"}, None, "Not published (nothing went out): it isn't ready for LinkedIn: 1 hashtag(s)"),
+        (ASKED, ["linkedin"], {"format": "story"}, None, "Not published (nothing went out): it isn't ready for LinkedIn: Story isn't a format on LinkedIn"),
+        (ASKED, ["facebook"], {"content": "Damn good #a"}, None, "Not published (nothing went out): it isn't ready for Facebook: it uses 'damn*'"),
+        # Regression: a live model published the Facebook version to LinkedIn as well.
+        (ASKED, ["linkedin", "facebook"], {"platform": "facebook"}, None, "Not published (nothing went out): it was written for Facebook, not LinkedIn. Tell the user why. Ask whether to publish it to Facebook without the others. Only if they want it"),
+        # Regression: an account problem got advice to write versions; a live model wrote three.
+        ("Publish to LinkedIn and Instagram", ["linkedin", "instagram"], {}, {**ALL_SCOPES, "instagram": ()}, "Not published (nothing went out): the Instagram account wasn't granted instagram_basic, instagram_content_publish; an admin reconnects it with that permission. Tell the user why. Ask whether to publish it to LinkedIn without the others."),
+    ],
+)  # fmt: skip
+async def test_publish_post_refuses_and_publishes_nothing_unless_every_check_passes(
+    database, request_text, platforms, post, accounts, expected
+):
+    from agent.memory import get_post
+    from agent.skills import Guardrails
+
+    await _publishable(post, accounts)
+    guardrails = Guardrails(blocked_terms=("damn*",))
+    with patch("agent.tools.skills.load_guardrails", return_value=guardrails):
+        result = await _publish(platforms, request_text)
+    assert result.startswith(expected)
+    # Advice to write a version only for a problem with the post, never with an account.
+    assert ("save_post" in result) == ("isn't ready" in result or "written for" in result)
+    count = database["cleaner"].execute("SELECT count(*) FROM publications").fetchone()
+    assert count == (0,)
+    assert (await get_post("test-org", "post_001"))["status"] == post.get("status", "approved")
+
+
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        ({"post_id": "post_001", "platforms": "linkedin"}, "Error: platforms must be a list"),
+        ({"post_id": "post_001", "platforms": [1]}, "Error: platforms must be a list"),
+        ({"post_id": "post_001", "platforms": []}, "Error: platforms is empty"),
+        ({"post_id": "post_404", "platforms": ["linkedin"]}, "Post post_404 not found in ledger"),
+        ({"post_id": "post_001"}, "Error: publish_post needs platforms"),
+    ],
+)
+async def test_publish_post_explains_arguments_it_cant_use(database, args, expected):
+    from agent.tools import Turn, handle_tool_call
+
+    await _publishable()
+    result = await handle_tool_call("publish_post", args, "test-org", Turn(request=ASKED))
+    assert result.startswith(expected)
 
 
 async def test_search_ledger_tool_formats_matches(database):

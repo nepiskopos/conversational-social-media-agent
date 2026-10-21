@@ -6,7 +6,7 @@ Mackie is a conversational social media manager for nonprofit marketing teams. I
 - **Create:** posts for LinkedIn, Instagram and Facebook, plus supporter email, in your own voice, each with an idea for the visual.
 - **Optimize:** tell Mackie how posts performed and it suggests what to post next based on what worked.
 
-Like a teammate, Mackie doesn't wait to be asked: each session opens with what needs you (drafts to approve, posts to publish, planned posts due this week, results to report). Nothing is approved without you, and your team still publishes the posts and makes the final graphics.
+Like a teammate, Mackie doesn't wait to be asked: each session opens with what needs you (drafts to approve, posts to publish, planned posts due this week, results to report). Nothing is approved without you, and nothing is published unless you ask: Mackie publishes approved posts to your connected LinkedIn, Facebook and Instagram accounts when you say so (simulated for now), or your team posts them. Your team makes the final graphics.
 
 ## Features
 
@@ -17,6 +17,7 @@ Like a teammate, Mackie doesn't wait to be asked: each session opens with what n
 - **Learns from feedback.** Corrections are saved in your own words, a sentence or two each, and approved or pasted posts become voice examples. Only what you type or approve is learned, so a web page Mackie reads can't teach it anything. Ask "what have you learned about us?" or "forget that rule" at any time. All of it carries over to future sessions.
 - **Post ledger.** Every suggestion and draft is tracked with a title, status (`suggested`, `draft`, `approved`, `posted`, `planned`, `rejected`), versions and dates, so "what did we work on this week?" has an answer.
 - **Content calendar.** A dated four-week plan for any month, two posts a week by default (one to three), mixing platforms and formats. Each week is tied to an awareness day, giving day or org event when one falls in it, serves the campaign you name ("plan November around our year-end appeal"), and builds on your best-performing posts.
+- **Publishing (simulated for now).** Say "publish post_004 to LinkedIn and Facebook" and Mackie publishes the approved post, exactly as you approved it, to each account you named, never twice to the same one. Until live publishing is switched on, nothing reaches the platforms: the publication is recorded and Mackie says it was simulated.
 - **Learns what works.** Report results in plain words ("the volunteer post got 240 likes and 30 shares", "that email raised $400") and Mackie records them, so "what should we post next?" is answered from evidence.
 - **Any LLM provider.** Ten built-in providers plus anything LiteLLM supports; extra configured providers act as automatic fallbacks.
 - **Accounts.** Each person logs in and sees only the organizations they belong to; the database itself keeps each org's data apart.
@@ -101,6 +102,13 @@ The voice correction ("warm and grassroots") applies to every later post, in thi
 
 Everything happens in chat, approvals included: say "approve post_003", "drop the second idea" or "we posted it on Friday", and Mackie updates the ledger. Mackie approves only a post it has shown you, so a draft from an earlier conversation is shown in full first. To change a draft, say what to change ("make it warmer") or name the exact words ("replace 'our helpers' with 'our volunteers'", "cut the last sentence"): an exact change swaps just those words, and Mackie says so if they aren't in the post, or appear more than once. Either way you get a new version, shown in full for approval; earlier versions stay in the ledger. A draft that breaks its platform's rules (too long, wrong hashtag count, no visual where one is needed) can't be approved until it is fixed.
 
+To publish an approved post, ask in one message and name each platform: "publish it to LinkedIn and Facebook". A plain "yes" isn't enough, so a web page Mackie reads can never make it publish. Mackie checks everything first and publishes nothing if one platform can't take the post:
+
+- the post must be approved, and meet each platform's rules (a LinkedIn version goes only to LinkedIn; a general post goes wherever it fits);
+- the organization needs an account connected for that platform, with the permissions publishing needs (see [Connect social media accounts](#connect-social-media-accounts)).
+
+A published post is marked `posted`, and asking again for the same platform is refused, so nothing goes out twice. Publishing is simulated for now: nothing reaches the platforms yet, and Mackie says so.
+
 Your conversation with an organization carries on where it left off, after a refresh or on another day: the web UI shows the last few messages again and offers **Start a new conversation**; the terminal says it is carrying on, and `reset` starts afresh. Either way, what Mackie learned is kept. Each person has their own conversation, one in the web UI and one in the terminal. In the terminal, `quit` exits. A message can be up to 20,000 characters; sent messages can't be edited, so send a new one instead.
 
 ## Users and access
@@ -121,6 +129,28 @@ In Docker, prefix each command with `docker compose run --rm mackie` (`-T` after
 - A user who starts a new organization becomes its member; anyone else needs a `grant`.
 - Five wrong passwords in a row lock an account for 15 minutes.
 - `revoke`, `remove` and `passwd` also end chats that are already open: their next message is refused.
+
+## Connect social media accounts
+
+Mackie publishes only to accounts an admin has connected for the organization, one per platform:
+
+```bash
+python scripts/platform_accounts.py connect "BRCA Strong" linkedin urn:li:organization:123 --name "BRCA Strong"
+python scripts/platform_accounts.py connect "BRCA Strong" facebook 1234567890
+python scripts/platform_accounts.py connect "BRCA Strong" instagram 17841400000 --scopes instagram_basic
+python scripts/platform_accounts.py list "BRCA Strong"
+python scripts/platform_accounts.py disconnect "BRCA Strong" instagram
+```
+
+The account id is the platform's id of the page or profile. `--scopes` lists the permissions the organization actually granted; without it, the ones publishing needs are assumed. `list` shows what an account is missing:
+
+| Platform | Permissions needed |
+|---|---|
+| LinkedIn | `w_organization_social` |
+| Facebook | `pages_manage_posts` |
+| Instagram | `instagram_basic`, `instagram_content_publish` |
+
+No access token is stored in Mackie's database. Publishing is simulated for now; when live publishing arrives, each platform's token will come from a secret store (see the design doc's Publishing section). In Docker, prefix each command with `docker compose run --rm mackie`.
 
 ## Running it for your team
 
@@ -287,6 +317,7 @@ agent/
   tools.py          Tool definitions and dispatch, post checks, org brief, calendar
   db.py             PostgreSQL pool, per-org transactions, migrations
   memory.py         Org memory: ledger, preferences, voice examples, research, tool trace
+  publishing.py     Connected accounts, publishers (dummies for now), what went out where
   accounts.py       Users, passwords, logins and org access
   errors.py         What users are told when something fails
   logs.py           Log setup, with secrets redacted
@@ -299,6 +330,7 @@ docker/             The database container's first-start script (roles, database
 scripts/
   migrate.py        Creates or updates the schema and the default account
   users.py          Accounts and their org access
+  platform_accounts.py   An org's social media accounts, for publishing
   export_profile.py / import_profiles.py   An org's memory as an editable JSON file
   validate.py       Checks skills/ and profile files
   eval.py           End-to-end evaluation
@@ -312,7 +344,7 @@ See [design_doc.md](design_doc.md) for the architecture and the reasons behind e
 - **Password logins only.** No single sign-on (OAuth) and no self-service password reset; an admin runs `scripts/users.py`. A reply already being written when someone's access is removed still finishes.
 - **A misspelled organization name starts a new organization.** Check `scripts/users.py list` before granting access to one.
 - **One conversation per person, organization and interface (web or terminal).** Two browser tabs of the same person share their conversation and take turns; two terminals, or two servers, don't, and replies sent at the same moment can overwrite each other's history.
-- **No publishing.** Mackie drafts posts but does not publish them; `posted` is only a status in the ledger.
+- **Publishing is simulated.** `publish_post` records a publication but sends nothing: each platform's publisher is a dummy until a live one replaces it. Publishing happens when you ask, not at a scheduled time, and live Instagram publishing will also need the image or video itself, not just its description.
 - **Results are entered by hand.** Mackie doesn't connect to platform analytics and doesn't run paid ads.
 - **Static websites only.** Sites rendered by JavaScript yield little text.
 - **No image generation.** Mackie describes the visual for each post; your team makes it.

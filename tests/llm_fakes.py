@@ -45,7 +45,7 @@ async def tool_call_stream(tc_id: str, name: str, arguments: str):
     yield text_chunk(None, "tool_calls")
 
 
-def completion(content: str) -> MagicMock:
+def completion(content: str | None) -> MagicMock:
     """A non-streamed completion whose message is content (summaries, the brief, the calendar, the judge)."""
     return MagicMock(choices=[MagicMock(message=MagicMock(content=content))])
 

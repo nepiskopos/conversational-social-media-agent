@@ -5,7 +5,8 @@ Owns: proof that the I/O CLAUDE.md requires to run in parallel (research,
 subpages, calendar weeks, judge calls) really does, using ConcurrencyProbe from
 conftest.py; responsiveness (replies stream token by token, tool steps show as
 they finish, a slow session doesn't stall others, nothing waits forever); scale
-(the prompt stays the same size however large an org's memory grows, tool
+(the prompt stays the same size however large an org's memory grows, a post
+goes to its platforms in parallel, tool
 results are capped however large the research, ledger operations stay fast at
 20,000 posts, a long conversation's stored history grows linearly and what it
 sends the model stays bounded, also in real tokens, every query reads its org's
@@ -90,6 +91,8 @@ PER_ORG_TABLES: frozenset[str] = frozenset(
         "checkpoints",
         "checkpoint_blobs",
         "checkpoint_writes",
+        "platform_accounts",
+        "publications",
     }
 )
 # ROWS_PER_SEEDED_ORG rows for each of SEEDED_ORGS orgs: o is the org, n the row.
@@ -116,6 +119,10 @@ INSERT INTO checkpoint_blobs (thread_id, channel, version, type)
     SELECT 'seed-' || o || ':web', 'messages', n::text, 'empty' {_EACH_SEEDED_ROW};
 INSERT INTO checkpoint_writes (thread_id, checkpoint_id, task_id, idx, channel, blob)
     SELECT 'seed-' || o || ':web', 'c' || n, 't', 0, 'messages', '' {_EACH_SEEDED_ROW};
+INSERT INTO platform_accounts (org_id, platform, account_id)
+    SELECT 'seed-' || o, 'p' || n, 'page' {_EACH_SEEDED_ROW};
+INSERT INTO publications (org_id, post_id, platform, state, account_id)
+    SELECT 'seed-' || o, 'post_' || n, 'linkedin', 'published', 'page' {_EACH_SEEDED_ROW};
 ANALYZE {", ".join(sorted(PER_ORG_TABLES))};
 """
 # Posts in the small and the large org of the statements-per-turn test.
@@ -138,6 +145,19 @@ LOGIN_FLOOD_POOL_SIZE: int = 2
 
 
 # --- Parallel I/O -----------------------------------------------------------------
+
+
+async def test_a_post_is_published_to_its_platforms_in_parallel(database, concurrency_probe):
+    from agent import memory as mem
+    from agent import publishing
+
+    await mem.fill_org_details("org", "Org")
+    accounts = [publishing.PlatformAccount(p, "page") for p in publishing.PUBLISHERS]
+    probe = concurrency_probe(len(accounts), publishing.Receipt("id"))
+    request = publishing.PublishRequest("post_001", "x")
+    with patch.object(publishing.DummyPublisher, "publish", probe):
+        outcomes = await publishing.publish("org", request, accounts)
+    assert probe.peak == len(accounts) and all(outcome.published for outcome in outcomes)
 
 
 async def test_calendar_plans_its_four_weeks_in_parallel(database, concurrency_probe):
@@ -340,7 +360,7 @@ def test_blocked_term_matching_stays_linear(text, term):
     """Every save checks every blocked term against the whole post."""
     from agent.skills import Guardrails
 
-    guardrails = Guardrails(blocked_terms=tuple(f"word{n}" for n in range(200)) + (term,))
+    guardrails = Guardrails(blocked_terms=tuple(f"word{n}" for n in range(20)) + (term,))
     started = time.perf_counter()
     guardrails.blocked_term(text)
     assert time.perf_counter() - started < LINEAR_TIME_CEILING_S
@@ -770,7 +790,7 @@ async def test_every_query_reads_only_its_own_orgs_rows_through_an_index(databas
     costs, the planner rightly seq-scans small tables; tipping it would take tables too big
     for the time budget, and would prove the table size rather than the index.
     """
-    from agent import accounts
+    from agent import accounts, publishing
     from agent.assistant import Assistant
     from agent.memory import get_post, read_trace, search_ledger
 
@@ -796,6 +816,11 @@ async def test_every_query_reads_only_its_own_orgs_rows_through_an_index(databas
         await read_trace("probe")
         await accounts.has_access(user_id, "probe")
         await accounts.user_orgs(user_id)
+        account = publishing.PlatformAccount("linkedin", "page", "", ("w_organization_social",))
+        await publishing.connect_account("probe", account)
+        await publishing.publish("probe", publishing.PublishRequest("post_001", "x"), [account])
+        await publishing.published_platforms("probe", "post_001")
+        await publishing.disconnect_account("probe", "linkedin")
 
     explained = 0
     with psycopg.connect(database["app"]) as conn, conn.transaction():

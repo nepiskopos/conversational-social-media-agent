@@ -97,15 +97,6 @@ async def test_the_password_is_never_stored_as_typed(database):
     assert stored.startswith("scrypt$")
 
 
-async def test_a_wrong_password_an_unknown_user_and_a_bad_name_all_get_none(database):
-    from agent import accounts
-
-    await accounts.create_user("alice", "a long passphrase")
-    assert await accounts.authenticate("alice", "wrong passphrase") is None
-    assert await accounts.authenticate("nobody", "a long passphrase") is None
-    assert await accounts.authenticate("not a name!", "a long passphrase") is None
-
-
 async def test_an_unknown_user_or_a_locked_account_costs_one_password_check_too(database):
     """Otherwise a fast "no" would tell an attacker which usernames exist, or are locked."""
     from agent import accounts

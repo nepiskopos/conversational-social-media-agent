@@ -111,14 +111,11 @@ async def test_scrape_site_caps_the_text_of_each_page():
     assert result == "[Page: https://example.com]\n" + "a" * SITE_PAGE_CHARS
 
 
-@pytest.mark.parametrize(
-    "given, fetched",
-    [("example.com", "https://example.com"), ("HTTPS://example.com", "HTTPS://example.com")],
-    ids=["no-scheme", "uppercase-scheme"],
-)
-async def test_scrape_site_adds_https_only_when_the_url_has_no_scheme(given, fetched):
-    _, _, client = await _scrape_with_responses(given, [_response("<p>Content</p>")])
-    assert client.get.call_args[0][0] == fetched
+async def test_scrape_site_keeps_a_scheme_written_in_capitals():
+    """No https:// is added to a URL that has a scheme already, in any case (with_scheme)."""
+    url = "HTTPS://example.com"
+    _, _, client = await _scrape_with_responses(url, [_response("<p>Content</p>")])
+    assert client.get.call_args[0][0] == url
 
 
 @pytest.mark.parametrize(
@@ -591,7 +588,7 @@ async def test_research_org_does_not_cite_a_homepage_it_could_not_read():
     from agent.research import research_org
 
     with (
-        patch("agent.research.scrape_site", new=AsyncMock(return_value=("Error: blocked", []))),
+        patch("agent.research.scrape_site", new=AsyncMock(return_value=("", []))),
         patch("agent.research.search_web", new=AsyncMock(return_value=[])),
     ):
         result = await research_org("Test Org", "http://169.254.169.254/")

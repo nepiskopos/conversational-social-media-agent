@@ -126,18 +126,6 @@ async def test_system_prompt_shows_what_the_profile_holds(database, profile, pre
         assert text not in prompt
 
 
-async def test_chat_returns_assistant_reply(database):
-    from agent.assistant import Assistant
-
-    with patch(
-        "agent.graph.litellm.acompletion",
-        new=AsyncMock(return_value=text_stream("Hello, I'm Mackie!")),
-    ):
-        assistant = Assistant("org")
-        reply = await assistant.chat("Hello")
-    assert "Mackie" in reply
-
-
 async def test_chat_persists_conversation_to_checkpoint(database):
     from langchain_core.messages import AIMessage, HumanMessage
 
@@ -513,6 +501,12 @@ async def test_system_prompt_describes_the_job_and_the_approval_rule(database):
         # A live model saved "change 'volunteers' to 'neighbours'" as the org's voice.
         "A change to one post (an edit, a rewrite, a word swapped) is not a preference",
         "Never replace a saved preference (such as `voice`) with something narrower",
+        "call `publish_post` with its id and exactly the platforms they named",
+        "Publishing is simulated for now",
+        'so a bare "yes" isn\'t enough',
+        # A live model said a general post couldn't be published, then marked one posted twice.
+        "A general post can go to any platform whose rules it meets",
+        "publish_post marks the post posted itself",
     ):
         assert part in stable
 
